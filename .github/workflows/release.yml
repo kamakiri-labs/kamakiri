@@ -1,0 +1,42 @@
+name: Release
+
+# The rehearsal build lives in its own workflow file instead of sharing this one
+# behind a condition. Every job runs on every trigger of the file it sits in, so
+# one file would leave a template expression deciding whether a run publishes,
+# and nothing here would catch it being wrong in the publishing direction.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    # The job token is read-only by default; contents: write is what authorizes
+    # creating the release and uploading its assets.
+    permissions:
+      contents: write
+
+    steps:
+      # goreleaser needs the repository, not just the tree at the tag: it warns
+      # outright when it runs against a shallow clone, and its previous-tag and
+      # first-commit lookups walk history that a shallow clone does not carry.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Create the GitHub release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          args: release --clean
+        # The permissions block above authorizes the token but does not put it
+        # where goreleaser reads it, and the action injects nothing on its own.
+        # Without this, goreleaser hard-fails on the publish path, and no static
+        # check of this file catches the omission.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

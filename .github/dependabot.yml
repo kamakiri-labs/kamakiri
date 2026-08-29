@@ -1,0 +1,10 @@
+# The workflows in this repo pin third-party actions to commit SHAs rather
+# than mutable tags. Dependabot opens a pull request whenever a pinned
+# action publishes a new version, so the pins stay current without anyone
+# having to track upstream releases by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

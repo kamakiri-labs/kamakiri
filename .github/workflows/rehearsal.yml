@@ -1,0 +1,51 @@
+name: Rehearsal
+
+# A dry run of the release build, dispatched by hand so the release path can be
+# exercised without cutting a tag. Snapshot mode skips publish, announce and
+# validate, so what it proves is the build itself and the asset list recorded in
+# checksums.txt; the token wiring, the upload of the release assets and the
+# rendering of the release body first run on a real tag.
+on:
+  workflow_dispatch:
+
+jobs:
+  rehearsal:
+    name: Snapshot build
+    runs-on: ubuntu-latest
+
+    # A rehearsal publishes nothing, and saying so here makes that a property of
+    # this file rather than of a repository setting that can be changed
+    # elsewhere.
+    permissions:
+      contents: read
+
+    steps:
+      # The rehearsal checks out the same full history the release run does,
+      # rather than the shallow default.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build a snapshot
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          args: release --snapshot --clean
+        # A rehearsal binary must not report a version that could pass for a
+        # release. Left alone goreleaser stamps whatever tag it resolves, which
+        # is the newest real tag once any exists; naming the version here keeps
+        # the output self-describing instead.
+        env:
+          GORELEASER_CURRENT_TAG: v0.1.0-snapshot
+
+      # dist/ holds one directory per target, named for the build, each holding
+      # a binary named kamakiri (kamakiri.exe on Windows); the names a release
+      # would publish those binaries under are the ones listed in checksums.txt.
+      - name: Upload the built artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/

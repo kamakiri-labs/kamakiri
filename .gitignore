@@ -1,0 +1,8 @@
+/kamakiri
+/dist/
+/cover/
+.env
+.env.*
+!.env.example
+*.test
+*.out

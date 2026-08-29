@@ -1,0 +1,54 @@
+version: 2
+
+project_name: kamakiri
+
+builds:
+  - main: ./cmd/kamakiri
+    binary: kamakiri
+    env:
+      - CGO_ENABLED=0
+    # The tag is stamped as-is, leading "v" kept: that is the form the version
+    # command reports. The kept "v" is a display form only, since the CLI drops
+    # it itself when it builds the version token it states on the wire.
+    # "-s -w" drops the symbol table and DWARF, which nothing here reads, and
+    # takes a useful bite out of the download.
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+# Raw per-target binaries, no tar.gz or zip: a download is one file that runs
+# as-is, and every consumer of these assets is spared an unpack step.
+# goreleaser appends ".exe" to the two Windows names on its own.
+archives:
+  - formats: [binary]
+    name_template: "kamakiri-{{ .Os }}-{{ .Arch }}"
+
+# Named explicitly: the default embeds the project and version, so the file to
+# fetch would be named differently at every release.
+checksum:
+  name_template: checksums.txt
+
+# The commit history here carries no per-change detail, so a generated
+# changelog would say nothing a reader wants. The notes are written by hand.
+changelog:
+  disable: true
+
+release:
+  name_template: "{{ .Tag }}"
+  # A tag such as v0.1.1-rc1 matches the same trigger as a plain release tag,
+  # so mark any tag carrying a semver prerelease suffix as a GitHub
+  # prerelease instead of publishing it as latest. Plain tags are unaffected.
+  prerelease: auto
+  # Release notes are hand-written and travel in the annotated tag's message.
+  # .TagBody is the message minus its subject line, which the title above
+  # already carries. Two consequences: the tag must be annotated (on a
+  # lightweight tag this silently resolves to the pointed-at commit's message)
+  # and its message must have a blank line after the subject (a one-line
+  # message yields an empty body, also silently).
+  header: "{{ .TagBody }}"
