@@ -233,7 +233,8 @@ function platformPackage(target, npmVersion, bytes) {
     cpu: [target.arch],
     files: ["bin/" + binaryName],
     // Scoped packages are private by default, and a first publish of one
-    // without this is refused.
+    // without this is refused. The launcher sets it too, for the reason its
+    // manifest states.
     publishConfig: { access: "public" },
     // No exports field, deliberately. The launcher reaches the binary by its
     // subpath, require.resolve("@kamakiri-labs/cli-linux-x64/bin/kamakiri"), which
@@ -289,6 +290,11 @@ function launcherPackage(npmVersion, platformNames) {
     // nothing newer, and this states the floor the channel is tested against.
     engines: { node: ">=18" },
     bin: { kamakiri: "bin/kamakiri.js" },
+    // An unscoped package is public by default, but npm still refuses to
+    // generate provenance for a package the registry has never seen unless
+    // the access is stated outright, so the first publish of this name fails
+    // without it.
+    publishConfig: { access: "public" },
     // Optional, so an install on a platform none of them match still
     // succeeds and the command reports the missing platform itself, rather
     // than the install failing with npm's own message about a dependency.
