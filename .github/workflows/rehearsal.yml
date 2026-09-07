@@ -37,8 +37,10 @@ jobs:
           args: release --snapshot --clean
         # A rehearsal binary must not report a version that could pass for a
         # release. Left alone goreleaser stamps whatever tag it resolves, which
-        # is the newest real tag once any exists; naming the version here keeps
-        # the output self-describing instead.
+        # is the newest real tag once any exists. This names a tag that never
+        # exists, and goreleaser 2.18.1 refuses a tag the checkout does not
+        # hold and falls back to v0.0.0 in snapshot mode, so the binaries
+        # report v0.0.0 whatever has been released.
         env:
           GORELEASER_CURRENT_TAG: v0.1.0-snapshot
 
