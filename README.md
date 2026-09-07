@@ -161,6 +161,31 @@ dependency in the project that has one; and for a copy `npx` fetched, there is
 nothing to update in place, since `npx kamakiri@latest` fetches the newest
 release each time. For Homebrew, run `brew upgrade kamakiri`.
 
+### Uninstall
+
+An install made by an install script is undone by the matching uninstall
+script. On macOS and Linux:
+
+```sh
+curl -fsSL https://get.kamakiri-labs.jp/uninstall.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://get.kamakiri-labs.jp/uninstall.ps1 | iex
+```
+
+Each removes the binary (from `KAMAKIRI_INSTALL_DIR` when set, the default
+install directory otherwise) and the config directory, which holds the saved
+API key; on Windows it also takes the install directory out of your user
+`PATH`. Nothing else is touched. The key itself stays valid on your account,
+since only the local copy is removed. Running it on a machine with nothing to
+remove is not an error.
+
+A copy installed through a package manager is removed through that package
+manager instead: `npm uninstall -g kamakiri` or `brew uninstall kamakiri`.
+
 ## Quick start
 
 ```sh

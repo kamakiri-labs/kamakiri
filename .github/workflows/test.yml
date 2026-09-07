@@ -39,12 +39,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # The install script is piped into whatever /bin/sh the user has, so a
-      # bashism in it is a syntax error on a Debian or Alpine machine and
-      # nothing else here would read the file at all. The runner ships
-      # shellcheck, so this needs no action and nothing to pin.
-      - name: Lint the install script
-        run: shellcheck --shell=sh install.sh
+      # The install and uninstall scripts are piped into whatever /bin/sh the
+      # user has, so a bashism in either is a syntax error on a Debian or
+      # Alpine machine and nothing else here would read the files at all. The
+      # runner ships shellcheck, so this needs no action and nothing to pin.
+      - name: Lint the install and uninstall scripts
+        run: shellcheck --shell=sh install.sh uninstall.sh
 
       # The cask push script, which runs nowhere near an ordinary push: the
       # release workflow invokes it on a tag. The check and the run are split
@@ -58,19 +58,20 @@ jobs:
       - name: Lint the cask push script
         run: shellcheck homebrew/publish.sh
 
-      # The other half of the install channel, and nothing else here reads it
-      # either. The runner ships pwsh, so this needs no action and nothing to
-      # pin, but it does not ship the analyzer, hence the install line.
-      # -EnableExit is what makes a finding fail the step, and the settings file
-      # beside the script names the rules, so a change to the script is held to
-      # the same ruleset here as it is before it lands. The analyzer itself is
-      # whatever version this install pulls, so a new release can report
-      # something an older one did not.
-      - name: Lint the PowerShell installer
+      # The other half of the install channel, and nothing else here reads
+      # either script. The runner ships pwsh, so this needs no action and
+      # nothing to pin, but it does not ship the analyzer, hence the install
+      # line. -EnableExit is what makes a finding fail the step, and the
+      # settings file beside the scripts names the rules, so a change to either
+      # is held to the same ruleset here as it is before it lands. The analyzer
+      # itself is whatever version this install pulls, so a new release can
+      # report something an older one did not.
+      - name: Lint the PowerShell installer and uninstaller
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
           Invoke-ScriptAnalyzer -Path install.ps1 -EnableExit -Settings PSScriptAnalyzerSettings.psd1
+          Invoke-ScriptAnalyzer -Path uninstall.ps1 -EnableExit -Settings PSScriptAnalyzerSettings.psd1
 
       # A broken release config would otherwise surface only on a tag push,
       # where it is most expensive to find. Validating it needs no token.
