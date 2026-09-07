@@ -48,35 +48,10 @@ function Install-Kamakiri {
     # Strict mode is set here for the locality above and turned off for a reason
     # of its own: under a caller's own Set-StrictMode, reading a property the
     # object does not carry raises instead of answering nothing, and reading a
-    # property that may not be there is how the redirect below is read, and how a
-    # failure carrying no response is told from one that carries one.
+    # property that may not be there is how a failure carrying no response is
+    # told from one that carries one.
     Set-StrictMode -Off
 
-    # The redirect below is read through both object models, because a block
-    # written against one answers nothing on the other and every stock Windows
-    # run would then land on the could-not-determine line: 5.1 raises a
-    # System.Net.WebException whose response holds the header as a raw string,
-    # while PowerShell 7 carries an HttpResponseMessage whose Headers.Location
-    # is a System.Uri, and hands the redirect back rather than raising it. An
-    # accessor the object at hand does not have is not an answer, so it is
-    # caught and the other one is tried. The third is the last resort for a
-    # response handed back rather than raised, whose Headers on 5.1 is a
-    # dictionary keyed by an ordinal comparer: a header spelled `location`
-    # answers nothing through it, while the response's own header lookup is
-    # case-insensitive and is what that spelling needs. This is nested
-    # rather than declared beside Install-Kamakiri so that a session that ran
-    # this through `iex` gains the one name that shape already costs it and no
-    # more.
-    function Get-RedirectLocation($response) {
-        $location = ''
-        if ($null -eq $response) { return $location }
-        try { $location = [string]@($response.Headers.Location)[0] } catch { $location = '' }
-        if ($location) { return $location }
-        try { $location = [string]@($response.Headers['Location'])[0] } catch { $location = '' }
-        if ($location) { return $location }
-        try { $location = [string]$response.BaseResponse.GetResponseHeader('Location') } catch { $location = '' }
-        return $location
-    }
 
     # Windows PowerShell 5.1 reaches the network through .NET Framework, where
     # one process-wide setting decides which TLS versions are offered, and on a
@@ -126,18 +101,33 @@ function Install-Kamakiri {
     Write-Host 'Checking for the latest release.'
     $latestUrl = "$releases/latest"
     $redirect = ''
+    # The probe goes through .NET's own request object rather than
+    # Invoke-WebRequest. With redirects disabled, Windows PowerShell 5.1's
+    # cmdlet throws a redirection-count error of its own that carries no
+    # response, so the Location header is unreachable through it and every
+    # stock Windows run would land on the could-not-determine line. The request
+    # object hands a 3xx back as an ordinary response on both PowerShells, and
+    # its header lookup is case-insensitive, which the lowercase `location`
+    # GitHub sends needs. The probe is a few hundred bytes of headers, so it
+    # is bounded end to end: one still open after ten seconds is not going to
+    # answer.
+    $response = $null
     try {
-        # The probe is a few hundred bytes of headers, so it is bounded end to
-        # end: one still open after ten seconds is not going to answer.
-        $probe = Invoke-WebRequest -Uri $latestUrl -MaximumRedirection 0 `
-            -UseBasicParsing -TimeoutSec 10
-        $redirect = Get-RedirectLocation $probe
+        $request = [System.Net.WebRequest]::Create($latestUrl)
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 10000
+        $response = $request.GetResponse()
     }
     catch {
-        # A repository with no release answers 404 rather than a redirect, and
-        # what the transport says about that is not this script's answer to
-        # give: the one line below is.
-        $redirect = Get-RedirectLocation $_.Exception.Response
+        # A repository with no release answers 404 rather than a redirect,
+        # which arrives as an exception carrying that response; what the
+        # transport says about it is not this script's answer to give: the one
+        # line below is. A failure carrying no response reads as no redirect.
+        try { $response = $_.Exception.Response } catch { $response = $null }
+    }
+    if ($null -ne $response) {
+        try { $redirect = [string]$response.GetResponseHeader('Location') } catch { $redirect = '' }
+        $response.Close()
     }
 
     $tag = ''
