@@ -160,8 +160,9 @@ function Install-Kamakiri {
     # in full and nothing else.
     if ($tag -cnotmatch '\Av[0-9]+\.[0-9]+\.[0-9]+\z') { $tag = '' }
     if (-not $tag) {
-        # Until the first release is cut this is what every real run reaches, so
-        # it is one line saying where to look rather than a diagnostic.
+        # A repository with no release lands here (every real run did until the
+        # first one was cut), so it is one line saying where to look rather
+        # than a diagnostic.
         throw "Could not determine the latest release. Check $releases"
     }
 
