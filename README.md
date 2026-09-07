@@ -14,6 +14,74 @@ live for a visitor, not once the request was accepted. Where a command waits,
 
 ## Install
 
+### Install scripts
+
+On macOS and Linux:
+
+```sh
+curl -fsSL https://get.kamakiri-labs.jp/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://get.kamakiri-labs.jp/install.ps1 | iex
+```
+
+Either one resolves the latest release for your platform, verifies the download
+against `checksums.txt`, and puts the binary in place. It goes to `~/.local/bin`
+as `kamakiri` on macOS and Linux, and to `%USERPROFILE%\.local\bin` as
+`kamakiri.exe` on Windows. Set `KAMAKIRI_INSTALL_DIR` to install somewhere else.
+Neither needs root or administrator rights, and running the command again
+updates an existing install (see Updating below).
+
+On macOS and Linux, when the install directory is not on your `PATH` the script
+prints the line to add to your shell's startup file, guessed from your `SHELL`
+environment variable; it edits no dotfile itself.
+On Windows the directory is added to your user environment when it is not there
+already, so a terminal opened afterwards has it and so does the session you ran
+the command in.
+
+### npm
+
+```sh
+npm install -g kamakiri
+```
+
+This needs Node, which comes with npm. It installs a small launcher package
+named `kamakiri`, which provides the command, and one package carrying the
+binary for your machine. The binary packages are
+`@kamakiri-labs/cli-<platform>-<arch>`, published for `darwin-arm64`, `darwin-x64`,
+`linux-arm64`, `linux-x64`, `win32-arm64` and `win32-x64`. The launcher depends
+on all six optionally, so npm installs only the one that matches. The `kamakiri`
+command then behaves like a binary you installed directly: same arguments, same
+output, same exit code, and Ctrl-C reaches the CLI. The package carries the
+binary itself, so the install fetches nothing from anywhere but the registry,
+and no install script runs.
+
+`npx kamakiri@latest` runs the CLI without installing anything, and a project can
+take `kamakiri` as a dependency of its own.
+
+On a platform no release covers the install still succeeds, since the binary
+packages are optional, and the command tells you there is no binary for your
+platform and architecture, then points you at the releases page and the install
+script. An npm copy is updated through npm rather than with `kamakiri upgrade`
+(see Updating below).
+
+### Homebrew
+
+```sh
+brew install kamakiri-labs/tap/kamakiri
+```
+
+This installs the cask our tap carries. It covers macOS, and Linux on Homebrew
+4.5.0 or newer. Homebrew verifies the binary it downloads against the SHA-256
+checksum the cask carries, so there is nothing for you to check by hand. On macOS
+the install clears the quarantine attribute the system puts on what a cask
+downloads, so nothing is left for you to clear by hand either. A Homebrew copy is
+updated with `brew upgrade kamakiri` rather than with `kamakiri upgrade` (see
+Updating below).
+
 ### Download a binary
 
 Each release publishes one binary per operating system and architecture on the
@@ -65,11 +133,6 @@ refused until the attribute is cleared:
 xattr -d com.apple.quarantine /path/to/kamakiri
 ```
 
-Once a release binary is installed, updating is one command: `kamakiri
-upgrade` downloads the latest release for your platform, checks it against
-`checksums.txt`, and replaces the binary in place. There is no need to repeat
-the steps above for a new version.
-
 ### go install
 
 ```sh
@@ -81,6 +144,22 @@ announced through it. A binary built this way also reports its version as
 `(dev)`, since the version is stamped in at release build time, and it cannot
 update itself: `kamakiri upgrade` only replaces a binary that came from a
 release.
+
+### Updating
+
+A binary put in place by an install script or downloaded by hand is updated with
+`kamakiri upgrade`, which downloads the latest release for your platform, checks
+it against `checksums.txt`, and replaces the binary in place. Re-running an
+install script does the same job, so either way is fine. There is no need to
+download and verify a new version by hand.
+
+A copy installed through a package manager is updated through that package
+manager instead, because `kamakiri upgrade` recognizes it and hands you back to
+that package manager rather than replacing the binary. For npm, run
+`npm install -g kamakiri@latest` for a global install; update the `kamakiri`
+dependency in the project that has one; and for a copy `npx` fetched, there is
+nothing to update in place, since `npx kamakiri@latest` fetches the newest
+release each time. For Homebrew, run `brew upgrade kamakiri`.
 
 ## Quick start
 

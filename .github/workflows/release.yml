@@ -40,3 +40,116 @@ jobs:
         # check of this file catches the omission.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The two jobs below each run on a machine of their own, with a checkout
+      # of their own, so what is built here reaches them only through this
+      # upload: the binaries for the npm packaging, and the generated cask for
+      # the tap push. The release assets are not a second route to either. The
+      # packaging reads the binaries out of the build manifest, and the manifest
+      # stays in dist/ rather than being published with them, while the cask is
+      # never a release asset at all.
+      - name: Upload the built artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/
+
+  # Split out of the release job rather than tacked onto its end, so a failed
+  # publish leaves the GitHub release green and re-running the failed job
+  # re-runs only this one. goreleaser is never asked to run a second time
+  # against a release it already created.
+  npm:
+    name: Publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+
+    # A job-level permissions block replaces the default wholesale instead of
+    # adding to it, so contents: read is listed here even though it is what the
+    # default already grants: leave it out and the checkout below has no token
+    # to read this repository with. id-token: write is what lets npm mint a
+    # provenance attestation for each package, which it does under either way of
+    # authenticating, and it is also the exchange the registry's own tokenless
+    # publishing runs on.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      # The packaging scripts live in this tree. Only the binaries they pack
+      # come from the release job, so the shallow default checkout is enough.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.x
+
+      # Downloaded into dist, not the default location. The manifest names each
+      # binary by a path relative to the working directory that already carries
+      # the dist/ prefix, while the upload above stores the directory's contents
+      # without it, so a download left where it lands by default would leave
+      # every one of those paths naming a file that is not there. The two
+      # actions number their majors separately, and this v8 download is the one
+      # released alongside the v7 upload above.
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Build the npm packages
+        run: node npm/build.js --version "${{ github.ref_name }}"
+
+      # There are two ways to authenticate against the registry, and the script
+      # picks between them by whether NPM_TOKEN arrives non-empty: with a token
+      # it points npm at credentials it writes itself, and with none it lets npm
+      # perform the registry's own OIDC exchange, which is what the id-token
+      # permission above is also for. Retiring the token is done by deleting the
+      # secret, and changes nothing in this file.
+      - name: Publish to npm
+        run: node npm/publish.js --version "${{ github.ref_name }}"
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # A job of its own for the same reason the npm one is: a failed push leaves
+  # the GitHub release and the published packages exactly as they were, and
+  # "re-run failed jobs" re-runs this one alone. Re-running it is safe because
+  # a tap already holding this release's cask is a success that writes nothing.
+  homebrew:
+    name: Publish the Homebrew cask
+    needs: release
+    runs-on: ubuntu-latest
+
+    # A job-level permissions block replaces the default wholesale instead of
+    # adding to it, so contents: read is listed here even though it is what the
+    # default already grants: leave it out and the checkout below has no token
+    # to read this repository with. Nothing is written through that token, the
+    # tap being another repository entirely and the credential for it being the
+    # separate secret named on the step below.
+    permissions:
+      contents: read
+
+    steps:
+      # The push script lives in this tree. Only the cask it pushes comes from
+      # the release job, so the shallow default checkout is enough.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Downloaded into dist, not the default location: the script reads the
+      # cask at the fixed path dist/homebrew/Casks/kamakiri.rb relative to the
+      # working directory, while the upload above stores the directory's
+      # contents without that prefix, so a download left where it lands by
+      # default would leave nothing at that path.
+      - name: Download the built artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist
+
+      # GH_TOKEN is the fine-grained token that may write to the tap repository
+      # and to nothing else, and it is named on this step rather than on the job
+      # so it reaches this one command's environment. The runner ships gh, which
+      # is what the script drives the write with, so this needs no install step
+      # and nothing to pin.
+      - name: Push the cask to the tap
+        run: bash homebrew/publish.sh --version "${{ github.ref_name }}"
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

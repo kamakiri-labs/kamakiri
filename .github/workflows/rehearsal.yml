@@ -2,9 +2,10 @@ name: Rehearsal
 
 # A dry run of the release build, dispatched by hand so the release path can be
 # exercised without cutting a tag. Snapshot mode skips publish, announce and
-# validate, so what it proves is the build itself and the asset list recorded in
-# checksums.txt; the token wiring, the upload of the release assets and the
-# rendering of the release body first run on a real tag.
+# validate, so what it proves is the build itself, the asset list recorded in
+# checksums.txt, the npm packaging step and the parse of the rendered cask; the
+# token wiring, the upload of the release assets and the rendering of the
+# release body first run on a real tag.
 on:
   workflow_dispatch:
 
@@ -41,11 +42,43 @@ jobs:
         env:
           GORELEASER_CURRENT_TAG: v0.1.0-snapshot
 
+      # A release runs this same packaging over the manifest the build above
+      # writes, and this is the only place it meets a real build's manifest
+      # before a tag does. Everything else that exercises the packaging hands it
+      # a manifest written by hand, which cannot notice the build changing the
+      # schema underneath it. The packages are stamped with the snapshot's own
+      # version, so none of them could pass for a release, and the job's
+      # read-only token publishes nothing. The runner ships Node, so this needs
+      # no action and nothing to pin.
+      - name: Package the snapshot for npm
+        run: node npm/build.js --version v0.1.0-snapshot
+
       # dist/ holds one directory per target, named for the build, each holding
       # a binary named kamakiri (kamakiri.exe on Windows); the names a release
       # would publish those binaries under are the ones listed in checksums.txt.
+      # It also carries the seven package trees the packaging step generated
+      # under dist/npm, so what a release would publish to the registry can be
+      # read off this artifact too, and the rendered cask under dist/homebrew,
+      # so the file a release would push to the tap can be read off it as well.
       - name: Upload the built artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
+
+      # The cask the build rendered is Ruby, and this is the only place anything
+      # ever parses it: it is not a release asset, no other check here reads it,
+      # and on a tag it goes straight to the tap for users to install from. A
+      # cask that does not parse would otherwise be found by whoever installed it
+      # first. It sits behind the upload rather than beside the packaging step,
+      # which has to precede the upload because it writes artifact content. This
+      # writes none, and the cask it refuses is the one an operator most wants in
+      # hand, which a check ahead of the upload would leave them without. The
+      # runner ships ruby, so this needs no action and nothing to pin.
+      - name: Check the rendered cask
+        run: |
+          if [ ! -f dist/homebrew/Casks/kamakiri.rb ]; then
+            echo "the snapshot build rendered no cask"
+            exit 1
+          fi
+          ruby -c dist/homebrew/Casks/kamakiri.rb

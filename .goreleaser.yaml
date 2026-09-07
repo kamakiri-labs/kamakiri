@@ -39,6 +39,34 @@ checksum:
 changelog:
   disable: true
 
+# The Homebrew cask goreleaser writes for the tap. This config only authors the
+# file: it pushes nothing, so the cask lands in dist/ and travels with it to the
+# release workflow's homebrew job, which is what pushes it to the tap. That is
+# also why no tap credential is configured here: with nothing in this file
+# pushing, a token would be dead config and one more place a credential could
+# sit. The repository is still named because an unnamed one makes the pipe skip
+# and write no file at all. "true" is quoted because the field is a template
+# string compared against that word, not a boolean.
+homebrew_casks:
+  - repository:
+      owner: kamakiri-labs
+      name: homebrew-tap
+    skip_upload: "true"
+    homepage: https://github.com/kamakiri-labs/kamakiri
+    description: CLI for Kamakiri Pages
+    # macOS marks what a cask downloads as quarantined, and these binaries are
+    # unsigned, so without this a fresh install refuses to run until the user
+    # clears the attribute by hand. The hook clears the whole staged directory
+    # rather than naming the file inside it because the staged file's name is
+    # per-architecture (kamakiri-darwin-arm64 and its siblings), and "-dr" is
+    # recursive.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}"]
+          end
+
 release:
   name_template: "{{ .Tag }}"
   # A tag such as v0.1.1-rc1 matches the same trigger as a plain release tag,

@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Go tests
+    name: Tests
     runs-on: ubuntu-latest
 
     permissions:
@@ -39,9 +39,126 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The install script is piped into whatever /bin/sh the user has, so a
+      # bashism in it is a syntax error on a Debian or Alpine machine and
+      # nothing else here would read the file at all. The runner ships
+      # shellcheck, so this needs no action and nothing to pin.
+      - name: Lint the install script
+        run: shellcheck --shell=sh install.sh
+
+      # The cask push script, which runs nowhere near an ordinary push: the
+      # release workflow invokes it on a tag. The check and the run are split
+      # accordingly. Shellcheck reads the file here, on every push, so a syntax
+      # error or a lint finding surfaces long before a tag is cut; what waits
+      # for the tag is the script executing and pushing a cask. No --shell:
+      # unlike the install script this one is bash and is run as a file, so its
+      # own shebang decides the dialect and naming another would lint it against
+      # rules it never runs under. The runner ships shellcheck, so this needs no
+      # action and nothing to pin.
+      - name: Lint the cask push script
+        run: shellcheck homebrew/publish.sh
+
+      # The other half of the install channel, and nothing else here reads it
+      # either. The runner ships pwsh, so this needs no action and nothing to
+      # pin, but it does not ship the analyzer, hence the install line.
+      # -EnableExit is what makes a finding fail the step, and the settings file
+      # beside the script names the rules, so a change to the script is held to
+      # the same ruleset here as it is before it lands. The analyzer itself is
+      # whatever version this install pulls, so a new release can report
+      # something an older one did not.
+      - name: Lint the PowerShell installer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Invoke-ScriptAnalyzer -Path install.ps1 -EnableExit -Settings PSScriptAnalyzerSettings.psd1
+
       # A broken release config would otherwise surface only on a tag push,
       # where it is most expensive to find. Validating it needs no token.
       - name: Check the release config
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           args: check
+
+      # The three JavaScript files of the npm channel. Two of them run nowhere
+      # near an ordinary push: the launcher shim runs on a machine that has
+      # installed a release, and the publishing script on a tag. The check and
+      # the run are split accordingly. Node parses all three here, on every
+      # push, so a syntax error surfaces long before either of those; what waits
+      # is the file executing, on the tag or on a user's machine. The runner
+      # ships Node, so this needs no action and nothing to pin.
+      - name: Check the npm scripts parse
+        run: |
+          node --check npm/build.js
+          node --check npm/publish.js
+          node --check npm/launcher/bin/kamakiri.js
+
+      # The packaging is then run for real, over the smallest build directory it
+      # accepts: six stub binaries and a manifest describing them, in the shape
+      # a release build writes. Each target is registered twice, once for the
+      # file the build stage produced and once for the asset the archive stage
+      # publishes it as, because separating those two is a choice the packaging
+      # makes and a manifest carrying only the entries to pack would leave it
+      # unexercised. The checksums are computed here as the stubs are written
+      # rather than being carried as constants, because the script holds every
+      # file it packs to the sum recorded beside it and a constant would go
+      # stale the moment a stub changed. The paths carry the dist/ prefix a real
+      # manifest's do, that being what the script resolves against the working
+      # directory. This is the release config check's counterpart for the
+      # packaging: nothing else on an ordinary push runs it.
+      - name: Package a fabricated build
+        run: |
+          node -e '
+            const crypto = require("crypto");
+            const fs = require("fs");
+            const path = require("path");
+            const targets = [
+              ["darwin", "amd64"],
+              ["darwin", "arm64"],
+              ["linux", "amd64"],
+              ["linux", "arm64"],
+              ["windows", "amd64"],
+              ["windows", "arm64"],
+            ];
+            const entries = [];
+            targets.forEach(function (target) {
+              const goos = target[0];
+              const goarch = target[1];
+              const windows = goos === "windows";
+              const dir = path.join("dist", "kamakiri_" + goos + "_" + goarch);
+              const file = path.join(dir, windows ? "kamakiri.exe" : "kamakiri");
+              const bytes = Buffer.from("stub binary for " + goos + "/" + goarch + "\n");
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(file, bytes);
+              entries.push({
+                name: windows ? "kamakiri.exe" : "kamakiri",
+                path: file,
+                goos: goos,
+                goarch: goarch,
+                type: "Binary",
+                extra: { Binary: "kamakiri", Builder: "go" },
+              });
+              entries.push({
+                name: "kamakiri-" + goos + "-" + goarch + (windows ? ".exe" : ""),
+                path: file,
+                goos: goos,
+                goarch: goarch,
+                type: "Binary",
+                extra: {
+                  Format: "binary",
+                  Checksum: "sha256:" + crypto.createHash("sha256").update(bytes).digest("hex"),
+                },
+              });
+            });
+            fs.writeFileSync(path.join("dist", "artifacts.json"), JSON.stringify(entries, null, 2) + "\n");
+          '
+          node npm/build.js --version v9.9.9
+          node -e '
+            const assert = require("assert");
+            const fs = require("fs");
+            const launcher = JSON.parse(fs.readFileSync("dist/npm/kamakiri/package.json", "utf8"));
+            assert.strictEqual(launcher.name, "kamakiri");
+            assert.strictEqual(launcher.version, "9.9.9");
+            const platform = JSON.parse(fs.readFileSync("dist/npm/cli-linux-x64/package.json", "utf8"));
+            assert.strictEqual(platform.name, "@kamakiri-labs/cli-linux-x64");
+            assert.strictEqual(platform.version, "9.9.9");
+          '

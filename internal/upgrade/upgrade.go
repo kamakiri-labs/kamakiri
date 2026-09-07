@@ -362,8 +362,15 @@ func verify(baseURL, tag, asset, sum string) error {
 		return fmt.Errorf("%s: %w", i18n.T("upgrade.err_request_failed"), err)
 	}
 
-	published, ok := publishedSum(body.String(), asset)
-	if !ok {
+	published, named := publishedSum(body.String(), asset)
+	if published == "" {
+		// A line that names the asset and carries nothing usable is its own
+		// answer: the file was published for this platform and the sum in it
+		// cannot be read, which is a different thing to fix than a release that
+		// never listed this asset.
+		if named {
+			return errors.New(i18n.Tf("upgrade.err_checksum_malformed", asset))
+		}
 		return errors.New(i18n.Tf("upgrade.err_checksum_missing", asset))
 	}
 	// A published checksum is not a secret, so an ordinary comparison is the
@@ -375,17 +382,25 @@ func verify(baseURL, tag, asset, sum string) error {
 	return nil
 }
 
-// publishedSum returns the checksum the file records for asset. The format is
-// sha256sum's own, the hex digest then two spaces then the file name, and the
-// name is compared in full so one asset's line can never be read as another's.
-func publishedSum(checksums, asset string) (string, bool) {
+// publishedSum returns the checksum the file records for asset, and whether any
+// line names asset at all. The format is sha256sum's own, the hex digest then
+// two spaces then the file name, and the name is compared in full so one asset's
+// line can never be read as another's. A line naming asset whose first field is
+// not a digest does not end the scan, so the first usable line wins wherever it
+// sits in the file; an empty sum with named set is a file that names asset and
+// never carries a digest for it.
+func publishedSum(checksums, asset string) (sum string, named bool) {
 	for _, line := range strings.Split(checksums, "\n") {
-		sum, name, ok := strings.Cut(line, "  ")
-		if ok && name == asset && isHexDigest(sum) {
-			return sum, true
+		field, name, ok := strings.Cut(line, "  ")
+		if !ok || name != asset {
+			continue
+		}
+		named = true
+		if isHexDigest(field) {
+			return field, true
 		}
 	}
-	return "", false
+	return "", named
 }
 
 // isHexDigest reports whether field is a sha256 digest spelled in hex and

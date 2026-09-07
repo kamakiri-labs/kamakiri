@@ -258,33 +258,36 @@ func outputCases() []outputCase {
 		{
 			name: "a global npm install",
 			arrange: func(t *testing.T) (invocation, string, string) {
-				const installed = "/usr/local/lib/node_modules/kamakiri/bin/kamakiri"
+				const installed = "/usr/local/lib/node_modules/kamakiri/node_modules/@kamakiri-labs/cli-linux-x64/bin/kamakiri"
 				base := linuxRelease("new binary").start(t)
 				return upgradeFrom(installed, base),
 					"Checking for the latest release.\n" +
 						"v0.2.0 is available; you are on v0.1.1.\n" +
-						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm update -g kamakiri`; for a copy inside a project's `node_modules`, update that project's dependency.\n",
+						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm install -g kamakiri@latest`. For a copy a project depends on, update that project's `kamakiri` dependency. For a copy npx fetched, there is nothing to update in place, and `npx kamakiri@latest` fetches the newest release.\n",
 					"最新リリースを確認しています。\n" +
 						"v0.2.0 が利用可能です。現在のバージョンは v0.1.1 です。\n" +
-						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm update -g kamakiri` を実行してください。プロジェクトの `node_modules` にある場合は、そのプロジェクトの依存関係を更新してください。\n"
+						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm install -g kamakiri@latest` を実行してください。プロジェクトの依存関係としてインストールされている場合は、そのプロジェクトの `kamakiri` を更新してください。npx で取得した場合は、その場で更新するものはなく、`npx kamakiri@latest` が最新リリースを取得します。\n"
 			},
 		},
 		{
 			// The npm defer line has to hold for a copy a project owns as much
-			// as for a global one: `npm update -g kamakiri` would not touch this
-			// binary, so the line names the path it is talking about and says
-			// what updates a copy under node_modules.
+			// as for a global one: `npm install -g kamakiri@latest` would not touch
+			// this binary, so the line names the path it is talking about and says
+			// what updates a copy a project depends on. The path it names is the
+			// platform package the launcher pulled in, not the `kamakiri`
+			// dependency the project itself records, which is why the line names
+			// that dependency rather than pointing at the path.
 			name: "an npm install inside a project",
 			arrange: func(t *testing.T) (invocation, string, string) {
-				const installed = "/home/user/project/node_modules/.bin/kamakiri"
+				const installed = "/home/user/project/node_modules/@kamakiri-labs/cli-linux-x64/bin/kamakiri"
 				base := linuxRelease("new binary").start(t)
 				return upgradeFrom(installed, base),
 					"Checking for the latest release.\n" +
 						"v0.2.0 is available; you are on v0.1.1.\n" +
-						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm update -g kamakiri`; for a copy inside a project's `node_modules`, update that project's dependency.\n",
+						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm install -g kamakiri@latest`. For a copy a project depends on, update that project's `kamakiri` dependency. For a copy npx fetched, there is nothing to update in place, and `npx kamakiri@latest` fetches the newest release.\n",
 					"最新リリースを確認しています。\n" +
 						"v0.2.0 が利用可能です。現在のバージョンは v0.1.1 です。\n" +
-						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm update -g kamakiri` を実行してください。プロジェクトの `node_modules` にある場合は、そのプロジェクトの依存関係を更新してください。\n"
+						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm install -g kamakiri@latest` を実行してください。プロジェクトの依存関係としてインストールされている場合は、そのプロジェクトの `kamakiri` を更新してください。npx で取得した場合は、その場で更新するものはなく、`npx kamakiri@latest` が最新リリースを取得します。\n"
 			},
 		},
 		{
@@ -295,17 +298,17 @@ func outputCases() []outputCase {
 			// it, and go on to replace a copy npm owns.
 			name: "an npm install on Windows",
 			arrange: func(t *testing.T) (invocation, string, string) {
-				const installed = `C:\Users\user\project\node_modules\.bin\kamakiri.exe`
+				const installed = `C:\Users\user\project\node_modules\@kamakiri-labs\cli-win32-x64\bin\kamakiri.exe`
 				base := linuxRelease("new binary").start(t)
 				call := upgradeFrom(installed, base)
 				call.goos = "windows"
 				return call,
 					"Checking for the latest release.\n" +
 						"v0.2.0 is available; you are on v0.1.1.\n" +
-						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm update -g kamakiri`; for a copy inside a project's `node_modules`, update that project's dependency.\n",
+						"npm installed this copy of kamakiri (" + installed + "). For a global install, run `npm install -g kamakiri@latest`. For a copy a project depends on, update that project's `kamakiri` dependency. For a copy npx fetched, there is nothing to update in place, and `npx kamakiri@latest` fetches the newest release.\n",
 					"最新リリースを確認しています。\n" +
 						"v0.2.0 が利用可能です。現在のバージョンは v0.1.1 です。\n" +
-						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm update -g kamakiri` を実行してください。プロジェクトの `node_modules` にある場合は、そのプロジェクトの依存関係を更新してください。\n"
+						"この kamakiri は npm でインストールされています (" + installed + ")。グローバルインストールの場合は `npm install -g kamakiri@latest` を実行してください。プロジェクトの依存関係としてインストールされている場合は、そのプロジェクトの `kamakiri` を更新してください。npx で取得した場合は、その場で更新するものはなく、`npx kamakiri@latest` が最新リリースを取得します。\n"
 			},
 		},
 	}
@@ -497,8 +500,8 @@ func failureCases() []failureCase {
 				serving.checksums = "\x1b[2J\x1b[H  kamakiri-linux-amd64\n" +
 					strings.Repeat("z", 64) + "  kamakiri-linux-amd64\n"
 				return upgradeFrom(target, serving.start(t)),
-					"no line in checksums.txt names kamakiri-linux-amd64",
-					"checksums.txt に kamakiri-linux-amd64 を示す行がありません"
+					"the line for kamakiri-linux-amd64 in checksums.txt does not carry a checksum (64 hexadecimal characters)",
+					"checksums.txt の kamakiri-linux-amd64 の行に有効なチェックサム（16進数64文字）がありません"
 			},
 		},
 		{
@@ -877,6 +880,33 @@ func TestRunAcceptsAnUppercaseChecksum(t *testing.T) {
 	var out bytes.Buffer
 	if err := run("v0.1.1", target, base, "linux", "amd64", maxAssetBytes, &out); err != nil {
 		t.Fatalf("run() error = %v, want nil", err)
+	}
+}
+
+// A line naming the asset with a first field that is not a digest is skipped
+// rather than taken as the file's answer for it, so the first usable line wins
+// wherever it sits. Refusing on the unusable one would turn a release whose
+// checksums file carries one bad line into a release nobody can upgrade to.
+func TestRunTakesTheFirstUsableChecksumLine(t *testing.T) {
+	isolateConfigDir(t)
+	dir := t.TempDir()
+	target := installedAt(t, dir, "kamakiri", "old binary")
+	serving := linuxRelease("new binary")
+	serving.checksums = "not-a-digest  kamakiri-linux-amd64\n" +
+		hexSum("new binary") + "  kamakiri-linux-amd64\n"
+	base := serving.start(t)
+
+	var out bytes.Buffer
+	if err := run("v0.1.1", target, base, "linux", "amd64", maxAssetBytes, &out); err != nil {
+		t.Fatalf("run() error = %v, want nil", err)
+	}
+
+	contents, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "new binary" {
+		t.Errorf("%s holds %q, want the downloaded bytes", target, contents)
 	}
 }
 
