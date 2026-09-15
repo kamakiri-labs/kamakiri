@@ -2,6 +2,7 @@ package login
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -25,6 +26,20 @@ func (m *mockClient) Verify(email, code, secret string) (*api.VerifyResponse, er
 	return m.verifyFn(email, code, secret)
 }
 
+// mintingClient answers the two calls of a successful login, checking nothing:
+// it serves the tests that hold the closing lines and the saved file rather
+// than the flow itself.
+func mintingClient(apiKey string) *mockClient {
+	return &mockClient{
+		registerFn: func(string, bool, string) (*api.RegisterResponse, error) {
+			return &api.RegisterResponse{Message: "Confirmation code sent."}, nil
+		},
+		verifyFn: func(string, string, string) (*api.VerifyResponse, error) {
+			return &api.VerifyResponse{APIKey: apiKey}, nil
+		},
+	}
+}
+
 // testLang is the catalog every test here renders against. A test that switches
 // away restores this rather than a literal of its own, so the pin moves in one
 // place.
@@ -35,8 +50,14 @@ const testLang = "en"
 // force, only renders in it. The tests that check the Japanese copy swap the
 // catalog themselves and swap it back; none of them is parallel, since the
 // catalog is an unsynchronized map.
+//
+// KAMAKIRI_API_KEY is cleared for a reason of its own: it outranks the
+// credentials file, so on a machine that exports it a test that writes a key
+// into its own config home would still load the developer's. There is no
+// *testing.T here, hence os.Unsetenv rather than t.Setenv.
 func TestMain(m *testing.M) {
 	i18n.Load(testLang)
+	os.Unsetenv(core.EnvAPIKey)
 	os.Exit(m.Run())
 }
 
@@ -98,6 +119,75 @@ func TestLoginSuccess(t *testing.T) {
 	ls, _ := core.LoadLoginSecret()
 	if ls != nil {
 		t.Error("login secret should be deleted after successful login")
+	}
+}
+
+// Under the variable the login still mints and saves a key; the note is what
+// tells the user why nothing about the run changes until the variable is unset.
+// The file is read with os.ReadFile rather than through core.LoadCredentials,
+// which under the variable hands back the variable's key and would prove
+// nothing about what was written.
+func TestLoginUnderTheEnvironmentVariableSavesAndSaysSo(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+
+	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
+	var stdout bytes.Buffer
+
+	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	output := stdout.String()
+	saved := strings.Index(output, "API key saved")
+	note := strings.Index(output, "KAMAKIRI_API_KEY is set, so it is the key every command uses for now; the saved key applies once it is unset.")
+	if saved < 0 {
+		t.Fatalf("output missing save message: %q", output)
+	}
+	if note < 0 {
+		t.Fatalf("output missing the override note: %q", output)
+	}
+	if note < saved {
+		t.Errorf("the override note came before the save message: %q", output)
+	}
+
+	credPath, err := core.CredentialsPath()
+	if err != nil {
+		t.Fatalf("CredentialsPath() error = %v", err)
+	}
+	raw, err := os.ReadFile(credPath)
+	if err != nil {
+		t.Fatalf("reading the credentials file: %v", err)
+	}
+	var written struct {
+		APIKey string `json:"api_key"`
+		Email  string `json:"email"`
+	}
+	if err := json.Unmarshal(raw, &written); err != nil {
+		t.Fatalf("decoding the credentials file: %v", err)
+	}
+	if written.APIKey != "kk_live_minted" {
+		t.Errorf("saved api_key = %q, want the key the server minted", written.APIKey)
+	}
+	if written.Email != "user@example.com" {
+		t.Errorf("saved email = %q, want user@example.com", written.Email)
+	}
+}
+
+func TestLoginWithoutTheEnvironmentVariablePrintsNoNote(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("KAMAKIRI_API_KEY", "")
+
+	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
+	var stdout bytes.Buffer
+
+	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := stdout.String(); strings.Contains(got, "KAMAKIRI_API_KEY") {
+		t.Errorf("output mentions the variable with none set: %q", got)
 	}
 }
 

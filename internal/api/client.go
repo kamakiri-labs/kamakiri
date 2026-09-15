@@ -44,6 +44,44 @@ func SetVersion(v string) {
 	version = strings.TrimPrefix(v, "v")
 }
 
+// keyFromEnvironment records whether the key the run authenticates with came
+// from KAMAKIRI_API_KEY rather than from the credentials file, which is what
+// decides the wording of the unauthorized error. It is package state because no
+// site that renders that copy can read the answer off what it holds: MapError
+// takes no receiver, and the two commands which render it themselves take
+// their client as an interface that carries no provenance. Like the version
+// value, it is race-free by being written once before the command runs and read
+// only afterwards.
+//
+// The invariant every reader depends on: the value was stamped by the path that
+// loads the credentials before the command runs, so a command that skips that
+// path must never render the unauthorized copy. `login` is the one such command,
+// and it has no unauthorized arm. `status` takes the loading path without the
+// exit, so it is stamped like the rest, and a failed load stamps false: the load
+// answers from the environment before it touches any file, so a load error
+// means no environment key.
+//
+// A test that flips this value stays serial and restores it, since nothing
+// synchronizes it and a parallel test would race it with nothing to notice.
+var keyFromEnvironment bool
+
+// SetKeyFromEnvironment records where the run's API key came from. It is called
+// once per run, before the command runs, with true when the key was resolved
+// from the environment.
+func SetKeyFromEnvironment(fromEnvironment bool) {
+	keyFromEnvironment = fromEnvironment
+}
+
+// UnauthorizedError is the error a rejected API key renders as. It names the
+// environment variable when that is where the key came from, since re-running
+// `kamakiri login` fixes nothing on a runner that reads its key from there.
+func UnauthorizedError() error {
+	if keyFromEnvironment {
+		return errors.New(i18n.T("api.err_unauthorized_env"))
+	}
+	return errors.New(i18n.T("api.err_unauthorized"))
+}
+
 // latestVersionHeader is the response header a server names its newest
 // published CLI release in. It is advisory: it refuses nothing, and a server
 // that sets none is the normal case.
@@ -681,7 +719,7 @@ func MapError(err error) error {
 	case "forbidden":
 		return errors.New(i18n.T("api.err_forbidden"))
 	case "unauthorized":
-		return errors.New(i18n.T("api.err_unauthorized"))
+		return UnauthorizedError()
 	case "tarball_invalid":
 		return errors.New(apiErr.Message)
 	case "deploy_too_large", "deploy_too_many_files", "config_too_large":
@@ -1201,9 +1239,11 @@ func (c *Client) doRaw(req *http.Request, result any) error {
 	defer resp.Body.Close()
 
 	// Before the status is looked at, since a command can exit 0 having seen a
-	// response that was not a success: the status command degrades to a shorter
-	// page on any API failure other than a version refusal and still exits 0, so
-	// recording only on success would drop the release such a run was told about.
+	// response that was not a success: a best-effort read whose failure changes
+	// nothing (the prior-mode read before a CDN flip, the nudge inside a watch),
+	// a watch poll that is retried, and a `kamakiri status --recheck` whose nudge
+	// the server did not perform all do, so recording only on success would drop
+	// the release such a run was told about.
 	recordLatestAdvertised(resp.Header.Get(latestVersionHeader))
 
 	respBody, err := io.ReadAll(resp.Body)

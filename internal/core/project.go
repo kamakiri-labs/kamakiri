@@ -20,15 +20,25 @@ type ProjectConfig struct {
 	ID      string `json:"id"`
 }
 
+// RequireCredentials returns nil when this run has a credential, and otherwise
+// the error a caller prints as-is: the load error when the file cannot be read,
+// the not-logged-in line when neither the variable nor the file holds a key.
+func RequireCredentials() error {
+	creds, err := LoadCredentials()
+	if err != nil {
+		return err
+	}
+	if creds == nil {
+		return errors.New(i18n.T("common.err_not_logged_in"))
+	}
+	return nil
+}
+
 // RequireProject returns the linked site's config, or an error the caller can
 // print as-is when the user is not logged in or the directory is not linked.
 func RequireProject() (*ProjectConfig, error) {
-	creds, err := LoadCredentials()
-	if err != nil {
+	if err := RequireCredentials(); err != nil {
 		return nil, err
-	}
-	if creds == nil {
-		return nil, errors.New(i18n.T("common.err_not_logged_in"))
 	}
 
 	config, err := LoadProject()

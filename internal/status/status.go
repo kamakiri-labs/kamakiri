@@ -92,38 +92,65 @@ type SiteClient interface {
 // records left stale by a CDN mode flip. The CLI wrapper exits non-zero on true,
 // so `kamakiri status` slots into polling and CI checks. The error is separate
 // from it because the two mean different things: drift is a finding about the
-// site, the error is status failing to report at all. It is non-nil only when
-// the server refuses this CLI version; every other API failure still degrades to
-// a shorter page, and the caller owns printing it.
+// site, the error is status being unable to vouch for it, whether because nobody
+// is logged in, the credentials file cannot be read, or a read failed. The page
+// is rendered as far as it got, and the caller owns printing the error after it.
 func Run(out io.Writer, version, baseURL string, client SiteClient, verbose bool) (bool, error) {
-	return run(out, version, baseURL, client, verbose, false)
+	return run(out, io.Discard, version, baseURL, client, verbose, false)
 }
 
 // RunWithRecheck is `status --recheck`: it POSTs the recheck endpoint for each
 // non-serving custom domain, opening the server-side verify-priority window,
-// before rendering. It returns the same drift signal and error as Run.
-func RunWithRecheck(out io.Writer, version, baseURL string, client SiteClient, verbose bool) (bool, error) {
-	return run(out, version, baseURL, client, verbose, true)
+// before rendering. It returns the same drift signal and error as Run. A recheck
+// the server did not perform changes nothing the page reports, so its failure is
+// written to errOut as the page renders and never returned.
+func RunWithRecheck(out, errOut io.Writer, version, baseURL string, client SiteClient, verbose bool) (bool, error) {
+	return run(out, errOut, version, baseURL, client, verbose, true)
 }
 
-func run(out io.Writer, version, baseURL string, client SiteClient, verbose, recheck bool) (bool, error) {
+func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verbose, recheck bool) (bool, error) {
 	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_version")), version)
 
-	credPath, pathErr := core.CredentialsPath()
-	if pathErr != nil {
+	// What stops this run from vouching for the site: the page reports it on its
+	// lines and the caller prints it after the page. It stays nil only while a
+	// key is in hand.
+	var credErr error
+
+	// The variable outranks the file and the file is then left unread, so this
+	// branch names the variable rather than a path the run never opened, and the
+	// logged-in line can only say yes: the variable carries a key and no email.
+	if _, fromEnvironment := core.APIKeyFromEnvironment(); fromEnvironment {
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), i18n.T("status.value_credentials_env"))
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_yes"))
+	} else if credPath, pathErr := core.CredentialsPath(); pathErr != nil {
+		credErr = pathErr
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), i18n.Tf("status.value_error", pathErr))
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_no"))
-	} else if _, err := os.Stat(credPath); err != nil {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), i18n.T("status.value_not_found"))
+	} else if creds, err := core.LoadCredentials(); err != nil {
+		// The page reads whether the file is usable off LoadCredentials and
+		// never off a stat, which would let it say not found over a file that
+		// is there but unreadable: such a file is reported here, as the load's
+		// own error, ahead of the branch below that does stat. The same failure
+		// is what the caller prints after the page.
+		credErr = err
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credPath)
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.Tf("status.value_error", err))
+	} else if creds == nil {
+		// Two states land here, no file at all and a file holding no key, and
+		// the stat only asks which of the two the reader is looking at. Every
+		// failure it can return reads as not found, the ordinary not-exist over
+		// a missing file included, which is safe because the load above has
+		// already ruled out a file that is there but cannot be read.
+		credErr = errors.New(i18n.T("common.err_not_logged_in"))
+		credValue := i18n.T("status.value_not_found")
+		if _, statErr := os.Stat(credPath); statErr == nil {
+			credValue = credPath
+		}
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credValue)
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_no"))
 	} else {
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credPath)
-		creds, err := core.LoadCredentials()
-		if err != nil {
-			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.Tf("status.value_error", err))
-		} else if creds == nil {
-			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_no"))
-		} else if creds.Email != "" {
+		if creds.Email != "" {
 			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), creds.Email)
 		} else {
 			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_yes"))
@@ -135,18 +162,26 @@ func run(out io.Writer, version, baseURL string, client SiteClient, verbose, rec
 	config, _ := core.LoadProject()
 	if config == nil {
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), i18n.T("status.value_none"))
-		return false, nil
+		return false, credErr
 	}
 
 	if client == nil {
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
-		return false, nil
+		return false, credErr
+	}
+
+	// With no key to send, a lookup can only come back unauthorized, and its
+	// copy would blame a key that was never sent; the site line carries the ID
+	// it can name and the credential lines already say why.
+	if credErr != nil {
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
+		return false, credErr
 	}
 
 	site, err := client.GetSite(config.ID)
 	if err != nil {
 		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
-		return false, versionRefusal(err)
+		return false, api.MapError(err)
 	}
 
 	// Branch on the teardown lifecycle before any per-projection rendering: for a
@@ -160,18 +195,28 @@ func run(out io.Writer, version, baseURL string, client SiteClient, verbose, rec
 
 	result, err := client.ListDomains(config.ID)
 	if err != nil {
-		return false, versionRefusal(err)
+		return false, api.MapError(err)
 	}
 
-	// The recheck endpoint does not probe: it opens the verify-priority window so
-	// the next server-side tick picks the domain up. Its errors are non-fatal,
-	// since the goal is still to render status: the pre-recheck row is kept.
+	// The recheck asks the server to probe sooner than its own cadence; it does
+	// not decide anything the page reports. A recheck the server did not perform
+	// therefore leaves the row as it was and the exit code alone: the server
+	// keeps probing regardless. A rate limit says nothing the page's in-burst
+	// nudge does not already say, so it stays quiet; any other failure is worth
+	// one line.
 	if recheck {
 		for i := range result.Domains {
 			if result.Domains[i].State == domain.StateServing {
 				continue
 			}
-			if fresh, err := client.RecheckDomain(result.Domains[i].Domain); err == nil && fresh != nil {
+			fresh, err := client.RecheckDomain(result.Domains[i].Domain)
+			if err != nil {
+				if !isErrorCode(err, "rate_limited") {
+					fmt.Fprintln(errOut, i18n.Tf("status.recheck_failed", result.Domains[i].Domain, api.MapError(err)))
+				}
+				continue
+			}
+			if fresh != nil {
 				result.Domains[i] = *fresh
 			}
 		}
@@ -198,7 +243,7 @@ func run(out io.Writer, version, baseURL string, client SiteClient, verbose, rec
 
 	cdnResult, err := client.CDNStatus(config.ID)
 	if err != nil {
-		return false, versionRefusal(err)
+		return false, api.MapError(err)
 	}
 
 	// The mode is the name of the `kamakiri cdn <mode>` subcommand that set it
@@ -226,18 +271,6 @@ func run(out io.Writer, version, baseURL string, client SiteClient, verbose, rec
 	blockedHosts := blockedHostSet(site)
 
 	return renderPerDomainStatus(out, result.Domains, cdnResult, verbose, recheck, blockedHosts), nil
-}
-
-// versionRefusal returns err when the server refused this CLI version, and nil
-// for any other API failure. Status degrades to a shorter page when a read
-// fails, which is right while the rest of it still holds; a refused version is
-// not that, since every further read fails the same way and the page left would
-// report an absence rather than a fact.
-func versionRefusal(err error) error {
-	if errors.Is(err, api.ErrUpgradeRequired) {
-		return err
-	}
-	return nil
 }
 
 // renderFreshnessBlock prints the site-level freshness lines: whether the
@@ -642,4 +675,13 @@ func renderStatusBranch(out io.Writer, site *api.Site) bool {
 			i18n.Tf("status.value_stuck", site.Status, site.StatusObserved))
 		return true
 	}
+}
+
+// isErrorCode reports whether err is an API error response carrying the given
+// code.
+func isErrorCode(err error, code string) bool {
+	if apiErr, ok := err.(*api.ErrorResponse); ok {
+		return apiErr.Code == code
+	}
+	return false
 }

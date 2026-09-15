@@ -21,8 +21,14 @@ import (
 // the suite runs under: the API error copy they match on renders from the
 // message catalog. Load rather than Setup: nothing here reports which language
 // is in force, only renders in it.
+//
+// KAMAKIRI_API_KEY is cleared for a reason of its own: it outranks the
+// credentials file, so on a machine that exports it a test that writes a key
+// into its own config home would still load the developer's. There is no
+// *testing.T here, hence os.Unsetenv rather than t.Setenv.
 func TestMain(m *testing.M) {
 	i18n.Load("en")
+	os.Unsetenv(core.EnvAPIKey)
 	os.Exit(m.Run())
 }
 

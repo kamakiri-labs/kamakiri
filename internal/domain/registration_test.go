@@ -278,6 +278,8 @@ func TestRegisterWatchNonTTYNoANSI(t *testing.T) {
 }
 
 func TestUnregisterSuccess(t *testing.T) {
+	setupCredentials(t)
+
 	var gotName string
 	client := &mockClient{
 		unregisterDomainFn: func(name string) error {
@@ -299,6 +301,8 @@ func TestUnregisterSuccess(t *testing.T) {
 }
 
 func TestUnregisterInUse(t *testing.T) {
+	setupCredentials(t)
+
 	client := &mockClient{
 		unregisterDomainFn: func(_ string) error {
 			return &api.ErrorResponse{
@@ -319,6 +323,8 @@ func TestUnregisterInUse(t *testing.T) {
 }
 
 func TestUnregisterIdempotentUnknown(t *testing.T) {
+	setupCredentials(t)
+
 	// An unknown name is a no-op server-side, so the CLI reports success.
 	client := &mockClient{
 		unregisterDomainFn: func(_ string) error { return nil },
@@ -331,6 +337,61 @@ func TestUnregisterIdempotentUnknown(t *testing.T) {
 	if !strings.Contains(out.String(), "Unregistered never-registered.com") {
 		t.Errorf("output = %q", out.String())
 	}
+}
+
+// The three account-scoped verbs need no project, so the credential check in
+// each wrapper is the only thing standing between a keyless run and a request
+// that could only come back unauthorized.
+func TestRegistrationVerbsRefuseWithoutACredential(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	client := &mockClient{
+		registerDomainFn: func(string) (*api.Registration, error) {
+			t.Fatal("RegisterDomain must not be called without a credential")
+			return nil, nil
+		},
+		unregisterDomainFn: func(string) error {
+			t.Fatal("UnregisterDomain must not be called without a credential")
+			return nil
+		},
+		listRegistrationsFn: func() (*api.RegistrationList, error) {
+			t.Fatal("ListRegistrations must not be called without a credential")
+			return nil, nil
+		},
+	}
+
+	t.Run("register", func(t *testing.T) {
+		var out bytes.Buffer
+		err := Register(client, "example.com", true, &out)
+		if err == nil {
+			t.Fatal("Register() expected error")
+		}
+		if got, want := err.Error(), i18n.T("common.err_not_logged_in"); got != want {
+			t.Errorf("error = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("unregister", func(t *testing.T) {
+		var out bytes.Buffer
+		err := Unregister(client, "example.com", &out)
+		if err == nil {
+			t.Fatal("Unregister() expected error")
+		}
+		if got, want := err.Error(), i18n.T("common.err_not_logged_in"); got != want {
+			t.Errorf("error = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("list", func(t *testing.T) {
+		var out bytes.Buffer
+		err := ListRegistrations(client, &out)
+		if err == nil {
+			t.Fatal("ListRegistrations() expected error")
+		}
+		if got, want := err.Error(), i18n.T("common.err_not_logged_in"); got != want {
+			t.Errorf("error = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestVerifyRoutesToRegisterWhenPendingRegistrationExists(t *testing.T) {

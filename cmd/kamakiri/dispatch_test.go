@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kamakiri-labs/kamakiri/internal/api"
+	"github.com/kamakiri-labs/kamakiri/internal/core"
 )
 
 // usageBlock is every byte `kamakiri` with no command prints, one Go line per
@@ -30,6 +36,11 @@ const usageBlock = "Usage: kamakiri <command>\n" +
 	"  upgrade     Update the CLI to the latest release\n" +
 	"\n" +
 	"Environment variables:\n" +
+	"  KAMAKIRI_API_KEY\n" +
+	"    The API key every command that needs a credential uses, for CI runners\n" +
+	"    with no credentials file. While it is set, the credentials file is not\n" +
+	"    read. Take the key from the file `kamakiri login` saves on your machine.\n" +
+	"\n" +
 	"  KAMAKIRI_CDN_TOKEN, KAMAKIRI_CDN_SECRET\n" +
 	"    WebAccel API credentials for `kamakiri cdn webaccel`. Prefer these\n" +
 	"    over --token/--secret flags in CI: command-line arguments are visible\n" +
@@ -113,20 +124,38 @@ type golden struct {
 
 // pinDispatchEnvironment gives one test an environment that reads the same on
 // any machine. XDG_CONFIG_HOME points at an empty directory because run
-// resolves the language from the saved settings and setAPIKey reads the
+// resolves the language from the saved settings and loadAPIKey reads the
 // credentials file: without it a test would render in whatever language the
-// developer saved, and hand their real API key to whatever it dispatched into.
-// The four locale variables are cleared for the first of those reasons one step
-// earlier: run re-resolves the language on every call, so the catalog TestMain
-// pins does not survive it.
+// developer saved. KAMAKIRI_API_KEY is cleared alongside it, since it outranks
+// that file: an empty config home alone would still hand a developer's real key
+// to whatever the test dispatched into. KAMAKIRI_API_URL is cleared too, so a
+// test that sets no server dispatches against the default base URL rather than
+// a host the developer exported; an empty value reads as unset. The four locale
+// variables are cleared for the first of those reasons one step earlier: run
+// re-resolves the language on every call, so the catalog TestMain pins does not
+// survive it.
 func pinDispatchEnvironment(t *testing.T) {
 	t.Helper()
 
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("KAMAKIRI_API_KEY", "")
+	t.Setenv("KAMAKIRI_API_URL", "")
 	t.Setenv("LC_ALL", "")
 	t.Setenv("LC_MESSAGES", "")
 	t.Setenv("LANG", "")
 	t.Setenv("KAMAKIRI_LANG", "")
+}
+
+// Nothing else in the package fails when the KAMAKIRI_API_KEY clear above is
+// dropped, so the clear is pinned here rather than through a dispatch. What it
+// costs is invisible on a machine that does not export the variable, and on one
+// that does it is a test handing a real key to the server it drives.
+func TestPinDispatchEnvironmentClearsTheAPIKey(t *testing.T) {
+	pinDispatchEnvironment(t)
+
+	if _, ok := core.APIKeyFromEnvironment(); ok {
+		t.Error("APIKeyFromEnvironment() reports a key after pinDispatchEnvironment, want none")
+	}
 }
 
 // run drives the dispatch with the environment pinned, so a golden reads the
@@ -604,6 +633,10 @@ func TestUpdateNudgeRidesTheDispatch(t *testing.T) {
 
 	t.Run("after a command that succeeded", func(t *testing.T) {
 		pinDispatchEnvironment(t)
+		// The command needs a credential to reach the server at all, and the
+		// variable is the cheapest way to give it one.
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_test")
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
 		forceNudgeTerminal(t)
 		stampVersion(t, "v0.1.1")
 		t.Setenv("KAMAKIRI_API_URL", advertisingAPI(t, 200, `{"registrations":[]}`))
@@ -624,6 +657,8 @@ func TestUpdateNudgeRidesTheDispatch(t *testing.T) {
 
 	t.Run("not after a command that failed", func(t *testing.T) {
 		pinDispatchEnvironment(t)
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_test")
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
 		forceNudgeTerminal(t)
 		stampVersion(t, "v0.1.1")
 		t.Setenv("KAMAKIRI_API_URL", advertisingAPI(t, 503, "<html>503 Service Unavailable</html>"))
@@ -643,6 +678,8 @@ func TestUpdateNudgeRidesTheDispatch(t *testing.T) {
 	// difference between the two, so it is the only thing this can be reporting.
 	t.Run("not when stderr is no terminal", func(t *testing.T) {
 		pinDispatchEnvironment(t)
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_test")
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
 		stampVersion(t, "v0.1.1")
 		t.Setenv("KAMAKIRI_API_URL", advertisingAPI(t, 200, `{"registrations":[]}`))
 
@@ -654,6 +691,787 @@ func TestUpdateNudgeRidesTheDispatch(t *testing.T) {
 		}
 		if got := stderr.String(); got != "" {
 			t.Errorf("stderr:\n%q\nwant nothing", got)
+		}
+	})
+}
+
+// The variable is read in one place, deep under every command, so what proves
+// it reaches the wire is a real dispatch: an ordinary command, no credentials
+// file anywhere, and a server that records what arrived. `domain list` is the
+// command that needs no linked project, `deploys` the one whose refusal crosses
+// the credential check, and `login` the one command that builds a client
+// without loading a credential.
+//
+// A dispatch that loads credentials leaves the package-level stamp in `api`
+// behind it, and nothing else in the suite resets it. Today every dispatch that
+// can render the unauthorized copy re-stamps first, so a stale value decides
+// nothing; the subtests that stamp it true restore it anyway, so a render site
+// added later without that re-stamp cannot inherit a value from another test.
+func TestAPIKeyFromEnvironmentRidesTheDispatch(t *testing.T) {
+	t.Run("the bearer is the key the variable holds", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+		var authorization string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authorization = r.Header.Get("Authorization")
+			io.WriteString(w, `{"registrations":[]}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"domain", "list"}, strings.NewReader(""), &stdout, &stderr)
+
+		// The handler records from the server's own goroutine, and Close
+		// returns only once that goroutine has finished, which is what orders
+		// its write against the read below.
+		server.Close()
+
+		if code != 0 {
+			t.Fatalf("`kamakiri domain list` exited %d, want 0; stderr: %q", code, stderr.String())
+		}
+		if got, want := authorization, "Bearer kk_live_fromenv"; got != want {
+			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+	})
+
+	// The stamp the credential load leaves is what the copy reads, so the pin
+	// has to be a real dispatch too. The assertion holds only the half that
+	// names the variable: the `invalid API key` prefix both arms share is what
+	// every other assertion on this copy matches, so nothing else would notice
+	// the stamp going missing.
+	t.Run("a rejected key from the variable says which variable", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"domain", "list"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri domain list` exited %d, want 1", code)
+		}
+		got := stderr.String()
+		if !strings.Contains(got, "The key came from KAMAKIRI_API_KEY; check the value that variable holds") {
+			t.Errorf("stderr:\n%q\nwant the copy naming the variable", got)
+		}
+		if strings.Contains(got, "kamakiri login") {
+			t.Errorf("stderr:\n%q\nwant no mention of login", got)
+		}
+	})
+
+	// The stamp's other arm. A stamp that recorded any credential at all rather
+	// than an environment one would send a file-credentialed user to look at a
+	// variable they never set, and nothing else in the suite would notice: every
+	// other assertion on this copy matches the shared `invalid API key` prefix.
+	t.Run("a rejected key from the file says to log in again", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+		if err := core.SaveCredentials("kk_live_fromfile", "user@example.com"); err != nil {
+			t.Fatalf("SaveCredentials: %v", err)
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"domain", "list"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri domain list` exited %d, want 1", code)
+		}
+		got := stderr.String()
+		if !strings.Contains(got, `Run "kamakiri login" to re-authenticate`) {
+			t.Errorf("stderr:\n%q\nwant the copy pointing at login", got)
+		}
+		if strings.Contains(got, "KAMAKIRI_API_KEY") {
+			t.Errorf("stderr:\n%q\nwant no mention of the variable", got)
+		}
+	})
+
+	// The `domain list` cases above reach the copy through api.MapError, while
+	// `init` and `teardown` build it themselves, so only a real dispatch through
+	// one of them proves that a direct render site consults the stamp.
+	t.Run("a rejected key on a direct render site says which variable", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		// The project file is written relative to the working directory, so the
+		// temp directory is what keeps it out of the developer's tree.
+		t.Chdir(t.TempDir())
+
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"teardown"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri teardown` exited %d, want 1", code)
+		}
+		got := stderr.String()
+		if !strings.Contains(got, "The key came from KAMAKIRI_API_KEY; check the value that variable holds") {
+			t.Errorf("stderr:\n%q\nwant the copy naming the variable", got)
+		}
+		if strings.Contains(got, "kamakiri login") {
+			t.Errorf("stderr:\n%q\nwant no mention of login", got)
+		}
+	})
+
+	// `login` mints a key rather than using one, so it is the one command that
+	// builds its client without setAPIKey and must send no bearer even while the
+	// variable holds a key. Nothing short of a real dispatch reaches that: the
+	// login package drives a client of function fields, where no request exists
+	// to inspect.
+	t.Run("login sends no bearer under the variable", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+
+		var registerAuth, verifyAuth string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/auth/register":
+				registerAuth = r.Header.Get("Authorization")
+				io.WriteString(w, `{"message":"Confirmation code sent."}`)
+			case "/v1/auth/verify":
+				verifyAuth = r.Header.Get("Authorization")
+				io.WriteString(w, `{"api_key":"kk_live_minted"}`)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"login"}, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+
+		// The handler records from the server's own goroutines, and Close returns
+		// only once those have finished, which is what orders both writes against
+		// the reads below.
+		server.Close()
+
+		if code != 0 {
+			t.Fatalf("`kamakiri login` exited %d, want 0; stderr: %q", code, stderr.String())
+		}
+		if registerAuth != "" || verifyAuth != "" {
+			t.Errorf("login sent an Authorization header (register %q, verify %q), want none on either", registerAuth, verifyAuth)
+		}
+		if got := stdout.String(); !strings.Contains(got, "KAMAKIRI_API_KEY is set") {
+			t.Errorf("stdout:\n%q\nwant the note saying the variable still wins", got)
+		}
+	})
+
+	// The whole line, rather than the bare `not logged in` prefix every
+	// neighbouring assertion matches on: this is the only test that holds the
+	// wording, and the blank value carries the trim rule end to end.
+	t.Run("a blank value is no credential", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Setenv("KAMAKIRI_API_KEY", " ")
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"deploys"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri deploys` exited %d, want 1", code)
+		}
+		want := "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+	})
+}
+
+// A credentials file that holds no key refuses every command that needs a
+// credential, with the login advice, rather than sending a request the server
+// could only reject. `status` is the exception that reports the same file on
+// its page instead. `deploys` is the command driven because its refusal
+// crosses the credential check with no other check ahead of it, so the line it
+// prints can only have come from that check: the keyless file leaves the load
+// with no error and the client's key empty, and the credential check is what
+// refuses.
+// No project is linked, so nothing is sent whichever way the check goes.
+func TestAKeylessCredentialsFileRefusesAsNotLoggedIn(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Chdir(t.TempDir())
+
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":"   "}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"deploys"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("`kamakiri deploys` exited %d, want 1", code)
+	}
+	want := "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+	if got := stderr.String(); got != want {
+		t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// An unreadable credentials file is a finding `status` reports rather than a
+// reason to refuse: it renders the whole page with the failure on its own line,
+// prints the same failure on stderr after it, and exits 1, so a check has the
+// page, the reason and a code.
+func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
+	t.Run("the page carries the error and the exit is 1", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		// No project is linked here, so the page ends at the site line before
+		// any request and needs no server.
+		t.Chdir(t.TempDir())
+		dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("not json"), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if line := stderr.String(); !strings.HasPrefix(line, "parse credentials:") ||
+			strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+			t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "parse credentials:")
+		}
+		// The Credentials line names a throwaway config home, so the two lines
+		// that carry no path are what is pinned.
+		got := stdout.String()
+		if !strings.Contains(got, "Logged in:    (error: parse credentials:") {
+			t.Errorf("stdout:\n%q\nwant the logged-in line carrying the load error", got)
+		}
+		if !strings.Contains(got, "Site:         (none)") {
+			t.Errorf("stdout:\n%q\nwant the page rendered to its last line", got)
+		}
+	})
+
+	// The variable outranks the file and the file is then left unread, so
+	// nothing it holds reaches the page or the exit code. The Credentials line
+	// pins the precedence, since the page asks APIKeyFromEnvironment directly,
+	// and the exit 0 over a file that cannot be parsed pins that the file
+	// decides nothing.
+	t.Run("the variable outranks the file for the exit code too", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("not json"), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 0 {
+			t.Fatalf("`kamakiri status` exited %d, want 0; stderr: %q", code, stderr.String())
+		}
+		if got := stderr.String(); got != "" {
+			t.Errorf("stderr:\n%q\nwant nothing", got)
+		}
+		got := stdout.String()
+		for _, want := range []string{
+			"Credentials:  KAMAKIRI_API_KEY (environment)",
+			"Logged in:    yes",
+			"Site:         (none)",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
+			}
+		}
+	})
+
+	// With a site linked and no key, the page still ends at the site line, but
+	// nothing is sent: a keyless lookup could only come back unauthorized.
+	t.Run("a linked site is not looked up without a key", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+
+		dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("not json"), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var requests int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if line := stderr.String(); !strings.HasPrefix(line, "parse credentials:") ||
+			strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+			t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "parse credentials:")
+		}
+		got := stdout.String()
+		if !strings.Contains(got, "Logged in:    (error: parse credentials:") {
+			t.Errorf("stdout:\n%q\nwant the logged-in line carrying the load error", got)
+		}
+		if !strings.Contains(got, "Site:         site123") {
+			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		}
+		if requests != 0 {
+			t.Error("a request went out, but a failed load leaves no key to send")
+		}
+	})
+}
+
+// TestSetAPIKeyStillRefusesOnAFailedLoad pins that the wrapper every command
+// that authenticates relies on still exits on a failed load; status is the one
+// command that renders the failure instead. `domain register` is the command
+// driven because the wrapper's line and the verb's own are told apart by their
+// shape: the wrapper prints the load error bare, while anything the verb returns
+// is printed behind the `Error:` prefix, so a wrapper that stopped exiting shows
+// up as a prefixed line. The address it would dial has nothing listening, so
+// nothing this test does can reach a real host.
+func TestSetAPIKeyStillRefusesOnAFailedLoad(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+	t.Chdir(t.TempDir())
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("not json"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("KAMAKIRI_API_URL", "http://127.0.0.1:1")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"domain", "register", "example.com"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("`kamakiri domain register` exited %d, want 1", code)
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("stdout:\n%q\nwant nothing", got)
+	}
+	if line := stderr.String(); !strings.HasPrefix(line, "parse credentials:") ||
+		strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+		t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "parse credentials:")
+	}
+}
+
+// TestStatusExitsWhenItCannotVouch pins the exit code as a verdict: the page
+// renders as far as it got, and status exits 1 with one line on stderr whenever
+// it could not vouch for this machine or the linked site.
+func TestStatusExitsWhenItCannotVouch(t *testing.T) {
+	t.Run("not logged in on a fresh machine", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		got := stdout.String()
+		for _, want := range []string{"Logged in:    no", "Site:         (none)"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
+			}
+		}
+		want := "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+		if line := stderr.String(); line != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", line, want)
+		}
+	})
+
+	// A file that is there but holds no key is reported as present and not
+	// logged in, and nothing is sent over it: a keyless lookup could only come
+	// back unauthorized, and its copy would blame a key that was never sent.
+	t.Run("a credentials file holding no key is not logged in and sends nothing", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+
+		dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":""}`), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var requests int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		got := stdout.String()
+		for _, want := range []string{"Logged in:    no", "Site:         site123"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
+			}
+		}
+		if strings.Contains(got, "(not found)") {
+			t.Errorf("stdout:\n%q\nwant the credentials line naming the file that is there", got)
+		}
+		want := "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+		if line := stderr.String(); line != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", line, want)
+		}
+		if requests != 0 {
+			t.Error("a request went out, but a file holding no key leaves no key to send")
+		}
+	})
+
+	t.Run("a rejected key", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if got := stdout.String(); !strings.Contains(got, "Site:         site123") {
+			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		}
+		if got := stderr.String(); !strings.Contains(got, "The key came from KAMAKIRI_API_KEY; check the value that variable holds") {
+			t.Errorf("stderr:\n%q\nwant the copy naming the variable", got)
+		}
+	})
+
+	// Nothing listens on port 1, so the request fails in the transport and the
+	// tail of the line is the platform's own dial error, which is why only the
+	// catalog prefix is matched.
+	t.Run("an unreachable API", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", "http://127.0.0.1:1")
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if got := stdout.String(); !strings.Contains(got, "Site:         site123") {
+			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		}
+		if line := stderr.String(); !strings.HasPrefix(line, "request failed:") ||
+			strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+			t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "request failed:")
+		}
+	})
+}
+
+// Drift is the one exit 1 the page reaches with no error in hand, so the arm
+// prints its line from a key of its own. The fixture is marshalled from the
+// wire types rather than spelled out as JSON so it cannot drift from them.
+func TestStatusDriftExitsWithALine(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+	t.Chdir(t.TempDir())
+
+	if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+		t.Fatalf("SaveProject: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body any
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/pages/sites/"):
+			body = api.Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}
+		case r.URL.Path == "/v1/pages/domains":
+			body = api.DomainList{Domains: []api.Domain{
+				{
+					Domain: "example.com",
+					Role:   "canonical",
+					State:  "serving",
+					// The server-derived verdict says the customer publishes
+					// direct apex A records, so the drift check applies.
+					DnsMatchedAlternative: "a",
+					DNSRecordsExpected: []api.DNSRecord{
+						{Name: "example.com", Type: "alias_or_aname", Value: "x.kamakiri-pages.site.", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+						{Name: "example.com", Type: "a", Value: "173.245.48.0", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+						{Name: "example.com", Type: "a", Value: "103.21.244.0", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+					},
+					DNSRecordsObserved: []api.DNSRecordObserved{
+						{
+							Name: "example.com", Type: "a",
+							// The old cluster IPs, against the post-flip anycast
+							// set expected above.
+							Values:           []string{"198.51.100.10", "198.51.100.11"},
+							AlternativeGroup: "apex_primary",
+						},
+					},
+				},
+			}}
+		case r.URL.Path == "/v1/pages/cdn/status":
+			body = api.CDNStatusResponse{CDNMode: "cloudflare", Provider: "cloudflare"}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+			return
+		}
+		payload, err := json.Marshal(body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("`kamakiri status` exited %d, want 1; stderr: %q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "✗ A records do not match the current edge for cloudflare mode") {
+		t.Errorf("stdout:\n%q\nwant the drift block", got)
+	}
+	want := "A records do not match the current edge. The kamakiri status page lists the expected and observed values.\n"
+	if got := stderr.String(); got != want {
+		t.Errorf("stderr = %q, want %q", got, want)
+	}
+}
+
+// TestStatusRecheckWarningRidesTheDispatch pins which stream the dispatch hands
+// the recheck loop: a recheck the server did not perform is noted on stderr and
+// not in the page, and it decides nothing about the exit code, so a run with
+// nothing else wrong leaves stderr holding that one line and exits 0.
+func TestStatusRecheckWarningRidesTheDispatch(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+	t.Chdir(t.TempDir())
+
+	if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+		t.Fatalf("SaveProject: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body any
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/recheck"):
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"code":"internal_error","message":"probe worker unavailable"}`)
+			return
+		case strings.HasPrefix(r.URL.Path, "/v1/pages/sites/"):
+			body = api.Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}
+		case r.URL.Path == "/v1/pages/domains":
+			body = api.DomainList{Domains: []api.Domain{
+				{
+					Domain: "next.altstack.jp",
+					Role:   "canonical",
+					// Awaiting DNS, so the loop asks about this row, and the row
+					// matched no apex A alternative, so the drift check does not
+					// apply and the exit code is the recheck's to decide.
+					State:      "awaiting_dns",
+					DnsVerdict: "absent",
+					DNSRecordsExpected: []api.DNSRecord{
+						{Name: "next.altstack.jp", Type: "cname", Value: "t.kamakiri-pages.site.", Purpose: "primary", Required: true},
+					},
+				},
+			}}
+		case r.URL.Path == "/v1/pages/cdn/status":
+			body = api.CDNStatusResponse{CDNMode: "none", Provider: "none"}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+			return
+		}
+		payload, err := json.Marshal(body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"status", "--recheck"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("`kamakiri status --recheck` exited %d, want 0; stderr: %q", code, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "next.altstack.jp") {
+		t.Errorf("stdout:\n%q\nwant the row for the domain the recheck was refused for", got)
+	}
+	if strings.Contains(got, "not performed") {
+		t.Errorf("stdout:\n%q\nwant the warning on stderr, not on stdout", got)
+	}
+	want := "recheck of next.altstack.jp not performed (probe worker unavailable). The server keeps checking on its own.\n"
+	if line := stderr.String(); line != want {
+		t.Errorf("stderr = %q, want %q", line, want)
+	}
+}
+
+// TestAccountScopedDomainVerbsRefuseBeforeSending pins that the domain verbs
+// that need no project still need a credential, and say so before anything is
+// sent: a keyless request could only come back unauthorized, blaming a key that
+// was never there.
+func TestAccountScopedDomainVerbsRefuseBeforeSending(t *testing.T) {
+	const notLoggedIn = "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+
+	t.Run("domain list refuses before it sends", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+		var requests int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"domain", "list"}, strings.NewReader(""), &stdout, &stderr)
+
+		// The handler records from the server's own goroutine, and Close
+		// returns only once that goroutine has finished, which is what orders
+		// its write against the read below.
+		server.Close()
+
+		if code != 1 {
+			t.Fatalf("`kamakiri domain list` exited %d, want 1", code)
+		}
+		if got := stderr.String(); got != notLoggedIn {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, notLoggedIn)
+		}
+		if requests != 0 {
+			t.Error("a request went out, but there is no credential to send")
+		}
+	})
+
+	t.Run("domain register says so behind its prefix", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+		var requests int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"domain", "register", "example.com"}, strings.NewReader(""), &stdout, &stderr)
+
+		server.Close()
+
+		if code != 1 {
+			t.Fatalf("`kamakiri domain register` exited %d, want 1", code)
+		}
+		if got, want := stderr.String(), "Error: "+notLoggedIn; got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+		if requests != 0 {
+			t.Error("a request went out, but there is no credential to send")
 		}
 	})
 }

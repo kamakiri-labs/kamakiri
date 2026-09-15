@@ -205,6 +205,26 @@ command: custom domains, CDN modes, rollbacks and the rest. There is no separate
 help command, and this is a usage message rather than a help screen: it goes to
 stderr and exits non-zero.
 
+## Deploying from CI
+
+A runner has no credentials file and nobody at the keyboard, so it authenticates
+through `KAMAKIRI_API_KEY`. Set it in the runner's environment, from a
+repository secret rather than a literal written into the workflow file. While
+the variable holds a key, the credentials file is not read at all, and
+`kamakiri status` reports the variable as the credential source.
+
+The key is the `api_key` value in `~/.config/kamakiri/credentials.json`, the
+file `kamakiri login` writes on your own machine; on Windows,
+`%USERPROFILE%\.config\kamakiri\credentials.json`. Copy that value in as the
+whole secret, with nothing around it. `login` prints only the path of the file
+it wrote, never the key. Running `login` again mints a new key and leaves the
+one already in CI valid, so rotating on your own machine does not break the
+runner.
+
+A command that needs a credential and finds neither the variable nor a
+credentials file exits 1 with one line pointing at both remedies:
+`kamakiri login`, or the variable.
+
 ## Language
 
 The CLI speaks English and Japanese. It settles on one at startup from your

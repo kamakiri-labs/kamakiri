@@ -777,6 +777,42 @@ func TestMapError(t *testing.T) {
 	}
 }
 
+// The unauthorized copy is the one arm whose wording depends on where the key
+// came from, so both arms are pinned here and through MapError, which is what
+// every command that meets a 401 actually goes through. The value is package
+// state: this test flips it and must stay serial, and it restores it because
+// every other case that renders this copy expects the file arm, whatever order
+// the suite runs in.
+func TestUnauthorizedErrorNamesWhereTheKeyCameFrom(t *testing.T) {
+	t.Cleanup(func() { SetKeyFromEnvironment(false) })
+
+	SetKeyFromEnvironment(false)
+	for name, got := range map[string]string{
+		"UnauthorizedError": UnauthorizedError().Error(),
+		"MapError":          MapError(&ErrorResponse{Code: "unauthorized", Message: "raw"}).Error(),
+	} {
+		if !strings.Contains(got, `Run "kamakiri login" to re-authenticate`) {
+			t.Errorf("%s with a key from the file = %q, want the login copy", name, got)
+		}
+		if strings.Contains(got, "KAMAKIRI_API_KEY") {
+			t.Errorf("%s with a key from the file = %q, want no mention of the variable", name, got)
+		}
+	}
+
+	SetKeyFromEnvironment(true)
+	for name, got := range map[string]string{
+		"UnauthorizedError": UnauthorizedError().Error(),
+		"MapError":          MapError(&ErrorResponse{Code: "unauthorized", Message: "raw"}).Error(),
+	} {
+		if !strings.Contains(got, "The key came from KAMAKIRI_API_KEY; check the value that variable holds") {
+			t.Errorf("%s with a key from the environment = %q, want the variable copy", name, got)
+		}
+		if strings.Contains(got, "kamakiri login") {
+			t.Errorf("%s with a key from the environment = %q, want no mention of login", name, got)
+		}
+	}
+}
+
 func TestMapErrorPassthroughNonAPI(t *testing.T) {
 	orig := errors.New("network error")
 	err := MapError(orig)
@@ -1726,10 +1762,11 @@ func TestLatestAdvertisedRecordsTheHeader(t *testing.T) {
 	}
 }
 
-// A command can exit 0 having seen a response that was not a success: the status
-// command degrades to a shorter page on any API failure other than a version
-// refusal and still exits 0, so recording only on success would drop the release
-// such a run was told about.
+// A command can exit 0 having seen a response that was not a success: a
+// best-effort read whose failure changes nothing (the prior-mode read before a
+// CDN flip, the nudge inside a watch), a watch poll that is retried, and a
+// `kamakiri status --recheck` whose nudge the server did not perform all do, so
+// recording only on success would drop the release such a run was told about.
 func TestLatestAdvertisedRecordsTheHeaderFromAnErrorResponse(t *testing.T) {
 	seedLatestAdvertised(t, "")
 

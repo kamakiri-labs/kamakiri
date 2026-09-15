@@ -102,6 +102,12 @@ func Run(client APIClient, in io.Reader, out io.Writer) error {
 
 		credPath, _ := core.CredentialsPath()
 		fmt.Fprintln(out, i18n.Tf("login.api_key_saved", credPath))
+		// The key was minted and saved, and yet nothing about the next command
+		// changes while the environment holds a key of its own, so say so rather
+		// than leave the user to work out why the account did not switch.
+		if _, fromEnvironment := core.APIKeyFromEnvironment(); fromEnvironment {
+			fmt.Fprintln(out, i18n.T("login.env_override_note"))
+		}
 		return nil
 	}
 }

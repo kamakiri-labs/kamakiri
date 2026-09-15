@@ -28,8 +28,14 @@ const testLang = "en"
 // the suite runs under: every label, value and per-domain row this page prints
 // comes from the message catalog. Load rather than Setup: nothing here reports
 // which language is in force, only renders in it.
+//
+// KAMAKIRI_API_KEY is cleared for a reason of its own: it outranks the
+// credentials file, so on a machine that exports it a test that writes a key
+// into its own config home would still load the developer's. There is no
+// *testing.T here, hence os.Unsetenv rather than t.Setenv.
 func TestMain(m *testing.M) {
 	i18n.Load(testLang)
+	os.Unsetenv(core.EnvAPIKey)
 	os.Exit(m.Run())
 }
 
@@ -70,7 +76,11 @@ func TestStatusNoCredentials(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	var buf bytes.Buffer
-	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	if want := i18n.T("common.err_not_logged_in"); err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
 
 	out := buf.String()
 
@@ -79,6 +89,47 @@ func TestStatusNoCredentials(t *testing.T) {
 	assertContains(t, out, "Logged in:    no")
 	assertContains(t, out, "https://api.kamakiri-labs.jp/cloud")
 	assertContains(t, out, "Site:         (none)")
+}
+
+// A credentials file holding no key is not a login. The page golden below
+// pins what the reader sees over it; this pins the verdict the run hands back,
+// which the golden runner discards.
+func TestStatusKeylessFileIsNotLoggedIn(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+
+	dir := filepath.Join(home, "kamakiri")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":"","email":"file@example.com"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	if want := i18n.T("common.err_not_logged_in"); err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
+}
+
+// Matched by containment: the message ends in the operating system's own reason
+// for having no home directory to fall back on.
+func TestStatusNoConfigDirectory(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	if want := "determine config directory"; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Run() error = %v, want it to carry %q", err, want)
+	}
+
+	assertContains(t, buf.String(), "Logged in:    no")
 }
 
 func TestStatusWithCredentials(t *testing.T) {
@@ -113,6 +164,51 @@ func TestStatusWithLegacyCredentials(t *testing.T) {
 	assertContains(t, out, "Logged in:    yes")
 }
 
+// The variable outranks the file, and the page says so rather than naming a
+// file the run never opened. `yes` on the logged-in line is all the variable
+// can support: it carries a key and no email. The page names the variable and
+// never the key it holds: a CI run prints that page into a log anyone can read.
+func TestStatusWithAPIKeyFromEnvironment(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+
+	var buf bytes.Buffer
+	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	out := buf.String()
+
+	assertContains(t, out, "Credentials:  KAMAKIRI_API_KEY (environment)")
+	assertContains(t, out, "Logged in:    yes")
+	assertNotContains(t, out, "credentials.json")
+	assertNotContains(t, out, "(not found)")
+	assertNotContains(t, out, "kk_live_fromenv")
+}
+
+// A file present under the variable is still not read, which is what the absent
+// email proves: the file holds one, and the page would print it if it had been
+// opened.
+func TestStatusWithAPIKeyFromEnvironmentIgnoresTheFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if err := core.SaveCredentials("kk_live_fromfile", "user@example.com"); err != nil {
+		t.Fatalf("SaveCredentials: %v", err)
+	}
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+
+	var buf bytes.Buffer
+	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	out := buf.String()
+
+	assertContains(t, out, "Credentials:  KAMAKIRI_API_KEY (environment)")
+	assertContains(t, out, "Logged in:    yes")
+	assertNotContains(t, out, "user@example.com")
+	assertNotContains(t, out, "credentials.json")
+	assertNotContains(t, out, "kk_live_fromenv")
+}
+
 func TestStatusDevVersion(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -133,7 +229,11 @@ func TestStatusCorruptedCredentials(t *testing.T) {
 	os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte("{bad json"), 0600)
 
 	var buf bytes.Buffer
-	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	if err == nil || !strings.Contains(err.Error(), "parse credentials") {
+		t.Fatalf("Run() error = %v, want it to carry %q", err, "parse credentials")
+	}
 
 	out := buf.String()
 	assertContains(t, out, "credentials.json")
@@ -244,9 +344,88 @@ func TestStatusWithSiteAPIError(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+	if err == nil || !strings.Contains(err.Error(), "invalid API key") {
+		t.Fatalf("Run() error = %v, want it to carry %q", err, "invalid API key")
+	}
 
 	out := buf.String()
+	assertContains(t, out, "Site:         site123")
+}
+
+// Every read hands its failure to MapError, so a server code arrives as the copy
+// every other command prints rather than as the server's own message. The site
+// read is pinned by TestStatusWithSiteAPIError; the tables that drive these two
+// feed them a plain error and the upgrade sentinel, both of which MapError
+// returns unchanged, so neither would catch a raw return here.
+func TestStatusMapsAnErrorResponseFromTheDomainAndCDNReads(t *testing.T) {
+	site := func(id string) (*api.Site, error) {
+		return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true}, nil
+	}
+	notFound := &api.ErrorResponse{Code: "site_not_found", Message: "Site not found."}
+
+	cases := []struct {
+		name   string
+		client *mockClient
+	}{
+		{
+			name: "domain list",
+			client: &mockClient{
+				getSiteFn:     site,
+				listDomainsFn: func(string) (*api.DomainList, error) { return nil, notFound },
+			},
+		},
+		{
+			name: "cdn status",
+			client: &mockClient{
+				getSiteFn:   site,
+				cdnStatusFn: func(string) (*api.CDNStatusResponse, error) { return nil, notFound },
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+			core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+			var buf bytes.Buffer
+			_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", tc.client, false)
+
+			if want := i18n.T("api.err_site_not_found"); err == nil || err.Error() != want {
+				t.Fatalf("Run() error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestStatusSkipsTheLookupWithoutAKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	client := &mockClient{
+		getSiteFn: func(string) (*api.Site, error) {
+			t.Fatal("GetSite must not be called without a key")
+			return nil, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+	// Equality rather than containment: a wrapped or prefixed error at the
+	// boundary between the page and its caller is the thing worth catching.
+	if want := i18n.T("common.err_not_logged_in"); err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
+
+	out := buf.String()
+	assertContains(t, out, "Logged in:    no")
 	assertContains(t, out, "Site:         site123")
 }
 
@@ -257,7 +436,13 @@ func TestStatusWithSiteNoClient(t *testing.T) {
 	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
 
 	var buf bytes.Buffer
-	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	// No credential is saved here, so the nil-client return is the one that
+	// carries the not-logged-in error out.
+	if want := i18n.T("common.err_not_logged_in"); err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
 
 	out := buf.String()
 	assertContains(t, out, "Site:         site123")
@@ -839,8 +1024,8 @@ func TestStatusRecheckOptInCallsRecheckAndUsesInBurstFraming(t *testing.T) {
 		return inner(d)
 	}
 
-	var buf bytes.Buffer
-	RunWithRecheck(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	var buf, errBuf bytes.Buffer
+	RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
 	out := buf.String()
 
 	if !called {
@@ -866,12 +1051,70 @@ func TestStatusRecheckRateLimitedIsNonFatal(t *testing.T) {
 		return nil, &api.ErrorResponse{Code: "rate_limited", Message: "Too many requests."}
 	}
 
-	var buf bytes.Buffer
-	RunWithRecheck(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
 	out := buf.String()
 	// Still renders status (falls back to the pre-recheck row).
 	assertContains(t, out, "next.altstack.jp")
 	assertContains(t, out, "Per-domain status:")
+	if err != nil {
+		t.Errorf("a rate-limited recheck must not fail the command, got %v", err)
+	}
+	if errBuf.String() != "" {
+		t.Errorf("a rate limit says nothing the page does not, want empty stderr, got %q", errBuf.String())
+	}
+}
+
+func TestStatusRecheckTransientFailureWarnsAndStillRenders(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	client := newNudgeClient(t, true)
+	client.recheckDomainFn = func(string) (*api.Domain, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	out := buf.String()
+	if err != nil {
+		t.Errorf("a failed recheck must not fail the command, got %v", err)
+	}
+	assertContains(t, out, "next.altstack.jp")
+	assertContains(t, out, "Per-domain status:")
+	assertContains(t, errBuf.String(), "recheck of next.altstack.jp not performed (connection refused). The server keeps checking on its own.")
+}
+
+// A recheck the server did perform is the freshest view of the domain, so the
+// page must render the row it returned and not the one the listing carried.
+func TestStatusRecheckReplacesTheRowWithTheFreshOne(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	client := newNudgeClient(t, true)
+	client.recheckDomainFn = func(d string) (*api.Domain, error) {
+		return &api.Domain{Domain: d, Role: "canonical", State: "serving"}, nil
+	}
+
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	out := buf.String()
+	if err != nil {
+		t.Errorf("a successful recheck must not fail the command, got %v", err)
+	}
+	if errBuf.String() != "" {
+		t.Errorf("a successful recheck warns about nothing, want empty stderr, got %q", errBuf.String())
+	}
+	assertContains(t, out, "next.altstack.jp")
+	assertContains(t, out, "✓ live")
+	// Both belong to the stale awaiting_dns row: its status line and the nudge
+	// that follows it.
+	assertNotContains(t, out, "waiting for your DNS")
+	assertNotContains(t, out, "domain verify next.altstack.jp")
 }
 
 // When an apex's own A records no longer match the per-mode expected set (a CDN
@@ -1475,10 +1718,11 @@ func TestStatusSurfacesAVersionRefusalFromEveryRead(t *testing.T) {
 	}
 }
 
-func TestStatusStillDegradesOnAnOrdinaryAPIError(t *testing.T) {
-	// The same three reads as the refusal table, so the sentinel check at each of
-	// them cannot quietly widen into returning every error and turning a transient
-	// blip into a failed `kamakiri status`.
+func TestStatusSurfacesAnOrdinaryAPIErrorAfterThePageItHas(t *testing.T) {
+	// The same three reads as the refusal table. Each failure ends the page where
+	// it stood and is returned for the caller to print, so a transient blip fails
+	// `kamakiri status` the way it fails every other command, with the page it
+	// managed to render still on stdout.
 	site := func(id string) (*api.Site, error) {
 		return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true}, nil
 	}
@@ -1527,8 +1771,8 @@ func TestStatusStillDegradesOnAnOrdinaryAPIError(t *testing.T) {
 
 			var buf bytes.Buffer
 			drift, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", tc.client, false)
-			if err != nil {
-				t.Fatalf("Run() error = %v, want nil: an unreachable server still renders the page it has", err)
+			if err == nil || !strings.Contains(err.Error(), "connection refused") {
+				t.Fatalf("Run() error = %v, want it to carry %q", err, "connection refused")
 			}
 			if drift {
 				t.Error("drift = true, want false")
@@ -1769,19 +2013,29 @@ func linkedSite(t *testing.T, email string) {
 // drift apart.
 const corruptCredentials = "not json"
 
-// renderPage runs the page and replaces two things the goldens cannot own with
-// stable placeholders: the run's throwaway config home, which the Credentials
-// line names, and the Go standard library's own error wording, which two of the
-// pages quote. Neither is CLI copy. The frames around them are, and they are
-// what the goldens pin; a Go release rewording a message it never promised
-// would otherwise read here as a status regression. Each payload is derived by
-// reproducing the failure rather than spelled out, so a rewording moves the
-// placeholder with it.
+// renderPage runs the page and replaces two things the goldens cannot own
+// with stable placeholders: the run's throwaway config home, which the
+// Credentials line names, and the Go standard library's own error wording,
+// which three of the pages quote. Neither is CLI copy. The frames around
+// them are, and they are what the goldens pin; a Go release rewording a
+// message it never promised would otherwise read here as a status
+// regression. Each payload is derived by reproducing the failure rather than
+// spelled out, so a rewording moves the placeholder with it.
 func renderPage(t *testing.T, client SiteClient) string {
 	t.Helper()
 	var buf bytes.Buffer
 	Run(&buf, "v1.2.3", "https://api.example.test/cloud", client, false)
 	out := buf.String()
+	// Ahead of the <CONFIG> replacement below, since the Go error string carries
+	// the raw home path and would no longer match once that has run. The guard
+	// leaves the other cases alone: there the same read either succeeds or fails
+	// with the not-exist error the page never prints.
+	if home := os.Getenv("XDG_CONFIG_HOME"); home != "" {
+		_, err := os.ReadFile(filepath.Join(home, "kamakiri", "credentials.json"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			out = strings.ReplaceAll(out, err.Error(), "<NOT A DIRECTORY>")
+		}
+	}
 	if home := os.Getenv("XDG_CONFIG_HOME"); home != "" {
 		out = strings.ReplaceAll(out, home, "<CONFIG>")
 	}
@@ -1807,6 +2061,28 @@ Site:         (none)
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
 				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				return nil
+			},
+		},
+		{
+			name: "credentials file holding no key",
+			want: `Version:      v1.2.3
+Credentials:  <CONFIG>/kamakiri/credentials.json
+Logged in:    no
+API server:   https://api.example.test/cloud
+Site:         (none)
+`,
+			setup: func(t *testing.T) SiteClient {
+				t.Chdir(t.TempDir())
+				home := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", home)
+				dir := filepath.Join(home, "kamakiri")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":"","email":"file@example.com"}`), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
 				return nil
 			},
 		},
@@ -1842,6 +2118,27 @@ Site:         (none)
 					t.Fatalf("MkdirAll: %v", err)
 				}
 				if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(corruptCredentials), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				return nil
+			},
+		},
+		{
+			name: "credentials path under a file",
+			want: `Version:      v1.2.3
+Credentials:  <CONFIG>/kamakiri/credentials.json
+Logged in:    (error: read credentials: <NOT A DIRECTORY>)
+API server:   https://api.example.test/cloud
+Site:         (none)
+`,
+			setup: func(t *testing.T) SiteClient {
+				t.Chdir(t.TempDir())
+				home := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", home)
+				// A regular file where the config directory should be, so the
+				// read of the credentials path fails with an error Go does not
+				// map to os.ErrNotExist.
+				if err := os.WriteFile(filepath.Join(home, "kamakiri"), []byte("x"), 0600); err != nil {
 					t.Fatalf("WriteFile: %v", err)
 				}
 				return nil

@@ -6,7 +6,81 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 )
+
+// TestRequireCredentials pins the three branches of RequireCredentials, the
+// nil branch twice, over no file and over a file that holds no key, since the
+// load makes no difference between them: it is the credential half of every
+// site-scoped command's check, and the three account-scoped domain verbs call
+// it directly, with no dispatch test of their own reaching its load-error
+// branch, since the dispatcher's own load exits before RequireProject or
+// RequireCredentials ever runs.
+func TestRequireCredentials(t *testing.T) {
+	t.Run("a key from the environment", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv(EnvAPIKey, "kk_live_fromenv")
+
+		if err := RequireCredentials(); err != nil {
+			t.Fatalf("RequireCredentials() error = %v", err)
+		}
+	})
+
+	t.Run("nothing anywhere", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+		err := RequireCredentials()
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		if err.Error() != i18n.T("common.err_not_logged_in") {
+			t.Errorf("error = %q, want %q", err.Error(), i18n.T("common.err_not_logged_in"))
+		}
+	})
+
+	t.Run("an unparsable file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", tmpDir)
+
+		dir := filepath.Join(tmpDir, "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := RequireCredentials()
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		if !strings.Contains(err.Error(), "parse credentials") {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), "parse credentials")
+		}
+	})
+
+	t.Run("a file holding no key", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", tmpDir)
+
+		dir := filepath.Join(tmpDir, "kamakiri")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":""}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := RequireCredentials()
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		if err.Error() != i18n.T("common.err_not_logged_in") {
+			t.Errorf("error = %q, want %q", err.Error(), i18n.T("common.err_not_logged_in"))
+		}
+	})
+}
 
 func TestProjectPath(t *testing.T) {
 	path := ProjectPath()

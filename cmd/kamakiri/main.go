@@ -180,11 +180,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 			}
 		}
 		client := api.NewClient(baseURL)
-		a.setAPIKey(client)
+		// The page loads the credential for itself and reports what it found, so
+		// the load here only arms the client and the stamp; the page's error is
+		// the one that decides the exit.
+		a.loadAPIKey(client)
 		var drift bool
 		var err error
 		if recheck {
-			drift, err = status.RunWithRecheck(a.stdout, version, baseURL, client, verbose)
+			drift, err = status.RunWithRecheck(a.stdout, a.stderr, version, baseURL, client, verbose)
 		} else {
 			drift, err = status.Run(a.stdout, version, baseURL, client, verbose)
 		}
@@ -192,7 +195,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 			fmt.Fprintln(a.stderr, err)
 			return 1
 		}
+		// The block on the page has the values and the fix; the line here is
+		// what a script log shows for the exit, so it names the page rather
+		// than pointing above.
 		if drift {
+			fmt.Fprintln(a.stderr, i18n.T("status.err_drift"))
 			return 1
 		}
 	case "init":
@@ -803,9 +810,9 @@ func (a *app) requireNoExtraCleanupArgs(extras []string) {
 }
 
 // persistedLanguage returns the language preference saved on this machine, or
-// an empty string when there is none to read. Unlike setAPIKey below it cannot
-// fail the command: an unreadable settings file means no preference, and the
-// language then falls back to the environment locale.
+// an empty string when there is none to read. Unlike the credential load, it
+// cannot fail the command: an unreadable settings file means no preference, and
+// the language then falls back to the environment locale.
 func persistedLanguage() string {
 	if settings := core.LoadSettings(); settings != nil {
 		return settings.Language
@@ -813,14 +820,29 @@ func persistedLanguage() string {
 	return ""
 }
 
-func (a *app) setAPIKey(client *api.Client) {
+// loadAPIKey arms the client and the environment stamp from the run's credential
+// and returns whatever the load failed with. setAPIKey acts on that error by
+// refusing; status calls loadAPIKey for the arming alone, since its page loads
+// and reports the credential for itself and must not exit before rendering. The
+// stamp runs on every path, the failed load included, so the value never carries
+// over from an earlier load in the same process.
+func (a *app) loadAPIKey(client *api.Client) error {
 	creds, err := core.LoadCredentials()
-	if err != nil {
-		fmt.Fprintln(a.stderr, err)
-		a.exit(1)
-	}
 	if creds != nil {
 		client.APIKey = creds.APIKey
+	}
+	// The unauthorized copy names the environment variable when the key came
+	// from it, and no site that renders it can read the answer off what it
+	// holds, so the answer is recorded in the api package rather than carried
+	// on the client.
+	api.SetKeyFromEnvironment(creds != nil && creds.Source == core.SourceEnvironment)
+	return err
+}
+
+func (a *app) setAPIKey(client *api.Client) {
+	if err := a.loadAPIKey(client); err != nil {
+		fmt.Fprintln(a.stderr, err)
+		a.exit(1)
 	}
 }
 
@@ -843,5 +865,7 @@ func (a *app) printUsage() {
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_upgrade"))
 	fmt.Fprintln(a.stderr, "")
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_env_header"))
+	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_env_api_key"))
+	fmt.Fprintln(a.stderr, "")
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_env_cdn"))
 }

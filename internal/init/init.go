@@ -138,7 +138,7 @@ func Run(client APIClient, noWait bool, in io.Reader, out io.Writer) error {
 		case "subdomain_reserved":
 			fmt.Fprintln(out, i18n.T("init.err_subdomain_reserved"))
 		case "unauthorized":
-			return errors.New(i18n.T("api.err_unauthorized"))
+			return api.UnauthorizedError()
 		default:
 			return apiErr
 		}

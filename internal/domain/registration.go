@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
+	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 )
 
@@ -35,6 +36,14 @@ const (
 // Registration is the prerequisite for attaching a domain to a site, not a
 // go-live, so the terminal milestone points at `domain set` rather than a URL.
 func Register(client APIClient, name string, noWait bool, out io.Writer) error {
+	// Account-scoped, so no project is required, but a credential still is:
+	// without the check the request goes out with no key and comes back blaming
+	// an invalid one. `verify` reaches register below after its own project
+	// check, which is why the check sits in the wrapper.
+	if err := core.RequireCredentials(); err != nil {
+		return err
+	}
+
 	interactive := !noWait && isTerminalWriter(out)
 	return register(client, name, interactive, out)
 }
@@ -259,6 +268,10 @@ func findRegistration(list *api.RegistrationList, name string) *api.Registration
 // synchronous and takes no wait flag. An unknown name succeeds as a no-op, and
 // a registration a site still attaches a host under fails instead.
 func Unregister(client APIClient, name string, out io.Writer) error {
+	if err := core.RequireCredentials(); err != nil {
+		return err
+	}
+
 	if err := client.UnregisterDomain(name); err != nil {
 		return api.MapError(err)
 	}
@@ -270,6 +283,10 @@ func Unregister(client APIClient, name string, out io.Writer) error {
 // needs no project: every registration the account owns, with its status and the
 // hosts attached under it. The per-site view lives in `kamakiri status`.
 func ListRegistrations(client APIClient, out io.Writer) error {
+	if err := core.RequireCredentials(); err != nil {
+		return err
+	}
+
 	list, err := client.ListRegistrations()
 	if err != nil {
 		return api.MapError(err)

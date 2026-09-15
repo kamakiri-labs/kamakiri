@@ -25,8 +25,14 @@ const testLang = "en"
 // runs under: the copy they match on renders from the message catalog. Load
 // rather than Setup: nothing here reports which language is in force, only
 // renders in it.
+//
+// KAMAKIRI_API_KEY is cleared for a reason of its own: it outranks the
+// credentials file, so on a machine that exports it a test that writes a key
+// into its own config home would still load the developer's. There is no
+// *testing.T here, hence os.Unsetenv rather than t.Setenv.
 func TestMain(m *testing.M) {
 	i18n.Load(testLang)
+	os.Unsetenv(core.EnvAPIKey)
 	os.Exit(m.Run())
 }
 
@@ -1233,7 +1239,10 @@ func TestRemoveResultCarriesSiteID(t *testing.T) {
 }
 
 func TestListRegistrationsHappyPath(t *testing.T) {
-	// Account-scoped, so there is no project or credential setup here.
+	// Account-scoped, so there is no project setup here, though the wrapper
+	// requires a credential.
+	setupCredentials(t)
+
 	client := &mockClient{
 		listRegistrationsFn: func() (*api.RegistrationList, error) {
 			return &api.RegistrationList{
@@ -1274,6 +1283,8 @@ func TestListRegistrationsHappyPath(t *testing.T) {
 }
 
 func TestListRegistrationsUnknownStatusRendersVerbatim(t *testing.T) {
+	setupCredentials(t)
+
 	// A status this CLI has no label for is shown as sent rather than swallowed.
 	client := &mockClient{
 		listRegistrationsFn: func() (*api.RegistrationList, error) {
@@ -1293,6 +1304,8 @@ func TestListRegistrationsUnknownStatusRendersVerbatim(t *testing.T) {
 }
 
 func TestListRegistrationsEmpty(t *testing.T) {
+	setupCredentials(t)
+
 	client := &mockClient{
 		listRegistrationsFn: func() (*api.RegistrationList, error) {
 			return &api.RegistrationList{}, nil
@@ -1309,6 +1322,8 @@ func TestListRegistrationsEmpty(t *testing.T) {
 }
 
 func TestListRegistrationsUnauthorized(t *testing.T) {
+	setupCredentials(t)
+
 	client := &mockClient{
 		listRegistrationsFn: func() (*api.RegistrationList, error) {
 			return nil, &api.ErrorResponse{Code: "unauthorized", Message: "Unauthorized."}

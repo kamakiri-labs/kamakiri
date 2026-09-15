@@ -52,6 +52,8 @@ func renderRegisterInstructions() string {
 // that layout keeps: each column is as wide as its widest cell plus two, and the
 // last cell of a row is never padded.
 func TestRegistrationTablesLayout(t *testing.T) {
+	setupCredentials(t)
+
 	wantList := strings.Join([]string{
 		"DOMAIN                        STATUS                 SITES",
 		"example.com                   verified               www.example.com (canonical)",
@@ -79,6 +81,8 @@ func TestRegistrationTablesLayout(t *testing.T) {
 // The same two tables with Japanese cells: the header row and the status column
 // both become wide, and neither is last in its row.
 func TestRegistrationTablesJapanese(t *testing.T) {
+	setupCredentials(t)
+
 	i18n.Load("ja")
 	t.Cleanup(func() { i18n.Load(testLang) })
 
@@ -116,6 +120,8 @@ func TestRegistrationTablesJapanese(t *testing.T) {
 // two localized statuses in it, the widest cell in that column is Japanese, and
 // a rune count reads it as half the terminal columns it takes.
 func TestRegistrationListSizesColumnsByDisplayWidth(t *testing.T) {
+	setupCredentials(t)
+
 	i18n.Load("ja")
 	t.Cleanup(func() { i18n.Load(testLang) })
 
@@ -138,6 +144,8 @@ func TestRegistrationListSizesColumnsByDisplayWidth(t *testing.T) {
 // No row of either table ends in whitespace, since the last cell is never
 // padded.
 func TestRegistrationTablesLeaveTheLastCellBare(t *testing.T) {
+	setupCredentials(t)
+
 	t.Cleanup(func() { i18n.Load(testLang) })
 	for _, lang := range []string{"en", "ja"} {
 		i18n.Load(lang)

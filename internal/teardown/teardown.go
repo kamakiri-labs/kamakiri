@@ -47,7 +47,7 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 			removeProjectConfig(out)
 			return nil
 		case "unauthorized":
-			return errors.New(i18n.T("api.err_unauthorized"))
+			return api.UnauthorizedError()
 		case "forbidden":
 			return errors.New(i18n.T("api.err_forbidden"))
 		default:
@@ -83,7 +83,7 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 			case "forbidden":
 				return errors.New(i18n.T("api.err_forbidden"))
 			case "unauthorized":
-				return errors.New(i18n.T("api.err_unauthorized"))
+				return api.UnauthorizedError()
 			}
 		}
 		return err
