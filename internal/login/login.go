@@ -41,6 +41,8 @@ func Run(client APIClient, in io.Reader, out io.Writer) error {
 		return errors.New(i18n.T("login.err_aborted_invalid_email"))
 	}
 
+	fmt.Fprintln(out, i18n.T("login.terms_line"))
+	fmt.Fprintln(out, i18n.T("login.privacy_line"))
 	fmt.Fprint(out, i18n.T("login.prompt_tos"))
 	tosInput, err := reader.ReadString('\n')
 	if err != nil {

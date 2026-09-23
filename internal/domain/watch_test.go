@@ -74,7 +74,7 @@ func (c *transitioningClient) AddDomain(string, string, string, int) (*api.Domai
 func (c *transitioningClient) RemoveDomain(string) (*api.RemoveDomainResult, error) {
 	return nil, errors.New("unexpected")
 }
-func (c *transitioningClient) WaitForSync(string, int64, time.Duration) (*api.Site, error) {
+func (c *transitioningClient) GetSite(string) (*api.Site, error) {
 	return nil, errors.New("unexpected")
 }
 func (c *transitioningClient) RecheckDomain(string) (*api.Domain, error) {
@@ -705,10 +705,7 @@ func TestSetNonTTYBehavesAsNoWait(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			t.Fatal("non-TTY must behave as --no-wait: no WaitForSync, no watch")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "non-TTY must behave as --no-wait: no poll, no watch"),
 		listDomainsFn: func(string) (*api.DomainList, error) {
 			t.Fatal("non-TTY must not enter the watch (no ListDomains poll)")
 			return nil, nil
@@ -752,7 +749,7 @@ func TestSetInteractiveStreamsToLive(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
+		getSiteFn: func(string) (*api.Site, error) {
 			syncWaited = true
 			return &api.Site{Sync: &api.Sync{LatestAttemptID: 1, Outcome: "ok"}}, nil
 		},
@@ -812,7 +809,6 @@ func TestSetSIGINTDuringPreWatchSyncPrintsDetachCopyAndInterrupts(t *testing.T) 
 		return ctx, func() {}
 	}
 
-	syncReleased := make(chan struct{})
 	client := &mockClient{
 		setCanonicalFn: func(_, _ string) (*api.Domain, error) {
 			return &api.Domain{
@@ -822,14 +818,8 @@ func TestSetSIGINTDuringPreWatchSyncPrintsDetachCopyAndInterrupts(t *testing.T) 
 				},
 			}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			// Blocking until teardown forces the select onto the cancelled arm,
-			// modelling a long wait the user interrupts.
-			<-syncReleased
-			return &api.Site{}, nil
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
-	t.Cleanup(func() { close(syncReleased) })
 
 	prev := watchToLiveFn
 	t.Cleanup(func() { watchToLiveFn = prev })
@@ -877,7 +867,7 @@ func TestAddInteractiveStreamsToLive(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
+		getSiteFn: func(string) (*api.Site, error) {
 			syncWaited = true
 			return &api.Site{Sync: &api.Sync{LatestAttemptID: 1, Outcome: "ok"}}, nil
 		},
@@ -931,8 +921,6 @@ func TestAddSIGINTDuringPreWatchSyncPrintsDetachCopyAndInterrupts(t *testing.T) 
 	t.Cleanup(func() { signalCtx = prevSig })
 	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
 
-	syncReleased := make(chan struct{})
-	t.Cleanup(func() { close(syncReleased) })
 	client := &mockClient{
 		addDomainFn: func(_, _, _ string, _ int) (*api.Domain, error) {
 			return &api.Domain{
@@ -942,10 +930,7 @@ func TestAddSIGINTDuringPreWatchSyncPrintsDetachCopyAndInterrupts(t *testing.T) 
 				},
 			}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			<-syncReleased
-			return &api.Site{}, nil
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	prev := watchToLiveFn
@@ -1041,16 +1026,11 @@ func TestUnsetInteractiveSIGINTStopsWithTeardownCopy(t *testing.T) {
 	t.Cleanup(func() { signalCtx = prevSig })
 	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
 
-	syncReleased := make(chan struct{})
-	t.Cleanup(func() { close(syncReleased) })
 	client := &mockClient{
 		unsetCanonicalFn: func(string) (*api.UnsetCanonicalResult, error) {
 			return &api.UnsetCanonicalResult{SyncAttemptID: 7}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			<-syncReleased
-			return &api.Site{}, nil
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	var out bytes.Buffer
@@ -1077,10 +1057,7 @@ func TestSetExplicitNoWaitUnchanged(t *testing.T) {
 		setCanonicalFn: func(_, _ string) (*api.Domain, error) {
 			return &api.Domain{Domain: "x.example.com", Role: "canonical", SyncAttemptID: 1}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			t.Fatal("--no-wait must not WaitForSync")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "--no-wait must not start the wait"),
 	}
 	var out bytes.Buffer
 	if err := Set(client, "x.example.com", true, &out); err != nil {

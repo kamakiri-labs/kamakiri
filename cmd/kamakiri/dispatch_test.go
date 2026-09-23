@@ -52,28 +52,26 @@ const usageBlock = "Usage: kamakiri <command>\n" +
 const (
 	usageDomainAdd = "Usage: kamakiri domain add <domain> [--redirect [--status N] | --alias] [--no-wait]\n" +
 		"  Blocks until the redirect/alias is live, streaming a go-live\n" +
-		"  view (waiting → detected → live). Safe to Ctrl-C any time.\n" +
-		"  The server keeps checking; resume with `kamakiri domain verify`.\n" +
+		"  view (waiting → detected → live). The server keeps checking;\n" +
+		"  resume with `kamakiri domain verify`.\n" +
 		"  --no-wait  print the record + queue and return promptly\n" +
 		"             (also the automatic behavior in non-TTY / CI).\n"
 
 	usageDomainRegister = "Usage: kamakiri domain register <domain> [--no-wait]\n" +
 		"  Registers account-level ownership of a domain (no project required).\n" +
 		"  Prints the TXT to publish, then blocks until verified, streaming the\n" +
-		"  view. Safe to Ctrl-C any time; the server keeps checking.\n" +
+		"  view; the server keeps checking.\n" +
 		"  --no-wait  print the record and return promptly (also the automatic\n" +
 		"             behavior in non-TTY / CI).\n"
 
 	usageDomainRemove = "Usage: kamakiri domain remove <domain> [--no-wait]\n" +
-		"  Blocks until the teardown is in sync on our side.\n" +
-		"  Safe to Ctrl-C any time. Teardown continues server-side.\n" +
-		"  --no-wait  queue and return promptly (also the automatic\n" +
-		"             behavior in non-TTY / CI).\n"
+		"  Blocks until the teardown is in sync on our side, non-TTY / CI included.\n" +
+		"  --no-wait  queue and return promptly.\n"
 
 	usageDomainSet = "Usage: kamakiri domain set <domain> [--no-wait]\n" +
 		"  Blocks until the domain is live, streaming a go-live view\n" +
-		"  (waiting → detected → live). Safe to Ctrl-C any time.\n" +
-		"  The server keeps checking; resume with `kamakiri domain verify`.\n" +
+		"  (waiting → detected → live). The server keeps checking;\n" +
+		"  resume with `kamakiri domain verify`.\n" +
 		"  --no-wait  print the record + queue and return promptly\n" +
 		"             (also the automatic behavior in non-TTY / CI).\n"
 
@@ -82,15 +80,12 @@ const (
 		"  Synchronous; fails if a site still uses a host under it (detach first).\n"
 
 	usageDomainUnset = "Usage: kamakiri domain unset [--no-wait]\n" +
-		"  --no-wait  exit 0 immediately after queueing.\n" +
-		"             Without it, the command blocks for up to ~60s waiting\n" +
-		"             for the edge to apply, and exits 1 with `still syncing`\n" +
-		"             if the deadline is hit.\n"
+		"  Blocks until the teardown is in sync on our side, non-TTY / CI included.\n" +
+		"  --no-wait  queue and return promptly.\n"
 
 	usageDomainVerify = "Usage: kamakiri domain verify <domain> [--no-wait]\n" +
 		"  Re-checks your DNS now and blocks until the domain is live,\n" +
-		"  streaming the view. Safe to Ctrl-C any time; the server keeps\n" +
-		"  checking.\n" +
+		"  streaming the view; the server keeps checking.\n" +
 		"  --no-wait  open the check and print fresh status promptly\n" +
 		"             (also the automatic behavior in non-TTY / CI).\n"
 

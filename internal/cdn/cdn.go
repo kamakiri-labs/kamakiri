@@ -27,15 +27,7 @@ type APIClient interface {
 	CDNStatus(siteID string) (*api.CDNStatusResponse, error)
 	PurgeCDN(siteID string) (*api.CDNPurgeResponse, error)
 	GetSite(id string) (*api.Site, error)
-	WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
 }
-
-// ourSideWaitTimeout caps how long the exit leg's flip to none blocks on the
-// reconciler's first pass, whether it runs standalone as `cdn none` or as the
-// first leg of a provider switch. The ceiling is sized for a site with many
-// content domains, on the assumption that the first pass works through them one
-// at a time, so a large site does not time out while still converging.
-const ourSideWaitTimeout = 5 * time.Minute
 
 // Status prints the CDN status for the linked site: the site-level mode and
 // health lines, then one row per domain.

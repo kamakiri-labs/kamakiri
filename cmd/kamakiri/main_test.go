@@ -12,6 +12,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/domain"
 	"github.com/kamakiri-labs/kamakiri/internal/freshness"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 // The catalog is pinned to English so the assertions below hold whatever locale
@@ -36,7 +37,8 @@ func TestDomainExitCode(t *testing.T) {
 		{"nil/live or async-submit", nil, 0, false},
 		{"Ctrl-C", domain.ErrWatchInterrupted, 130, false},
 		{"Ctrl-C wrapped", fmt.Errorf("x: %w", domain.ErrWatchInterrupted), 130, false},
-		{"pre-watch sync timeout (hint on stdout)", api.ErrSyncTimeout, 1, false},
+		{"Ctrl-C (plain unset/remove wait)", syncwait.ErrInterrupted, 130, false},
+		{"Ctrl-C (plain unset/remove wait) wrapped", fmt.Errorf("x: %w", syncwait.ErrInterrupted), 130, false},
 		{"our-side failure (✗ already on stdout)", fmt.Errorf("boom: %w", domain.ErrOurSideShown), 1, false},
 		{"transport / API error", errors.New("connection refused"), 1, true},
 	}
@@ -45,6 +47,34 @@ func TestDomainExitCode(t *testing.T) {
 			code, echo := domainExitCode(c.err)
 			if code != c.wantCode || echo != c.wantEcho {
 				t.Errorf("domainExitCode(%v) = (%d, %t), want (%d, %t)",
+					c.err, code, echo, c.wantCode, c.wantEcho)
+			}
+		})
+	}
+}
+
+// Nothing but this test enforces that `init`, `teardown` and the three
+// `subdomain` verbs share one matrix, since they share it only by calling the
+// same mapper. It also pins that none of them has an exit-0 arm of its own: an
+// unfinished own-side change exits nonzero whichever command asked for it.
+func TestSyncWaitExitCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantEcho bool
+	}{
+		{"nil/applied or queued by --no-wait", nil, 0, false},
+		{"Ctrl-C", syncwait.ErrInterrupted, 130, false},
+		{"Ctrl-C wrapped", fmt.Errorf("x: %w", syncwait.ErrInterrupted), 130, false},
+		{"reconcile failure", errors.New("reconcile failed: caddy push failed"), 1, true},
+		{"transport / API error", errors.New("connection refused"), 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, echo := syncWaitExitCode(c.err)
+			if code != c.wantCode || echo != c.wantEcho {
+				t.Errorf("syncWaitExitCode(%v) = (%d, %t), want (%d, %t)",
 					c.err, code, echo, c.wantCode, c.wantEcho)
 			}
 		})
@@ -65,7 +95,10 @@ func TestCdnExitCode(t *testing.T) {
 		// a domain sentinel and must still map to a clean 130.
 		{"Ctrl-C (cdn none, domain watch)", domain.ErrWatchInterrupted, 130, false},
 		{"Ctrl-C (cdn none) wrapped", fmt.Errorf("x: %w", domain.ErrWatchInterrupted), 130, false},
-		{"pre-watch sync timeout (hint on stdout)", api.ErrSyncTimeout, 1, false},
+		// The verbs with no watch to stream, `cdn credentials` among them, wait
+		// through the shared own-side package, so its sentinel reaches here too.
+		{"Ctrl-C (own-side wait)", syncwait.ErrInterrupted, 130, false},
+		{"Ctrl-C (own-side wait) wrapped", fmt.Errorf("x: %w", syncwait.ErrInterrupted), 130, false},
 		{"terminal error (reason already on stdout)", fmt.Errorf("boom: %w", cdn.ErrCdnReported), 1, false},
 		// `cdn purge` waits through the freshness package, so its sentinels
 		// reach cdnExit too.

@@ -2,6 +2,7 @@ package teardown
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 // The catalog is pinned to English so the assertions below hold whatever
@@ -28,13 +30,30 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// resolvedAttemptID sits above every attempt id these tests await, so the
+// default site below resolves whichever wait reaches it.
+const resolvedAttemptID = 1000
+
+// mockClient answers GetSite from getSiteFn where a test scripts one and from a
+// site whose reconcile has already succeeded otherwise. One function serves
+// both readers: the confirmation notice reads the site before the prompt, and
+// the wait polls the same call afterwards. The wait has no bound, so a script
+// that never resolves would hang a test rather than fail it.
 type mockClient struct {
-	getSiteFn     func(id string) (*api.Site, error)
-	deleteSiteFn  func(id string) (*api.Site, error)
-	waitForSyncFn func(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
+	getSiteFn    func(id string) (*api.Site, error)
+	deleteSiteFn func(id string) (*api.Site, error)
+	getSiteCalls int
 }
 
 func (m *mockClient) GetSite(id string) (*api.Site, error) {
+	m.getSiteCalls++
+	if m.getSiteFn == nil {
+		return &api.Site{
+			ID:        id,
+			Subdomain: "my-site",
+			Sync:      &api.Sync{Outcome: "ok", LatestAttemptID: resolvedAttemptID},
+		}, nil
+	}
 	return m.getSiteFn(id)
 }
 
@@ -42,8 +61,46 @@ func (m *mockClient) DeleteSite(id string) (*api.Site, error) {
 	return m.deleteSiteFn(id)
 }
 
-func (m *mockClient) WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error) {
-	return m.waitForSyncFn(siteID, sinceAttemptID, timeout)
+// fastPolls runs the wait on a millisecond cadence for one test, so a scripted
+// sequence of answers plays out without waiting out the production bands.
+func fastPolls(t *testing.T) {
+	t.Helper()
+	prev := pollSchedule
+	t.Cleanup(func() { pollSchedule = prev })
+	pollSchedule = func(time.Duration) time.Duration { return time.Millisecond }
+}
+
+// interruptBeforeWait hands the wait a context that is already cancelled, which
+// is how Ctrl-C reaches it without a real signal.
+func interruptBeforeWait(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prev := signalCtx
+	t.Cleanup(func() { signalCtx = prev })
+	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
+}
+
+// reconcileFailed scripts GetSite to answer the confirmation notice's read
+// first and a failed attempt carrying changes and the reconciler's own reason
+// after it.
+func reconcileFailed(reason string, changes []string) func(string) (*api.Site, error) {
+	first := true
+	return func(id string) (*api.Site, error) {
+		if first {
+			first = false
+			return &api.Site{ID: id, Subdomain: "my-site"}, nil
+		}
+		return &api.Site{
+			ID: id,
+			Sync: &api.Sync{
+				LatestAttemptID: 42,
+				Outcome:         "error",
+				Changes:         changes,
+				Error:           reason,
+			},
+		}, nil
+	}
 }
 
 func setupCredentials(t *testing.T) {
@@ -78,10 +135,6 @@ func TestTeardownNotLoggedIn(t *testing.T) {
 			t.Error("DeleteSite should not be called")
 			return nil, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("")
@@ -101,11 +154,9 @@ func TestTeardownHappyPath(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
+	fastPolls(t)
 
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site", URL: "https://my-site.kamakiri-pages.jp"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			if id != "site123" {
 				t.Errorf("id = %q, want site123", id)
@@ -118,23 +169,28 @@ func TestTeardownHappyPath(t *testing.T) {
 				SyncAttemptID:  42,
 			}, nil
 		},
-		waitForSyncFn: func(siteID string, sinceAttemptID int64, _ time.Duration) (*api.Site, error) {
-			if siteID != "site123" {
-				t.Errorf("WaitForSync siteID = %q, want site123", siteID)
-			}
-			if sinceAttemptID != 42 {
-				t.Errorf("WaitForSync sinceAttemptID = %d, want 42", sinceAttemptID)
-			}
+	}
+	// Three answers: the confirmation notice's read, then ok one attempt below
+	// the id the deletion returned, then ok at it. A wait started any lower
+	// would resolve on the second answer, so the call count is what proves
+	// which id it awaited.
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		if id != "site123" {
+			t.Errorf("GetSite id = %q, want site123", id)
+		}
+		switch client.getSiteCalls {
+		case 1:
+			return &api.Site{ID: id, Subdomain: "my-site", URL: "https://my-site.kamakiri-pages.jp"}, nil
+		case 2:
+			return &api.Site{ID: id, Sync: &api.Sync{LatestAttemptID: 41, Outcome: "ok"}}, nil
+		default:
 			return &api.Site{
-				ID:             siteID,
+				ID:             id,
 				Status:         "deleted",
 				StatusObserved: "deleted",
-				Sync: &api.Sync{
-					LatestAttemptID: 42,
-					Outcome:         "ok",
-				},
+				Sync:           &api.Sync{LatestAttemptID: 42, Outcome: "ok"},
 			}, nil
-		},
+		}
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -143,6 +199,11 @@ func TestTeardownHappyPath(t *testing.T) {
 	err := Run(client, stdin, &stdout, false)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+
+	if client.getSiteCalls != 3 {
+		t.Errorf("GetSite called %d times, want 3: the attempt at 41 must not satisfy a wait for 42",
+			client.getSiteCalls)
 	}
 
 	output := stdout.String()
@@ -170,11 +231,9 @@ func TestTeardownAbortsOnAVersionRefusal(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
+	fastPolls(t)
 
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{
 				ID:            id,
@@ -184,9 +243,15 @@ func TestTeardownAbortsOnAVersionRefusal(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrUpgradeRequired
-		},
+	}
+	// The pre-read has to answer with the site the confirmation notice names;
+	// only the polls after it carry the refusal, since a resolved attempt would
+	// keep it from ever arriving.
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		if client.getSiteCalls == 1 {
+			return &api.Site{ID: id, Subdomain: "my-site"}, nil
+		}
+		return nil, api.ErrUpgradeRequired
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -206,7 +271,6 @@ func TestTeardownAbortsOnAVersionRefusal(t *testing.T) {
 		i18n.T("teardown.failed"),
 		i18n.T("teardown.failed_edge_delete"),
 		i18n.T("teardown.done"),
-		i18n.T("teardown.still_syncing"),
 	} {
 		if strings.Contains(output, banned) {
 			t.Errorf("output must not carry %q:\n%s", banned, output)
@@ -235,11 +299,9 @@ func TestTeardownWebAccelNoticeNamesResource(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
+	fastPolls(t)
 
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{
 				ID:            id,
@@ -249,13 +311,14 @@ func TestTeardownWebAccelNoticeNamesResource(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{
-				ID:             siteID,
-				StatusObserved: "deleted",
-				Sync:           &api.Sync{LatestAttemptID: 42, Outcome: "ok"},
-			}, nil
-		},
+	}
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		return &api.Site{
+			ID:             id,
+			Subdomain:      "my-site",
+			StatusObserved: "deleted",
+			Sync:           &api.Sync{LatestAttemptID: 42, Outcome: "ok"},
+		}, nil
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -283,10 +346,10 @@ func TestTeardownWebAccelNoticeNoWaitFallbackToID(t *testing.T) {
 	setupCredentials(t)
 	setupConfig(t, "site123")
 
+	// The default site resolves, so a regression that ran the wait here would
+	// fail on the call count below rather than poll an unresolved script until
+	// the suite's own panic.
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{
 				ID:            id,
@@ -297,16 +360,17 @@ func TestTeardownWebAccelNoticeNoWaitFallbackToID(t *testing.T) {
 				},
 			}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync must not be called when --no-wait is set")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("y\n")
 	var stdout bytes.Buffer
 	if err := Run(client, stdin, &stdout, true); err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+
+	if client.getSiteCalls != 1 {
+		t.Errorf("the site was read %d times on the --no-wait path, want 1 (the confirmation notice)",
+			client.getSiteCalls)
 	}
 
 	output := stdout.String()
@@ -328,16 +392,12 @@ func TestTeardownNoWait(t *testing.T) {
 	setupCredentials(t)
 	setupConfig(t, "site123")
 
+	// The default site resolves, so a regression that ran the wait here would
+	// fail on the call count below rather than poll an unresolved script until
+	// the suite's own panic.
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{ID: id, SyncAttemptID: 42}, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync must not be called when --no-wait is set")
-			return nil, nil
 		},
 	}
 
@@ -355,6 +415,11 @@ func TestTeardownNoWait(t *testing.T) {
 		t.Errorf("--no-wait took %v; expected <2s", elapsed)
 	}
 
+	if client.getSiteCalls != 1 {
+		t.Errorf("the site was read %d times on the --no-wait path, want 1 (the confirmation notice)",
+			client.getSiteCalls)
+	}
+
 	output := stdout.String()
 	if !strings.Contains(output, "queued") {
 		t.Errorf("output should mention 'queued': %q", output)
@@ -364,12 +429,16 @@ func TestTeardownNoWait(t *testing.T) {
 	}
 }
 
-// A timeout prints the "still syncing" hint and propagates the sentinel, so the
-// caller can tell it apart from a real failure.
-func TestTeardownWaitTimeout(t *testing.T) {
+// On Ctrl-C the sentinel propagates, so the 130 exit can recognize it, the stop
+// copy is teardown's own rather than the shared one that points at a site that
+// no longer has a local link, and no failure label is invented for a teardown
+// that failed at no step.
+func TestTeardownInterruptStopsAndRemovesConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
+	fastPolls(t)
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		getSiteFn: func(id string) (*api.Site, error) {
@@ -378,30 +447,34 @@ func TestTeardownWaitTimeout(t *testing.T) {
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{ID: id, SyncAttemptID: 42}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
 	}
 
 	stdin := strings.NewReader("y\n")
 	var stdout bytes.Buffer
 
 	err := Run(client, stdin, &stdout, false)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("Run() error = %v, want ErrSyncTimeout", err)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("Run() error = %v, want syncwait.ErrInterrupted", err)
 	}
 
 	output := stdout.String()
-	if !strings.Contains(output, "still syncing") {
-		t.Errorf("output should print 'still syncing' hint: %q", output)
+	stop := i18n.T("teardown.stopped")
+	if got := strings.Count(output, stop); got != 1 {
+		t.Errorf("stop line printed %d times, want exactly 1:\n%q", got, output)
+	}
+	if strings.Contains(output, syncwait.SharedStopLine()) {
+		t.Errorf("the shared stop line points at a site the local config no longer names:\n%q", output)
+	}
+	if strings.Contains(output, i18n.T("teardown.failed")) {
+		t.Errorf("an interrupt is not a failure, so no label belongs here:\n%q", output)
 	}
 	// A config left behind here would point a later deploy at a site that is
 	// being torn down.
 	if !strings.Contains(output, "Removed .kamakiri/config.json") {
-		t.Errorf("output should remove config on timeout: %q", output)
+		t.Errorf("output should remove config on an interrupt: %q", output)
 	}
 	if config, _ := core.LoadProject(); config != nil {
-		t.Error("config should be removed after timeout")
+		t.Error("config should be removed after an interrupt")
 	}
 }
 
@@ -411,27 +484,14 @@ func TestTeardownReconcileError(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
-
-	reconcileErr := errors.New("reconcile failed: caddy push timed out")
+	fastPolls(t)
 
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{ID: id, SyncAttemptID: 42}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			// No changes at all: nothing to name, so the label stays generic.
-			return &api.Site{
-				ID: "site123",
-				Sync: &api.Sync{
-					LatestAttemptID: 42,
-					Outcome:         "error",
-					Changes:         nil,
-				},
-			}, reconcileErr
-		},
+		// No changes at all: nothing to name, so the label stays generic.
+		getSiteFn: reconcileFailed("caddy push timed out", nil),
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -441,11 +501,8 @@ func TestTeardownReconcileError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run() expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "reconcile failed") {
-		t.Errorf("err = %v, want propagated reconcile error", err)
-	}
-	if errors.Is(err, api.ErrSyncTimeout) {
-		t.Errorf("err = %v, want NOT ErrSyncTimeout", err)
+	if err.Error() != "reconcile failed: caddy push timed out" {
+		t.Errorf("err = %q, want the reconciler's own reason framed", err.Error())
 	}
 
 	output := stdout.String()
@@ -465,26 +522,14 @@ func TestTeardownPerStepFailureLabel(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
-
-	reconcileErr := errors.New("reconcile failed: cloudflare 500")
+	fastPolls(t)
 
 	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{ID: id, SyncAttemptID: 42}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{
-				ID: "site123",
-				Sync: &api.Sync{
-					LatestAttemptID: 42,
-					Outcome:         "error",
-					Changes:         []string{"caddy_delete", "dns_delete:example.com"},
-				},
-			}, reconcileErr
-		},
+		getSiteFn: reconcileFailed("cloudflare 500",
+			[]string{"caddy_delete", "dns_delete:example.com"}),
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -509,10 +554,6 @@ func TestTeardownAbort(t *testing.T) {
 		},
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			t.Error("DeleteSite should not be called")
-			return nil, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
 			return nil, nil
 		},
 	}
@@ -548,10 +589,6 @@ func TestTeardownDefaultNo(t *testing.T) {
 			t.Error("DeleteSite should not be called")
 			return nil, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("\n")
@@ -578,10 +615,6 @@ func TestTeardownNoConfig(t *testing.T) {
 		},
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			t.Error("DeleteSite should not be called")
-			return nil, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
 			return nil, nil
 		},
 	}
@@ -611,10 +644,6 @@ func TestTeardownSiteNotFoundCleansUp(t *testing.T) {
 		},
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			t.Error("DeleteSite should not be called")
-			return nil, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
 			return nil, nil
 		},
 	}
@@ -650,10 +679,6 @@ func TestTeardownGetSiteForbidden(t *testing.T) {
 			t.Error("DeleteSite should not be called")
 			return nil, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("")
@@ -679,10 +704,6 @@ func TestTeardownGetSiteUnauthorized(t *testing.T) {
 		},
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			t.Error("DeleteSite should not be called")
-			return nil, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
 			return nil, nil
 		},
 	}
@@ -711,10 +732,6 @@ func TestTeardownDeleteForbidden(t *testing.T) {
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			return nil, &api.ErrorResponse{Code: "forbidden", Message: "You do not own this site."}
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -741,10 +758,6 @@ func TestTeardownDeleteUnauthorized(t *testing.T) {
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			return nil, &api.ErrorResponse{Code: "unauthorized", Message: "Unauthorized."}
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
-		},
 	}
 
 	stdin := strings.NewReader("y\n")
@@ -770,10 +783,6 @@ func TestTeardownDeleteSiteNotFound(t *testing.T) {
 		},
 		deleteSiteFn: func(_ string) (*api.Site, error) {
 			return nil, &api.ErrorResponse{Code: "site_not_found", Message: "Site not found."}
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Error("WaitForSync should not be called")
-			return nil, nil
 		},
 	}
 

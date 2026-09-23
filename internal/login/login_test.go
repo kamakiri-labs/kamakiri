@@ -97,12 +97,18 @@ func TestLoginSuccess(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	output := stdout.String()
-	if !strings.Contains(output, "Confirmation code sent to user@example.com.") {
-		t.Errorf("output missing confirmation message: %q", output)
+	// Prompts do not echo what the reader supplies, so each answer is absent
+	// and the line that follows a prompt starts right after it.
+	credPath, err := core.CredentialsPath()
+	if err != nil {
+		t.Fatalf("CredentialsPath() error = %v", err)
 	}
-	if !strings.Contains(output, "API key saved") {
-		t.Errorf("output missing save message: %q", output)
+	want := "Email: Terms of Service: https://kamakiri-labs.jp/en/terms/\n" +
+		"Privacy Policy:   https://kamakiri-labs.jp/en/privacy/\n" +
+		"Accept Terms of Service? (Y/n) Confirmation code sent to user@example.com.\n" +
+		"Code: API key saved to " + credPath + "\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("output:\n got %q\nwant %q", got, want)
 	}
 
 	creds, err := core.LoadCredentials()
@@ -211,9 +217,11 @@ func TestLoginTosRejected(t *testing.T) {
 		t.Fatal("Run() expected error, got nil")
 	}
 
-	output := stdout.String()
-	if !strings.Contains(output, "Terms of Service") {
-		t.Errorf("output missing ToS message: %q", output)
+	want := "Email: Terms of Service: https://kamakiri-labs.jp/en/terms/\n" +
+		"Privacy Policy:   https://kamakiri-labs.jp/en/privacy/\n" +
+		"Accept Terms of Service? (Y/n) Error: You must accept the Terms of Service to continue.\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("output:\n got %q\nwant %q", got, want)
 	}
 }
 
@@ -239,9 +247,10 @@ func TestLoginInvalidEmail(t *testing.T) {
 		t.Fatal("Run() expected error, got nil")
 	}
 
-	output := stdout.String()
-	if !strings.Contains(output, "Invalid email") {
-		t.Errorf("output missing error message: %q", output)
+	// The address is refused before the Terms and Privacy lines print.
+	want := "Email: Error: Invalid email address.\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("output:\n got %q\nwant %q", got, want)
 	}
 }
 

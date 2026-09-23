@@ -59,6 +59,23 @@ func (r *Renderer) Transient(lines ...string) {
 	r.transient = len(lines)
 }
 
+// RewriteRow redraws the current terminal row in place: it returns the cursor
+// to column zero, erases to the end of the line and writes text, leaving the
+// row open with no newline of its own. An empty text clears the row and writes
+// nothing else.
+//
+// It sits beside Renderer rather than on it because the two models cannot share
+// one screen. A Renderer owns a block of whole lines and rewinds it by counting
+// the lines it wrote itself, while this rewrites a single unterminated row that
+// somebody else opened and will terminate; routing it through a Renderer would
+// leave that count claiming a line nobody wrote and corrupt the next rewind.
+//
+// The escapes go out unconditionally, so a caller that is not on a terminal
+// must not call it.
+func RewriteRow(out io.Writer, text string) {
+	fmt.Fprint(out, "\r\033[K"+text)
+}
+
 // IsTerminalWriter reports whether out is a real terminal, the condition for
 // cursor control and glyph rendering.
 func IsTerminalWriter(out io.Writer) bool {

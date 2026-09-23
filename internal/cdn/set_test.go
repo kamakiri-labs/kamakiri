@@ -2,14 +2,13 @@ package cdn
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/domain"
+	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 )
 
 // Returning early means no watch, not no reads at all: one status read still
@@ -58,26 +57,22 @@ func TestSetModeNoneOneShot(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
-	var waitCalled bool
+	fastPolls(t)
 	client := &mockClient{
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 42}, nil
 		},
-		waitForSyncFn: func(siteID string, since int64, _ time.Duration) (*api.Site, error) {
-			waitCalled = true
-			if since != 42 {
-				t.Errorf("sinceAttemptID = %d, want 42", since)
-			}
-			return &api.Site{ID: siteID}, nil
-		},
 	}
+	// An attempt below 42 first, so a wait keyed on a lower id would settle on
+	// the wrong one and never make the second read.
+	client.getSiteFn = client.resolveAt(42)
 
 	var out bytes.Buffer
 	if err := SetMode(client, "none", false, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !waitCalled {
-		t.Fatal("none must wait for the pre-watch sync")
+	if client.getSiteCalls != 2 {
+		t.Fatalf("GetSite called %d times, want 2: the wait must poll past the older attempt", client.getSiteCalls)
 	}
 	got := out.String()
 	if !strings.Contains(got, "✓ CDN deactivated") {
@@ -103,9 +98,6 @@ func TestSetModeNoneFromWebAccelSurfacesCleanup(t *testing.T) {
 		},
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 7}, nil
-		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{ID: siteID}, nil
 		},
 	}
 
@@ -141,9 +133,6 @@ func TestSetModeNoneFromWebAccelShowsRevertRecord(t *testing.T) {
 		},
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 5}, nil
-		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{ID: siteID}, nil
 		},
 		listDomainsFn: func(string) (*api.DomainList, error) {
 			return &api.DomainList{Domains: []api.Domain{{
@@ -195,9 +184,6 @@ func TestSetModeNoneFromCloudflareStreamsExit(t *testing.T) {
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 8}, nil
 		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{ID: siteID}, nil
-		},
 		listDomainsFn: func(string) (*api.DomainList, error) {
 			return &api.DomainList{Domains: []api.Domain{
 				{Domain: "shop.example.com", Role: "canonical"},
@@ -244,9 +230,6 @@ func TestSetModeNoneFromCloudflareNoContentSettles(t *testing.T) {
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 9}, nil
 		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{ID: siteID}, nil
-		},
 		listDomainsFn: func(string) (*api.DomainList, error) {
 			return &api.DomainList{Domains: []api.Domain{
 				{Domain: "go.example.com", Role: "redirect"},
@@ -284,9 +267,6 @@ func TestSetModeNoneIdempotentReRunIsOneShot(t *testing.T) {
 		},
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 11}, nil
-		},
-		waitForSyncFn: func(siteID string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{ID: siteID}, nil
 		},
 		listDomainsFn: func(string) (*api.DomainList, error) {
 			t.Fatal("a none-prior re-run must not fetch the domain list (no exit to stream)")
@@ -340,32 +320,47 @@ func TestSetModeNoneNoWaitQueued(t *testing.T) {
 	assertCleanCopy(t, out.String())
 }
 
-func TestSetModeNonePreWatchSyncTimeout(t *testing.T) {
+// A status endpoint that keeps failing is the one way the deactivation wait
+// ends without the server having answered. It spends the transient budget and
+// then reports like any other failure, rather than running on forever.
+func TestSetModeNoneDeactivationGivesUpOnAPersistentTransportFailure(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	fastPolls(t)
 
 	client := &mockClient{
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 99}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
+		getSiteFn: func(string) (*api.Site, error) {
+			return nil, errors.New("request failed: connection refused")
 		},
 	}
 	var out bytes.Buffer
 	err := SetMode(client, "none", false, &out)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("err = %v, want ErrSyncTimeout", err)
+	if err == nil {
+		t.Fatal("expected an error once the reads stop coming back")
 	}
-	if !strings.Contains(out.String(), "queued") {
-		t.Errorf("missing queued hint: %q", out.String())
+	if !errors.Is(err, ErrCdnReported) {
+		t.Errorf("the failure must wrap ErrCdnReported (so cdnExit suppresses the stderr echo); got %v", err)
 	}
-	assertCleanCopy(t, out.String())
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("the transport reason must travel: %v", err)
+	}
+	// Six reads: five consecutive failures are tolerated and the sixth ends it.
+	if client.getSiteCalls != 6 {
+		t.Errorf("GetSite called %d times, want 6 (five tolerated, the sixth ends the wait)", client.getSiteCalls)
+	}
+	got := out.String()
+	if !strings.Contains(got, "CDN change failed.") || !strings.Contains(got, "Re-run `kamakiri cdn none`") {
+		t.Errorf("missing actionable failure copy: %q", got)
+	}
+	assertCleanCopy(t, got)
 }
 
-// A failure that is not a timeout prints its own actionable copy, so the error
-// must be marked reported: the user should see one report, not two.
+// A failed reconcile prints its own actionable copy, so the error must be
+// marked reported: the user should see one report, not two.
 func TestSetModeNoneReconcileError(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
@@ -375,17 +370,15 @@ func TestSetModeNoneReconcileError(t *testing.T) {
 		setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 99}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			return nil, errors.New("reconcile failed: internal error")
-		},
+		getSiteFn: reconcileFailed("edge push failed"),
 	}
 	var out bytes.Buffer
 	err := SetMode(client, "none", false, &out)
 	if err == nil {
 		t.Fatal("expected error for a failed deactivation")
 	}
-	if errors.Is(err, api.ErrSyncTimeout) {
-		t.Errorf("deactivation failure must not be ErrSyncTimeout: %v", err)
+	if !strings.Contains(err.Error(), "edge push failed") {
+		t.Errorf("the reconciler's own reason must travel: %v", err)
 	}
 	if !errors.Is(err, ErrCdnReported) {
 		t.Errorf("deactivation failure must wrap ErrCdnReported (so cdnExit suppresses the stderr echo); got %v", err)
@@ -408,17 +401,8 @@ func TestSetModeNoneSIGINTDuringDeactivationInterrupts(t *testing.T) {
 			setupCredentials(t)
 			setupProjectConfig(t, "site123")
 
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel() // SIGINT already delivered before the wait starts.
+			interruptBeforeWait(t)
 
-			prevSig := signalCtx
-			t.Cleanup(func() { signalCtx = prevSig })
-			signalCtx = func() (context.Context, context.CancelFunc) {
-				return ctx, func() {}
-			}
-
-			syncReleased := make(chan struct{})
-			t.Cleanup(func() { close(syncReleased) })
 			client := &mockClient{
 				cdnStatusFn: func(string) (*api.CDNStatusResponse, error) {
 					return &api.CDNStatusResponse{CDNMode: prior, Provider: prior,
@@ -426,12 +410,6 @@ func TestSetModeNoneSIGINTDuringDeactivationInterrupts(t *testing.T) {
 				},
 				setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 					return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 3}, nil
-				},
-				waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-					// Blocks until teardown, modelling a long wait the user gives up
-					// on, so the already-cancelled context is the only way out.
-					<-syncReleased
-					return &api.Site{}, nil
 				},
 				listDomainsFn: func(string) (*api.DomainList, error) {
 					t.Fatal("interrupt during deactivation must not enter the exit watch")
@@ -456,6 +434,11 @@ func TestSetModeNoneSIGINTDuringDeactivationInterrupts(t *testing.T) {
 			}
 			if strings.Contains(got, "switching traffic to our edge") || strings.Contains(got, "Configure your DNS") {
 				t.Errorf("interrupt during deactivation must not enter either exit flow: %q", got)
+			}
+			// The already-cancelled context ends the wait before any poll starts,
+			// so GetSite must never run.
+			if client.getSiteCalls != 0 {
+				t.Errorf("GetSite called %d times, want none after an interrupt", client.getSiteCalls)
 			}
 			assertCleanCopy(t, got)
 		})
@@ -674,4 +657,21 @@ func TestSetModeCloudflareWithApexIPs(t *testing.T) {
 		t.Errorf("missing CF anycast IP line: %q", got)
 	}
 	assertCleanCopy(t, got)
+}
+
+// The own-side wait restores this prefix verbatim right before the caller's own
+// closing line, off a terminal, with nothing in between. That only lands the
+// two lines back to back because the prefix carries no trailing whitespace; a
+// translator adding one would silently open a gap between the prefix and the
+// line that follows it.
+func TestDeactivatingPrefixHasNoTrailingWhitespace(t *testing.T) {
+	t.Cleanup(func() { i18n.Load(testLang) })
+
+	for _, lang := range []string{"en", "ja"} {
+		i18n.Load(lang)
+		got := i18n.T("cdn.deactivating")
+		if trimmed := strings.TrimRight(got, " \t"); trimmed != got {
+			t.Errorf("cdn.deactivating (%s) has trailing whitespace: %q", lang, got)
+		}
+	}
 }

@@ -2,6 +2,7 @@ package initcmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 // The catalog is pinned to English so the assertions below hold whatever
@@ -28,13 +30,17 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// mockClient defaults waitForSyncFn to a flunk, so a path that regresses into
-// polling fails loudly rather than quietly.
+// resolvedAttemptID sits above every attempt id these tests await, so the
+// default site below resolves whichever wait reaches it.
+const resolvedAttemptID = 1000
+
+// mockClient answers GetSite from getSiteFn where a test scripts one and from a
+// site whose reconcile has already succeeded otherwise. The wait has no bound,
+// so a default that never resolved would hang a test rather than fail it.
 type mockClient struct {
-	createSiteFn   func(subdomain string) (*api.Site, error)
-	getSiteFn      func(id string) (*api.Site, error)
-	waitForSyncFn  func(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
-	waitForSyncHit bool
+	createSiteFn func(subdomain string) (*api.Site, error)
+	getSiteFn    func(id string) (*api.Site, error)
+	getSiteCalls int
 }
 
 func (m *mockClient) CreateSite(subdomain string) (*api.Site, error) {
@@ -42,18 +48,15 @@ func (m *mockClient) CreateSite(subdomain string) (*api.Site, error) {
 }
 
 func (m *mockClient) GetSite(id string) (*api.Site, error) {
+	m.getSiteCalls++
 	if m.getSiteFn == nil {
-		return nil, errors.New("GetSite: no mock configured")
+		return &api.Site{
+			ID:        id,
+			Subdomain: "my-site",
+			Sync:      &api.Sync{Outcome: "ok", LatestAttemptID: resolvedAttemptID},
+		}, nil
 	}
 	return m.getSiteFn(id)
-}
-
-func (m *mockClient) WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error) {
-	m.waitForSyncHit = true
-	if m.waitForSyncFn == nil {
-		return nil, errors.New("WaitForSync: no mock configured")
-	}
-	return m.waitForSyncFn(siteID, sinceAttemptID, timeout)
 }
 
 func setupCredentials(t *testing.T) {
@@ -64,11 +67,31 @@ func setupCredentials(t *testing.T) {
 	}
 }
 
-// flunkWait fails the test if WaitForSync is called at all.
-func flunkWait(t *testing.T) func(string, int64, time.Duration) (*api.Site, error) {
+// fastPolls runs the wait on a millisecond cadence for one test, so a scripted
+// sequence of answers plays out without waiting out the production bands.
+func fastPolls(t *testing.T) {
 	t.Helper()
-	return func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-		t.Error("WaitForSync should not be called on this path")
+	prev := pollSchedule
+	t.Cleanup(func() { pollSchedule = prev })
+	pollSchedule = func(time.Duration) time.Duration { return time.Millisecond }
+}
+
+// interruptBeforeWait hands the wait a context that is already cancelled, which
+// is how Ctrl-C reaches it without a real signal.
+func interruptBeforeWait(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prev := signalCtx
+	t.Cleanup(func() { signalCtx = prev })
+	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
+}
+
+// flunkGetSite fails the test if the site is read at all.
+func flunkGetSite(t *testing.T) func(string) (*api.Site, error) {
+	t.Helper()
+	return func(_ string) (*api.Site, error) {
+		t.Error("GetSite should not be called on this path")
 		return nil, errors.New("flunk")
 	}
 }
@@ -82,7 +105,7 @@ func TestInitNotLoggedIn(t *testing.T) {
 			t.Error("CreateSite should not be called")
 			return nil, nil
 		},
-		waitForSyncFn: flunkWait(t),
+		getSiteFn: flunkGetSite(t),
 	}
 
 	stdin := strings.NewReader("")
@@ -97,9 +120,14 @@ func TestInitNotLoggedIn(t *testing.T) {
 	}
 }
 
+// The wait has to be started at the attempt id the creation returned, or a
+// reconcile that ran before it would satisfy it. The script answers ok one
+// below that id first and at it second, so the poll count is what proves which
+// id was awaited.
 func TestInitHappyPath(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	client := &mockClient{
 		createSiteFn: func(subdomain string) (*api.Site, error) {
@@ -113,18 +141,19 @@ func TestInitHappyPath(t *testing.T) {
 				SyncAttemptID: 42,
 			}, nil
 		},
-		waitForSyncFn: func(siteID string, sinceAttemptID int64, _ time.Duration) (*api.Site, error) {
-			if siteID != "site123" {
-				t.Errorf("WaitForSync siteID = %q, want site123", siteID)
-			}
-			if sinceAttemptID != 42 {
-				t.Errorf("WaitForSync sinceAttemptID = %d, want 42 (matches 202 sync_attempt_id)", sinceAttemptID)
-			}
-			return &api.Site{
-				ID: "site123", Subdomain: "my-site",
-				Sync: &api.Sync{Outcome: "ok", LatestAttemptID: 42},
-			}, nil
-		},
+	}
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		if id != "site123" {
+			t.Errorf("GetSite id = %q, want site123", id)
+		}
+		attempt := int64(42)
+		if client.getSiteCalls == 1 {
+			attempt = 41
+		}
+		return &api.Site{
+			ID: "site123", Subdomain: "my-site",
+			Sync: &api.Sync{Outcome: "ok", LatestAttemptID: attempt},
+		}, nil
 	}
 
 	stdin := strings.NewReader("my-site\n")
@@ -142,8 +171,9 @@ func TestInitHappyPath(t *testing.T) {
 	if !strings.Contains(output, ".kamakiri/config.json") {
 		t.Errorf("output missing config path: %q", output)
 	}
-	if !client.waitForSyncHit {
-		t.Error("WaitForSync was not called on the sync-default path")
+	if client.getSiteCalls != 2 {
+		t.Errorf("GetSite called %d times, want 2: the attempt at 41 must not satisfy a wait for 42",
+			client.getSiteCalls)
 	}
 
 	config, err := core.LoadProject()
@@ -170,7 +200,7 @@ func TestInitNoWaitSkipsPolling(t *testing.T) {
 				SyncAttemptID: 7,
 			}, nil
 		},
-		waitForSyncFn: flunkWait(t),
+		getSiteFn: flunkGetSite(t),
 	}
 
 	stdin := strings.NewReader("nowait\n")
@@ -187,8 +217,8 @@ func TestInitNoWaitSkipsPolling(t *testing.T) {
 	if !strings.Contains(output, "Saved to .kamakiri/config.json") {
 		t.Errorf("output missing 'Saved to .kamakiri/config.json': %q", output)
 	}
-	if client.waitForSyncHit {
-		t.Error("WaitForSync was called on the --no-wait path")
+	if client.getSiteCalls != 0 {
+		t.Errorf("the site was read %d times on the --no-wait path, want 0", client.getSiteCalls)
 	}
 
 	config, err := core.LoadProject()
@@ -197,19 +227,26 @@ func TestInitNoWaitSkipsPolling(t *testing.T) {
 	}
 }
 
-// A reconcile failure other than a timeout propagates, and still leaves the
-// local config on disk so the user can retry or tear down.
-func TestInitWaitForSyncErrorPropagates(t *testing.T) {
+// A failed reconcile propagates its reason, and still leaves the local config
+// on disk so the user can retry or tear down.
+func TestInitReconcileErrorPropagates(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
-	want := errors.New("reconcile failed: caddy push failed: connection refused")
 	client := &mockClient{
 		createSiteFn: func(_ string) (*api.Site, error) {
 			return &api.Site{ID: "siteErr", Subdomain: "errsite", SyncAttemptID: 11}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, want
+		getSiteFn: func(id string) (*api.Site, error) {
+			return &api.Site{
+				ID: id, Subdomain: "errsite",
+				Sync: &api.Sync{
+					Outcome:         "error",
+					LatestAttemptID: 11,
+					Error:           "caddy push failed: connection refused",
+				},
+			}, nil
 		},
 	}
 
@@ -217,8 +254,11 @@ func TestInitWaitForSyncErrorPropagates(t *testing.T) {
 	var stdout bytes.Buffer
 
 	err := Run(client, false, stdin, &stdout)
-	if !errors.Is(err, want) {
-		t.Fatalf("Run() err = %v, want %v", err, want)
+	if err == nil {
+		t.Fatal("Run() expected the reconcile failure, got nil")
+	}
+	if err.Error() != "reconcile failed: caddy push failed: connection refused" {
+		t.Errorf("Run() err = %q, want the reconciler's own reason framed", err.Error())
 	}
 
 	output := stdout.String()
@@ -237,32 +277,36 @@ func TestInitWaitForSyncErrorPropagates(t *testing.T) {
 	}
 }
 
-// On timeout the sentinel must propagate, since suppressing the duplicate
-// stderr echo depends on recognizing it, and the "still syncing" hint must
-// reach stdout.
-func TestInitTimeoutPrintsHintAndPropagatesSentinel(t *testing.T) {
+// On Ctrl-C the sentinel must propagate, since the 130 exit depends on
+// recognizing it, the stop line must reach stdout once, and the config line has
+// to follow it: the site exists and the user is owed its handle.
+func TestInitInterruptStopsAndKeepsConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		createSiteFn: func(_ string) (*api.Site, error) {
 			return &api.Site{ID: "siteTO", Subdomain: "tosite", SyncAttemptID: 99}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
+		getSiteFn: flunkGetSite(t),
 	}
 
 	stdin := strings.NewReader("tosite\n")
 	var stdout bytes.Buffer
 
 	err := Run(client, false, stdin, &stdout)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("Run() err = %v, want ErrSyncTimeout", err)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("Run() err = %v, want syncwait.ErrInterrupted", err)
 	}
 	output := stdout.String()
-	if !strings.Contains(output, "still syncing") {
-		t.Errorf("output missing 'still syncing': %q", output)
+	stop := syncwait.SharedStopLine()
+	if got := strings.Count(output, stop); got != 1 {
+		t.Errorf("stop line printed %d times, want exactly 1:\n%q", got, output)
+	}
+	if !strings.Contains(output, stop+"\n"+i18n.T("init.saved_config")+"\n") {
+		t.Errorf("the config line must follow the stop line:\n%q", output)
 	}
 
 	config, err := core.LoadProject()
@@ -277,13 +321,19 @@ func TestInitTimeoutPrintsHintAndPropagatesSentinel(t *testing.T) {
 func TestInitConfigSavedEvenOnReconcileError(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	client := &mockClient{
 		createSiteFn: func(_ string) (*api.Site, error) {
 			return &api.Site{ID: "siteUX", Subdomain: "uxsite", SyncAttemptID: 1}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, errors.New("reconcile failed: caddy unreachable")
+		getSiteFn: func(id string) (*api.Site, error) {
+			return &api.Site{
+				ID: id,
+				Sync: &api.Sync{
+					Outcome: "error", LatestAttemptID: 1, Error: "caddy unreachable",
+				},
+			}, nil
 		},
 	}
 
@@ -328,7 +378,6 @@ func TestInitAlreadyInitialized(t *testing.T) {
 			}
 			return &api.Site{ID: "existing123", Subdomain: "my-site"}, nil
 		},
-		waitForSyncFn: flunkWait(t),
 	}
 
 	stdin := strings.NewReader("")
@@ -343,8 +392,8 @@ func TestInitAlreadyInitialized(t *testing.T) {
 	if !strings.Contains(output, "Already initialized: my-site.kamakiri-pages.jp") {
 		t.Errorf("output missing friendly already-initialized message: %q", output)
 	}
-	if client.waitForSyncHit {
-		t.Error("WaitForSync called on already-initialized short-circuit")
+	if client.getSiteCalls != 1 {
+		t.Errorf("the site was read %d times, want 1: the short-circuit runs no wait", client.getSiteCalls)
 	}
 }
 
@@ -368,7 +417,6 @@ func TestInitAlreadyInitializedFallsBackToIDWhenOffline(t *testing.T) {
 		getSiteFn: func(_ string) (*api.Site, error) {
 			return nil, errors.New("network unreachable")
 		},
-		waitForSyncFn: flunkWait(t),
 	}
 
 	var stdout bytes.Buffer
@@ -401,7 +449,6 @@ func TestInitAlreadyInitializedFallsBackToIDWhenSubdomainEmpty(t *testing.T) {
 		getSiteFn: func(_ string) (*api.Site, error) {
 			return &api.Site{ID: "existing123", Subdomain: ""}, nil
 		},
-		waitForSyncFn: flunkWait(t),
 	}
 
 	var stdout bytes.Buffer
@@ -416,6 +463,7 @@ func TestInitAlreadyInitializedFallsBackToIDWhenSubdomainEmpty(t *testing.T) {
 func TestInitSubdomainTakenReprompts(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	attempt := 0
 	client := &mockClient{
@@ -434,9 +482,6 @@ func TestInitSubdomainTakenReprompts(t *testing.T) {
 				ID: "site456", Subdomain: "available",
 				URL: "https://available.kamakiri-pages.jp", SyncAttemptID: 5,
 			}, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{Sync: &api.Sync{Outcome: "ok"}}, nil
 		},
 	}
 
@@ -482,7 +527,7 @@ func TestInitSubdomainTakenOwnAccountAccept(t *testing.T) {
 		},
 		// Adopting an existing site enqueues no reconcile, so there is nothing
 		// for a wait to poll.
-		waitForSyncFn: flunkWait(t),
+		getSiteFn: flunkGetSite(t),
 	}
 
 	stdin := strings.NewReader("my-blog\nY\n")
@@ -500,8 +545,8 @@ func TestInitSubdomainTakenOwnAccountAccept(t *testing.T) {
 	if !strings.Contains(output, ".kamakiri/config.json") {
 		t.Errorf("output missing config path: %q", output)
 	}
-	if client.waitForSyncHit {
-		t.Error("WaitForSync called on the adoption path, which is sync-only")
+	if client.getSiteCalls != 0 {
+		t.Errorf("the site was read %d times on the adoption path, want 0", client.getSiteCalls)
 	}
 
 	config, err := core.LoadProject()
@@ -519,6 +564,7 @@ func TestInitSubdomainTakenOwnAccountAccept(t *testing.T) {
 func TestInitSubdomainTakenOwnAccountReject(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	attempt := 0
 	client := &mockClient{
@@ -535,11 +581,6 @@ func TestInitSubdomainTakenOwnAccountReject(t *testing.T) {
 				ID: "newsite", Subdomain: subdomain,
 				URL: "https://" + subdomain + ".kamakiri-pages.jp", SyncAttemptID: 13,
 			}, nil
-		},
-		// The reprompt after a rejected answer ends in a real creation, so one
-		// wait is expected here.
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{Sync: &api.Sync{Outcome: "ok"}}, nil
 		},
 	}
 
@@ -570,6 +611,7 @@ func TestInitSubdomainTakenOwnAccountReject(t *testing.T) {
 func TestInitInvalidSubdomainReprompts(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	attempt := 0
 	client := &mockClient{
@@ -585,9 +627,6 @@ func TestInitInvalidSubdomainReprompts(t *testing.T) {
 				ID: "site789", Subdomain: subdomain,
 				URL: "https://" + subdomain + ".kamakiri-pages.jp", SyncAttemptID: 21,
 			}, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{Sync: &api.Sync{Outcome: "ok"}}, nil
 		},
 	}
 
@@ -622,6 +661,7 @@ func TestInitInvalidSubdomainReprompts(t *testing.T) {
 func TestInitReservedSubdomainReprompts(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
+	fastPolls(t)
 
 	attempt := 0
 	client := &mockClient{
@@ -637,9 +677,6 @@ func TestInitReservedSubdomainReprompts(t *testing.T) {
 				ID: "site789", Subdomain: subdomain,
 				URL: "https://" + subdomain + ".kamakiri-pages.jp", SyncAttemptID: 21,
 			}, nil
-		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{Sync: &api.Sync{Outcome: "ok"}}, nil
 		},
 	}
 
@@ -679,7 +716,6 @@ func TestInitUnauthorized(t *testing.T) {
 		createSiteFn: func(_ string) (*api.Site, error) {
 			return nil, &api.ErrorResponse{Code: "unauthorized", Message: "Unauthorized."}
 		},
-		waitForSyncFn: flunkWait(t),
 	}
 
 	stdin := strings.NewReader("my-site\n")
@@ -706,7 +742,6 @@ func TestInitAdoptionEmptySiteID(t *testing.T) {
 				SiteID:  "",
 			}
 		},
-		waitForSyncFn: flunkWait(t),
 	}
 
 	stdin := strings.NewReader("my-blog\ny\n")

@@ -278,8 +278,9 @@ type Quota struct {
 }
 
 // Sync is the site's latest reconcile attempt. Error carries the reconciler's
-// own failure reason, which WaitForSync surfaces rather than replacing with a
-// generic message; an empty one falls back to pointing at `kamakiri status`.
+// own failure reason, which the CLI's own-side wait surfaces verbatim rather
+// than replacing with a generic message; an empty one falls back to pointing at
+// `kamakiri status`.
 type Sync struct {
 	LatestAttemptID int64    `json:"latest_attempt_id"`
 	Outcome         string   `json:"outcome"`
@@ -451,7 +452,7 @@ type UnsetCanonicalResult struct {
 
 // RemoveDomainResult is the response from DELETE /v1/pages/domains/:domain. The
 // async remove returns site_id as well, since the CLI knows only the domain name
-// and WaitForSync needs the site.
+// and the wait that follows reads the site back until the attempt resolves.
 type RemoveDomainResult struct {
 	SiteID        string `json:"site_id"`
 	SyncAttemptID int64  `json:"sync_attempt_id"`
@@ -534,8 +535,9 @@ type ApexARecordsPending struct {
 }
 
 // CDNPurgeResponse is the 202 response from POST /v1/pages/cdn/purge, a manual
-// cache purge. site_id and sync_attempt_id let the CLI wait on the reconciler's
-// purge step via WaitForSync.
+// cache purge, identifying the site and the attempt the flush runs in. The CLI
+// does not wait on that attempt: it waits on the site's Freshness verdict, which
+// holds only once every cache a visitor could hit serves the current deploy.
 type CDNPurgeResponse struct {
 	SiteID        string `json:"site_id"`
 	SyncAttemptID int64  `json:"sync_attempt_id"`
@@ -1163,7 +1165,8 @@ func (c *Client) RotateCDNCredentials(siteID, token, secret string) (*CDNSetResp
 }
 
 // PurgeCDN calls POST /v1/pages/cdn/purge (authenticated), a manual cache purge.
-// It returns 202 with site_id and sync_attempt_id, which WaitForSync waits on.
+// It returns 202 with site_id and sync_attempt_id, the accepted flush; what the
+// CLI then waits on is described on CDNPurgeResponse.
 func (c *Client) PurgeCDN(siteID string) (*CDNPurgeResponse, error) {
 	body := map[string]string{"site_id": siteID}
 	var result CDNPurgeResponse

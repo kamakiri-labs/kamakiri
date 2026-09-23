@@ -17,6 +17,8 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/dns"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 	"github.com/kamakiri-labs/kamakiri/internal/timeago"
 )
 
@@ -357,7 +359,10 @@ type APIClient interface {
 	AddDomain(siteID, domain, role string, redirectStatus int) (*api.Domain, error)
 	RemoveDomain(domain string) (*api.RemoveDomainResult, error)
 	ListDomains(siteID string) (*api.DomainList, error)
-	WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
+
+	// GetSite is what the our-side waits poll: the domain verbs queue a change
+	// and read the site back until its sync attempt reaches a terminal outcome.
+	GetSite(id string) (*api.Site, error)
 
 	// RecheckDomain asks the server to re-probe the domain soon and returns its
 	// current status. No probe runs as part of the call, so the status it
@@ -601,37 +606,43 @@ func WatchExitToLive(ctx context.Context, client APIClient, siteID string, watch
 	return true, watchAllToLiveFn(ctx, client, siteID, names, out)
 }
 
-// ourSideWaitTimeout covers the server's first reconcile pass, which pushes the
-// edge route and upserts DNS where we own it. That takes a few seconds, so a
-// minute leaves generous headroom for retries against a flaky edge or DNS API.
-const ourSideWaitTimeout = 60 * time.Second
-
-// waitAndRender blocks on the sync attempt and renders its outcome. A timeout
-// still returns the error, so a scripted run can tell "timed out, status
-// unknown" apart from "definitely succeeded".
+// waitAndRender blocks on the sync attempt and renders its outcome. Every
+// non-nil outcome propagates as well as being rendered, so the screen reports
+// to the user and the error reports to a scripted run.
 //
-// Every caller opens an unterminated in-progress line and leaves it to this
-// function to close, so every path through it must write exactly one line,
-// outcome or not.
-func waitAndRender(client APIClient, siteID string, attemptID int64, out io.Writer) error {
-	if _, err := client.WaitForSync(siteID, attemptID, ourSideWaitTimeout); err != nil {
+// The wait leaves its row open on every outcome but an interrupt, where it
+// terminates the row itself, so each path here owes the row exactly one
+// terminator and the interrupt path owes it none.
+func waitAndRender(ctx context.Context, client APIClient, siteID string, attemptID int64, prefix string, out io.Writer) error {
+	_, err := syncwait.Sync(ctx, client, siteID, attemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   prefix,
+		StopLine: i18n.T("domain.stopped_teardown"),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		// Both callers are the non-interactive branches of unset and remove, so
+		// this is false in every real run, and that is what makes the removal
+		// prefix safe here: it carries a domain name and can exceed one row,
+		// while the row is rewritten in place on a terminal alone.
+		IsTTY: isTerminalWriter(out),
+	})
+
+	switch {
+	case err == nil:
+		fmt.Fprintln(out, i18n.T("domain.wait_done"))
+	case errors.Is(err, api.ErrUpgradeRequired):
 		// The refusal is the whole message and the command layer prints it, so a
-		// "failed." line in front of it would only dull it. The caller's line
-		// still has to be closed, so the outcome word is dropped, not the newline.
-		if errors.Is(err, api.ErrUpgradeRequired) {
-			fmt.Fprintln(out)
-			return err
-		}
-		switch {
-		case errors.Is(err, api.ErrSyncTimeout):
-			fmt.Fprintln(out, i18n.T("domain.wait_still_syncing"))
-		default:
-			fmt.Fprintln(out, i18n.T("domain.wait_failed"))
-		}
-		return err
+		// "failed." line in front of it would only dull it. The row still has to
+		// be closed, so the outcome word is dropped, not the newline.
+		fmt.Fprintln(out)
+	case errors.Is(err, syncwait.ErrInterrupted):
+		// The wait has closed the row itself and said the teardown carries on,
+		// so an outcome word here would report on something that has not
+		// stopped.
+	default:
+		fmt.Fprintln(out, i18n.T("domain.wait_failed"))
 	}
-	fmt.Fprintln(out, i18n.T("domain.wait_done"))
-	return nil
+	return err
 }
 
 // syncVerb says which of the two things the our-side line is reporting. It is a
@@ -690,17 +701,15 @@ func ourSideDoneLine(verb syncVerb) string {
 //     the user needs the record at their registrar and our own sync is
 //     irrelevant to that;
 //  2. the three-state "<verb> your domain on our side" line, which carries its
-//     own resume hint on failure or timeout so the user is never left without a
-//     way forward, while the error still propagates;
+//     own resume hint on failure so the user is never left without a way
+//     forward, while the error still propagates;
 //  3. the streamed go-live watch.
 //
-// One cancellable context spans the whole region, so a Ctrl-C anywhere in it
+// ctx is the caller's, and spans this whole region, so a Ctrl-C anywhere in it
 // prints stop copy and returns ErrWatchInterrupted, never a bare exit code with
-// nothing said.
-func interactiveSync(client APIClient, siteID, domainName string, attemptID int64, d *api.Domain, opts syncOpts, out io.Writer) error {
-	ctx, stop := signalCtx()
-	defer stop()
-
+// nothing said. Minting one here as well would put a second signal region
+// inside the caller's.
+func interactiveSync(ctx context.Context, client APIClient, siteID, domainName string, attemptID int64, d *api.Domain, opts syncOpts, out io.Writer) error {
 	if opts.showInstructions {
 		printDnsInstructions(out, d)
 		fmt.Fprintln(out)
@@ -720,35 +729,54 @@ func interactiveSync(client APIClient, siteID, domainName string, attemptID int6
 }
 
 // renderOurSideCtx prints the three-state "<verb> your domain on our side"
-// line, racing the sync against ctx. WaitForSync blocks in a poll loop of its
-// own and takes no context, so it runs in a goroutine raced against ctx.Done().
-// That goroutine writes to a cap-1 channel, so it never blocks and leaks
-// nothing even though the interrupt path stops reading.
+// line. The wait owns that row while it runs and hands it back open, so every
+// outcome below ends it, two of them with the line that reports on it: on a
+// terminal that line takes the row's place, off one it follows on the next
+// line. The exception is an interrupt, where the wait terminates the row
+// itself and nothing below ends it again.
 //
 // An interrupt prints the watch's detach copy where a go-live wait was still to
 // come, and a teardown-appropriate stop line otherwise. Both return
 // ErrWatchInterrupted, never a bare exit code with no copy.
 func renderOurSideCtx(ctx context.Context, client APIClient, siteID, domainName string, attemptID int64, opts syncOpts, out io.Writer) error {
 	tty := isTerminalWriter(out)
-	fmt.Fprintln(out, ourSideStartLine(opts.verb))
-	// This copy is fixed and never wraps at a sane width, so rewinding exactly
-	// one line is correct. The watch counts rendered rows instead, because its
-	// frames vary. Lengthening this line means revisiting the fixed rewind.
-	redraw := func() {
+
+	_, err := syncwait.Sync(ctx, client, siteID, attemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   ourSideStartLine(opts.verb),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    tty,
+	})
+
+	// closeRow ends the open row with the line that reports the outcome: on a
+	// terminal the line takes the row's place, off one it follows on the next.
+	// An empty line is for an outcome with nothing of its own to say: on a
+	// terminal it erases the row and leaves the cursor on it, and off one,
+	// where nothing can be erased, it terminates the row and leaves it standing.
+	closeRow := func(line string) {
 		if tty {
-			fmt.Fprint(out, "\033[1A\033[J")
+			streamui.RewriteRow(out, line)
+			if line == "" {
+				return
+			}
+			fmt.Fprintln(out)
+			return
+		}
+		fmt.Fprintln(out)
+		if line != "" {
+			fmt.Fprintln(out, line)
 		}
 	}
 
-	type syncResult struct{ err error }
-	done := make(chan syncResult, 1)
-	go func() {
-		_, err := client.WaitForSync(siteID, attemptID, ourSideWaitTimeout)
-		done <- syncResult{err: err}
-	}()
+	switch {
+	case err == nil:
+		closeRow(ourSideDoneLine(opts.verb))
+		return nil
 
-	select {
-	case <-ctx.Done():
+	case errors.Is(err, syncwait.ErrInterrupted):
+		// The wait has terminated the row already, so the copy below starts on a
+		// line of its own.
 		if opts.watch {
 			printDetachCopy(out, []string{domainName})
 		} else {
@@ -756,37 +784,26 @@ func renderOurSideCtx(ctx context.Context, client APIClient, siteID, domainName 
 			fmt.Fprintln(out, i18n.T("domain.stopped_teardown"))
 		}
 		return ErrWatchInterrupted
-	case r := <-done:
-		if r.err != nil {
-			redraw()
-			// Nothing on our side failed, and both resume pointers name commands
-			// the same floor refuses. The ✗ line and the already-reported wrap are
-			// skipped so the command layer prints the upgrade message.
-			if errors.Is(r.err, api.ErrUpgradeRequired) {
-				return r.err
-			}
-			resume := i18n.Tf("domain.resume_verify", domainName)
-			if !opts.watch {
-				resume = i18n.T("domain.resume_status")
-			}
-			// A timeout is not a failure, our side is still reconciling, so the
-			// line keeps the in-progress glyph and offers a resume path. The ✗
-			// form is reserved for a real reported error. The error still
-			// propagates, so the exit code says "status unknown".
-			if errors.Is(r.err, api.ErrSyncTimeout) {
-				fmt.Fprintln(out, i18n.Tf("domain.our_side_still_syncing", resume))
-				return r.err
-			}
-			mapped := api.MapError(r.err)
-			fmt.Fprintln(out, ourSideFailedLine(opts.verb, mapped.Error(), resume))
-			// Wrapping the mapped error keeps the returned error and the ✗ line
-			// saying the same thing, and marks the reason as already on stdout so
-			// the command layer does not echo it again.
-			return &ourSideError{mapped}
+
+	case errors.Is(err, api.ErrUpgradeRequired):
+		// Nothing on our side failed, and both resume pointers name commands the
+		// same floor refuses. The ✗ line and the already-reported wrap are
+		// skipped so the command layer prints the upgrade message.
+		closeRow("")
+		return err
+
+	default:
+		resume := i18n.Tf("domain.resume_verify", domainName)
+		if !opts.watch {
+			resume = i18n.T("domain.resume_status")
 		}
-		redraw()
-		fmt.Fprintln(out, ourSideDoneLine(opts.verb))
-		return nil
+		// The reason is user-facing as it stands: the wait frames a reconciler
+		// failure and maps a transport one before it returns.
+		closeRow(ourSideFailedLine(opts.verb, err.Error(), resume))
+		// Wrapping keeps the returned error and the ✗ line saying the same
+		// thing, and marks the reason as already on stdout so the command layer
+		// does not echo it again.
+		return &ourSideError{err}
 	}
 }
 
@@ -839,13 +856,23 @@ func set(client APIClient, domainName string, interactive bool, out io.Writer) e
 	}
 
 	fmt.Fprintln(out, i18n.Tf("domain.set_done", domain.Domain))
-	return interactiveSync(client, config.ID, domain.Domain, domain.SyncAttemptID, domain,
+
+	ctx, stop := signalCtx()
+	defer stop()
+
+	return interactiveSync(ctx, client, config.ID, domain.Domain, domain.SyncAttemptID, domain,
 		syncOpts{verb: syncVerbLink, showInstructions: true, watch: true}, out)
 }
 
 var signalCtx = func() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
+
+// pollSchedule is the cadence the our-side sync waits poll on, a seam so a test
+// can drive several polls without waiting out the production bands. The go-live
+// watch has a cadence of its own; this is the our-side wait's, whether a watch
+// follows it or not.
+var pollSchedule = syncwait.DefaultSchedule
 
 var watchToLiveFn = watchToLiveCtx
 
@@ -879,16 +906,18 @@ func unset(client APIClient, noWait, interactive bool, out io.Writer) error {
 		return nil
 	}
 
+	ctx, stop := signalCtx()
+	defer stop()
+
 	if !interactive {
-		fmt.Fprint(out, i18n.T("domain.unset_removing"))
-		return waitAndRender(client, config.ID, result.SyncAttemptID, out)
+		return waitAndRender(ctx, client, config.ID, result.SyncAttemptID, i18n.T("domain.unset_removing"), out)
 	}
 
 	// Teardown never renders the domain name: instructions and the watch are
 	// off, and the resume copy points at `kamakiri status`. Passing "" rather
 	// than a human phrase keeps a future code path from printing prose where an
 	// argument belongs.
-	return interactiveSync(client, config.ID, "", result.SyncAttemptID, nil,
+	return interactiveSync(ctx, client, config.ID, "", result.SyncAttemptID, nil,
 		syncOpts{verb: syncVerbRemove, showInstructions: false, watch: false}, out)
 }
 
@@ -932,7 +961,11 @@ func add(client APIClient, domainName, role string, redirectStatus int, interact
 	}
 
 	fmt.Fprintln(out, i18n.Tf("domain.add_done", domain.Domain, roleSuffix))
-	return interactiveSync(client, config.ID, domain.Domain, domain.SyncAttemptID, domain,
+
+	ctx, stop := signalCtx()
+	defer stop()
+
+	return interactiveSync(ctx, client, config.ID, domain.Domain, domain.SyncAttemptID, domain,
 		syncOpts{verb: syncVerbLink, showInstructions: true, watch: true}, out)
 }
 
@@ -962,19 +995,22 @@ func remove(client APIClient, domainName string, noWait, interactive bool, out i
 		return nil
 	}
 
-	// An empty site id would make the wait block on the wrong key and never see
-	// the reconcile finish, so say so rather than let the user sit out the full
-	// timeout for no reason.
+	// An empty site id would make the wait poll a key that is not this site's,
+	// so the reconcile could never resolve it: say so plainly rather than let
+	// the user read a transport error from a request that was never going to
+	// work.
 	if result.SiteID == "" {
 		return errors.New(i18n.T("domain.err_no_site_id"))
 	}
 
+	ctx, stop := signalCtx()
+	defer stop()
+
 	if !interactive {
-		fmt.Fprint(out, i18n.Tf("domain.remove_removing", domainName))
-		return waitAndRender(client, result.SiteID, result.SyncAttemptID, out)
+		return waitAndRender(ctx, client, result.SiteID, result.SyncAttemptID, i18n.Tf("domain.remove_removing", domainName), out)
 	}
 
-	return interactiveSync(client, result.SiteID, domainName, result.SyncAttemptID, nil,
+	return interactiveSync(ctx, client, result.SiteID, domainName, result.SyncAttemptID, nil,
 		syncOpts{verb: syncVerbRemove, showInstructions: false, watch: false}, out)
 }
 

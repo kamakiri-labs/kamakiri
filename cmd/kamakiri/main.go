@@ -25,6 +25,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/status"
 	"github.com/kamakiri-labs/kamakiri/internal/streamui"
 	"github.com/kamakiri-labs/kamakiri/internal/subdomain"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 	"github.com/kamakiri-labs/kamakiri/internal/teardown"
 	"github.com/kamakiri-labs/kamakiri/internal/upgrade"
 	versioncmd "github.com/kamakiri-labs/kamakiri/internal/version"
@@ -207,28 +208,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 		client := api.NewClient(baseURL)
 		a.setAPIKey(client)
 		if err := initcmd.Run(client, noWait, a.stdin, a.stdout); err != nil {
-			// A sync timeout has already put its hint on stdout, so echoing
-			// the error would double-report it. The exit stays nonzero: the
-			// reconcile did not reach a terminal outcome.
-			if !errors.Is(err, api.ErrSyncTimeout) {
-				fmt.Fprintln(a.stderr, err)
-			}
-			return 1
+			return a.syncWaitExit(err)
 		}
 	case "teardown":
 		teardownNoWait := a.parseNoWait(a.args[1:], i18n.T("cmd.usage_teardown"))
 		client := api.NewClient(baseURL)
 		a.setAPIKey(client)
 		if err := teardown.Run(client, a.stdin, a.stdout, teardownNoWait); err != nil {
-			// Alone among these commands, a teardown sync timeout exits 0: the
-			// teardown is queued, converges server-side, and the local config
-			// is already gone, so a slow but healthy one must not fail a
-			// script.
-			if errors.Is(err, api.ErrSyncTimeout) {
-				return 0
-			}
-			fmt.Fprintln(a.stderr, err)
-			return 1
+			return a.syncWaitExit(err)
 		}
 	case "deploy":
 		if len(a.args) < 2 {
@@ -342,8 +329,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 			}
 		case "verify":
 			// Deliberately not routed through domainExit: verify has no
-			// pre-watch sync, so it can yield neither ErrSyncTimeout nor
-			// ErrOurSideShown, and its stderr carries the plain `Error:`
+			// our-side sync wait, so it can yield neither syncwait.ErrInterrupted
+			// nor ErrOurSideShown, and its stderr carries the plain `Error:`
 			// prefix rather than domainExit's bare echo.
 			if len(a.args) < 3 {
 				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_domain_verify"))
@@ -429,29 +416,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 				return 1
 			}
 			if err := subdomain.Set(client, positional, noWait, a.stdout); err != nil {
-				// A sync timeout's hint is already on stdout, so it is not
-				// echoed here or in the two toggles below; the exit stays
-				// nonzero all the same.
-				if !errors.Is(err, api.ErrSyncTimeout) {
-					fmt.Fprintln(a.stderr, err)
-				}
-				return 1
+				return a.syncWaitExit(err)
 			}
 		case "disable":
 			noWait := a.parseNoWait(a.args[2:], i18n.Tf("cmd.usage_subdomain_toggle", "disable"))
 			if err := subdomain.Disable(client, noWait, a.stdout); err != nil {
-				if !errors.Is(err, api.ErrSyncTimeout) {
-					fmt.Fprintln(a.stderr, err)
-				}
-				return 1
+				return a.syncWaitExit(err)
 			}
 		case "enable":
 			noWait := a.parseNoWait(a.args[2:], i18n.Tf("cmd.usage_subdomain_toggle", "enable"))
 			if err := subdomain.Enable(client, noWait, a.stdout); err != nil {
-				if !errors.Is(err, api.ErrSyncTimeout) {
-					fmt.Fprintln(a.stderr, err)
-				}
-				return 1
+				return a.syncWaitExit(err)
 			}
 		default:
 			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_subdomain_command", a.args[1]))
@@ -506,18 +481,49 @@ func (a *app) runDomainAdd(client *api.Client) {
 	a.domainExit(domain.Add(client, domainName, role, redirectStatus, noWait, a.stdout))
 }
 
+// syncWaitExit maps the result of a command whose whole wait is our own side to
+// a process exit code, echoing the error where nothing has reported it yet. It
+// is shared by `init`, `teardown` and `subdomain set/disable/enable`, so their
+// matrices are identical by construction.
+func (a *app) syncWaitExit(err error) int {
+	code, echo := syncWaitExitCode(err)
+	if echo {
+		fmt.Fprintln(a.stderr, err)
+	}
+	return code
+}
+
+// syncWaitExitCode is the pure core of syncWaitExit, returning the exit code
+// and whether to echo err to stderr:
+//
+//	nil                     → 0   the change is applied, or --no-wait queued it
+//	syncwait.ErrInterrupted → 130 Ctrl-C; the stop line is already on stdout
+//	other                   → 1   the failure, echoed so a CI log keeps it
+func syncWaitExitCode(err error) (code int, echoStderr bool) {
+	switch {
+	case err == nil:
+		return 0, false
+	case errors.Is(err, syncwait.ErrInterrupted):
+		return 130, false
+	default:
+		return 1, true
+	}
+}
+
 // domainExit maps a domain-verb result to a process exit code. It is shared by
 // `domain set/add/unset/remove`, so their matrices are identical by
 // construction:
 //
-//	nil                 → 0   live, or the --no-wait async submit, where
-//	                          DNS not yet live is the expected state
-//	ErrWatchInterrupted → 130 Ctrl-C; the detach copy is already on stdout
-//	ErrSyncTimeout      → 1   pre-watch sync timeout, interactive path only;
-//	                          the ⧗ resume hint is already on stdout
-//	ErrOurSideShown     → 1   pre-watch sync failure; the ✗ reason is already
-//	                          on stdout
-//	other               → 1   transport or API error; echo to stderr
+//	nil                     → 0   live, or the --no-wait async submit, where
+//	                              DNS not yet live is the expected state
+//	ErrWatchInterrupted     → 130 Ctrl-C on an interactive run; the detach or
+//	                              teardown stop copy is already on stdout
+//	syncwait.ErrInterrupted → 130 Ctrl-C on the plain unset/remove wait a run
+//	                              off a terminal gets; its stop copy is on
+//	                              stdout too
+//	ErrOurSideShown         → 1   pre-watch sync failure; the ✗ reason is
+//	                              already on stdout
+//	other                   → 1   transport or API error; echo to stderr
 func (a *app) domainExit(err error) {
 	code, echo := domainExitCode(err)
 	if echo {
@@ -532,9 +538,9 @@ func domainExitCode(err error) (code int, echoStderr bool) {
 	switch {
 	case err == nil:
 		return 0, false
-	case errors.Is(err, domain.ErrWatchInterrupted):
+	case errors.Is(err, domain.ErrWatchInterrupted), errors.Is(err, syncwait.ErrInterrupted):
 		return 130, false
-	case errors.Is(err, api.ErrSyncTimeout), errors.Is(err, domain.ErrOurSideShown):
+	case errors.Is(err, domain.ErrOurSideShown):
 		// The reason is already on stdout, so nonzero without an echo: CI
 		// still sees the failure, the user does not read it twice.
 		return 1, false
@@ -636,18 +642,23 @@ func (a *app) runCDNCredentials(client *api.Client) {
 	a.cdnExit(cdn.RotateCredentials(client, opts, noWait, a.stdin, a.stdout))
 }
 
-// cdnExit maps a CDN-verb result to a process exit code, for the verbs that can
-// block on the go-live watch or the pre-watch sync:
+// cdnExit maps a CDN-verb result to a process exit code, for the verbs that
+// wait on their own side, watch the edge converge, or both:
 //
 //	nil                    → 0   live, queued or disabled
-//	ErrCdnWatchInterrupted,      Ctrl-C; the detach copy is already on stdout.
-//	  domain.ErrWatchInterrupted, Three sentinels because three waits can be
-//	  freshness.ErrInterrupted    interrupted: cdn's own go-live watch, the
-//	                       → 130  domain-package watches `cdn none` runs, and
-//	                              `cdn purge`'s freshness wait.
-//	ErrSyncTimeout,        → 1   the reason is already on stdout, whether a
-//	  ErrCdnReported,             queued hint, a ✗ breakdown or rejected
-//	  freshness.ErrFlushBlocked   credentials
+//	ErrCdnWatchInterrupted,      Ctrl-C; the detach or stop copy is already on
+//	  domain.ErrWatchInterrupted, stdout. Four sentinels, between them covering
+//	  freshness.ErrInterrupted,   every wait that can be interrupted: cdn's own
+//	  syncwait.ErrInterrupted     go-live watch; `cdn none`'s own deactivation
+//	                       → 130  wait and the domain-package watches after it,
+//	                              both surfacing as domain.ErrWatchInterrupted;
+//	                              `cdn purge`'s freshness wait; and the own-side
+//	                              wait a verb with no watch to stream blocks on.
+//	ErrCdnReported,        → 1   the report is already on stdout: a ✗
+//	  freshness.ErrFlushBlocked   breakdown, a failed `cdn none` change, a
+//	                              blocked or unreadable cleanup, rejected
+//	                              credentials, or a rotation whose outcome the
+//	                              wait could not read
 //	other                  → 1   transport or API error; echo to stderr
 func (a *app) cdnExit(err error) {
 	code, echo := cdnExitCode(err)
@@ -664,10 +675,9 @@ func cdnExitCode(err error) (code int, echoStderr bool) {
 	case err == nil:
 		return 0, false
 	case errors.Is(err, cdn.ErrCdnWatchInterrupted), errors.Is(err, domain.ErrWatchInterrupted),
-		errors.Is(err, freshness.ErrInterrupted):
+		errors.Is(err, freshness.ErrInterrupted), errors.Is(err, syncwait.ErrInterrupted):
 		return 130, false
-	case errors.Is(err, api.ErrSyncTimeout), errors.Is(err, cdn.ErrCdnReported),
-		errors.Is(err, freshness.ErrFlushBlocked):
+	case errors.Is(err, cdn.ErrCdnReported), errors.Is(err, freshness.ErrFlushBlocked):
 		return 1, false
 	default:
 		return 1, true

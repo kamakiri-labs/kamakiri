@@ -237,3 +237,22 @@ func assertCellsStartTogether(t *testing.T, what string, rows, anchors []string)
 		}
 	}
 }
+
+// The own-side wait restores each of these prefixes verbatim right before the
+// caller's own closing line, off a terminal, with nothing in between. That only
+// lands the two lines back to back because the prefix carries no trailing
+// whitespace; a translator adding one would silently open a gap between the
+// prefix and the line that follows it.
+func TestOurSidePrefixesHaveNoTrailingWhitespace(t *testing.T) {
+	t.Cleanup(func() { i18n.Load(testLang) })
+
+	for _, key := range []string{"domain.our_side_linking", "domain.our_side_removing"} {
+		for _, lang := range []string{"en", "ja"} {
+			i18n.Load(lang)
+			got := i18n.T(key)
+			if trimmed := strings.TrimRight(got, " \t"); trimmed != got {
+				t.Errorf("%s (%s) has trailing whitespace: %q", key, lang, got)
+			}
+		}
+	}
+}

@@ -1,19 +1,20 @@
 package subdomain
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
-
-// defaultSyncTimeout is how long a subdomain change waits for the reconcile to
-// converge before printing the "still syncing" hint and exiting nonzero.
-const defaultSyncTimeout = 60 * time.Second
 
 // APIClient is the API surface the subdomain commands need.
 type APIClient interface {
@@ -21,7 +22,34 @@ type APIClient interface {
 	UpdateSubdomain(siteID, subdomain string) (*api.Site, error)
 	DisableSubdomain(siteID string) (*api.Site, error)
 	EnableSubdomain(siteID string) (*api.Site, error)
-	WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
+}
+
+var signalCtx = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// pollSchedule is the cadence a subdomain change's wait polls on, a seam so a
+// test can drive several polls without waiting out the production bands.
+var pollSchedule = syncwait.DefaultSchedule
+
+// awaitChange blocks until the change the server accepted is reconciled.
+// Nothing is on screen while it runs until the liveness token is due, at which
+// point tickText says which of the three changes is being waited on. On a
+// terminal the token is erased again before the wait returns, and off one each
+// token is a finished line, so either way the caller's result line lands on a
+// clean row.
+func awaitChange(client APIClient, siteID string, attemptID int64, tickText string, out io.Writer) (*api.Site, error) {
+	ctx, stop := signalCtx()
+	defer stop()
+
+	return syncwait.Sync(ctx, client, siteID, attemptID, syncwait.Options{
+		Out:      out,
+		TickText: tickText,
+		StopLine: syncwait.SharedStopLine(),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    streamui.IsTerminalWriter(out),
+	})
 }
 
 // Get prints the current subdomain for the linked site.
@@ -58,15 +86,8 @@ func Set(client APIClient, subdomain string, noWait bool, out io.Writer) error {
 		return nil
 	}
 
-	final, err := client.WaitForSync(config.ID, site.SyncAttemptID, defaultSyncTimeout)
+	final, err := awaitChange(client, config.ID, site.SyncAttemptID, i18n.T("subdomain.tick_renaming"), out)
 	if err != nil {
-		if errors.Is(err, api.ErrSyncTimeout) {
-			// The hint is for the person; the sentinel still has to reach the
-			// caller, since exiting 0 would tell a CI script the rename
-			// definitely landed when its status is unknown.
-			fmt.Fprintln(out, i18n.T("subdomain.set_still_syncing"))
-			return err
-		}
 		return err
 	}
 	fmt.Fprintln(out, i18n.Tf("subdomain.renamed", final.Subdomain, api.PagesDomain))
@@ -76,7 +97,8 @@ func Set(client APIClient, subdomain string, noWait bool, out io.Writer) error {
 // Disable stops the subdomain route serving, waiting for the reconcile unless
 // noWait is set. The name itself stays reserved.
 func Disable(client APIClient, noWait bool, out io.Writer) error {
-	return toggle(client, noWait, out, client.DisableSubdomain, i18n.T("subdomain.verbing_disable"),
+	return toggle(client, noWait, out, client.DisableSubdomain,
+		i18n.T("subdomain.verbing_disable"), i18n.T("subdomain.tick_disabling"),
 		func(out io.Writer, host string) {
 			fmt.Fprintln(out, i18n.Tf("subdomain.disabled", host))
 			fmt.Fprintln(out, i18n.T("subdomain.disabled_still_reserved"))
@@ -86,21 +108,25 @@ func Disable(client APIClient, noWait bool, out io.Writer) error {
 // Enable puts the subdomain route back, waiting for the reconcile unless noWait
 // is set.
 func Enable(client APIClient, noWait bool, out io.Writer) error {
-	return toggle(client, noWait, out, client.EnableSubdomain, i18n.T("subdomain.verbing_enable"),
+	return toggle(client, noWait, out, client.EnableSubdomain,
+		i18n.T("subdomain.verbing_enable"), i18n.T("subdomain.tick_enabling"),
 		func(out io.Writer, host string) {
 			fmt.Fprintln(out, i18n.Tf("subdomain.enabled", host))
 		})
 }
 
-// toggle is the shared body of Disable and Enable. verbing is the rendered word
-// the queued and still-syncing hints read with, and printSuccess is the
-// caller's, since only disable has anything to reassure the user about.
+// toggle is the shared body of Disable and Enable. verbing is the word the
+// queued hint reads with; tickText is the whole sentence the wait's token
+// follows, a string of its own rather than a frame around verbing, since
+// Japanese builds neither from the other. printSuccess is the caller's, since
+// only disable has anything to reassure the user about.
 func toggle(
 	client APIClient,
 	noWait bool,
 	out io.Writer,
 	mutate func(string) (*api.Site, error),
 	verbing string,
+	tickText string,
 	printSuccess func(out io.Writer, host string),
 ) error {
 	config, err := core.RequireProject()
@@ -118,12 +144,8 @@ func toggle(
 		return nil
 	}
 
-	final, err := client.WaitForSync(config.ID, site.SyncAttemptID, defaultSyncTimeout)
+	final, err := awaitChange(client, config.ID, site.SyncAttemptID, tickText, out)
 	if err != nil {
-		if errors.Is(err, api.ErrSyncTimeout) {
-			fmt.Fprintln(out, i18n.Tf("subdomain.toggle_still_syncing", verbing))
-			return err
-		}
 		return err
 	}
 

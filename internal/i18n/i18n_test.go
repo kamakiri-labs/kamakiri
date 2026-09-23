@@ -54,6 +54,45 @@ func TestInviteRequiredPresentInBothLocales(t *testing.T) {
 	}
 }
 
+// The login lines name the site's Terms and Privacy pages in the language the
+// CLI runs in, since the site serves each page only under a language prefix.
+// Each catalog aligns the two URLs by padding the shorter label inside the
+// string, so the labels' widths are what hold the alignment; Width is the
+// measure because a Japanese label's byte and rune counts are not its columns.
+func TestLoginSiteLinesPointAtTheSite(t *testing.T) {
+	restoreSelection(t)
+
+	for _, lang := range []string{"en", "ja"} {
+		Load(lang)
+
+		terms := T("login.terms_line")
+		privacy := T("login.privacy_line")
+
+		if want := "https://kamakiri-labs.jp/" + lang + "/terms/"; !strings.HasSuffix(terms, want) {
+			t.Errorf("login.terms_line (%s) = %q, want it to end with %q", lang, terms, want)
+		}
+		if want := "https://kamakiri-labs.jp/" + lang + "/privacy/"; !strings.HasSuffix(privacy, want) {
+			t.Errorf("login.privacy_line (%s) = %q, want it to end with %q", lang, privacy, want)
+		}
+
+		termsLabel, _, termsFound := strings.Cut(terms, "https://")
+		privacyLabel, _, privacyFound := strings.Cut(privacy, "https://")
+		if !termsFound || !privacyFound {
+			t.Errorf("login.terms_line or login.privacy_line (%s) carries no URL: %q, %q", lang, terms, privacy)
+		} else if tw, pw := Width(termsLabel), Width(privacyLabel); tw != pw {
+			t.Errorf("login URLs (%s) start at different columns: terms label %q is %d wide, privacy label %q is %d", lang, termsLabel, tw, privacyLabel, pw)
+		}
+
+		serverErr := T("login.err_server")
+		if !strings.Contains(serverErr, "support@kamakiri-labs.jp") {
+			t.Errorf("login.err_server (%s) missing the support address: %q", lang, serverErr)
+		}
+		if strings.Contains(serverErr, "pages.kamakiri-labs.jp") {
+			t.Errorf("login.err_server (%s) names pages.kamakiri-labs.jp, which serves nothing: %q", lang, serverErr)
+		}
+	}
+}
+
 func TestMissingKeyReturnsKey(t *testing.T) {
 	Load("en")
 

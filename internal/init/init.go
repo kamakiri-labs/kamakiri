@@ -2,28 +2,37 @@ package initcmd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
-// defaultInitSyncTimeout is how long init waits for the reconcile to converge
-// before printing the "still syncing" hint and exiting nonzero.
-const defaultInitSyncTimeout = 60 * time.Second
-
 // APIClient is the API surface the init flow needs. Site creation is accepted
-// asynchronously, so WaitForSync is what turns it into a terminal outcome.
+// asynchronously, so the wait polls GetSite to turn it into a terminal outcome.
 type APIClient interface {
 	CreateSite(subdomain string) (*api.Site, error)
 	GetSite(id string) (*api.Site, error)
-	WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
 }
+
+var signalCtx = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// pollSchedule is the cadence the create wait polls on, a seam so a test can
+// drive several polls without waiting out the production bands.
+var pollSchedule = syncwait.DefaultSchedule
 
 // Run executes the init flow, reading from in and writing to out. It blocks on
 // the reconcile unless noWait is set, which is for CI scripts that only want the
@@ -82,10 +91,11 @@ func Run(client APIClient, noWait bool, in io.Reader, out io.Writer) error {
 
 			// The terminator prints only once the wait resolves: nothing may
 			// report done while the edge is not yet serving the route.
-			fmt.Fprint(out, i18n.T("init.creating"))
-			if _, err := client.WaitForSync(site.ID, site.SyncAttemptID, defaultInitSyncTimeout); err != nil {
-				if errors.Is(err, api.ErrSyncTimeout) {
-					fmt.Fprintln(out, i18n.T("init.still_syncing"))
+			if err := waitForCreate(client, site, out); err != nil {
+				if errors.Is(err, syncwait.ErrInterrupted) {
+					// The wait has already said the work carries on. What
+					// still has to be said is where the site's handle went,
+					// since the user is left with a site they own.
 					fmt.Fprintln(out, i18n.T("init.saved_config"))
 					return err
 				}
@@ -143,4 +153,23 @@ func Run(client APIClient, noWait bool, in io.Reader, out io.Writer) error {
 			return apiErr
 		}
 	}
+}
+
+// waitForCreate blocks until the site the server accepted is reconciled,
+// leaving the in-progress line open for Run to terminate. The signal region is
+// minted here rather than around the prompt loop, so Ctrl-C at the subdomain
+// prompt still ends the process the ordinary way.
+func waitForCreate(client APIClient, site *api.Site, out io.Writer) error {
+	ctx, stop := signalCtx()
+	defer stop()
+
+	_, err := syncwait.Sync(ctx, client, site.ID, site.SyncAttemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   i18n.T("init.creating"),
+		StopLine: syncwait.SharedStopLine(),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    streamui.IsTerminalWriter(out),
+	})
+	return err
 }

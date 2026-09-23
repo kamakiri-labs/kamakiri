@@ -7,7 +7,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
@@ -401,9 +400,9 @@ func TestExitToDirectInSwitchSuppressesOrphan(t *testing.T) {
 
 // A refusal is not the CDN change failing, and the fix copy names commands the
 // same floor refuses, so the exit prints neither and the sentinel travels
-// unmarked for the command layer to render as the upgrade message. The status
-// line is all that is left, rewound in place where the run is interactive so
-// the upgrade message lands on a clean terminal.
+// unmarked for the command layer to render as the upgrade message. The ⧗ row is
+// all that is left, erased in place where the run is interactive so the upgrade
+// message lands on a clean terminal.
 func TestExitToDirectAbortsOnAVersionRefusal(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -417,7 +416,7 @@ func TestExitToDirectAbortsOnAVersionRefusal(t *testing.T) {
 				setCDNFn: func(_, _ string) (*api.CDNSetResponse, error) {
 					return &api.CDNSetResponse{CDNMode: "none", SyncAttemptID: 1}, nil
 				},
-				waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
+				getSiteFn: func(string) (*api.Site, error) {
 					return nil, api.ErrUpgradeRequired
 				},
 			}
@@ -448,12 +447,14 @@ func TestExitToDirectAbortsOnAVersionRefusal(t *testing.T) {
 					t.Errorf("output must not carry %q:\n%s", banned, got)
 				}
 			}
-			// The ⧗ line is the whole of the output: interactively it is rewound
-			// where the settled glyph would have gone, and off a TTY it stays,
+			// The ⧗ row is the whole of the output: interactively the wait leaves
+			// it standing and the erase takes it away, and off a TTY it stays,
 			// terminated, with nothing under it.
-			want := i18n.T("cdn.deactivating") + "\n"
+			want := i18n.T("cdn.deactivating")
 			if tc.interactive {
-				want += rewind(1)
+				want += "\r\033[K"
+			} else {
+				want += "\n"
 			}
 			if got != want {
 				t.Errorf("output = %q, want %q", got, want)

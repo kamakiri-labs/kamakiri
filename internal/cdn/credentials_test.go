@@ -5,10 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 func TestRotateCredentialsSuccess(t *testing.T) {
@@ -16,19 +16,17 @@ func TestRotateCredentialsSuccess(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
+	fastPolls(t)
 	var gotTok, gotSec string
 	client := &mockClient{
 		rotateCredsFn: func(_, tok, sec string) (*api.CDNSetResponse, error) {
 			gotTok, gotSec = tok, sec
 			return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 7}, nil
 		},
-		waitForSyncFn: func(_ string, since int64, _ time.Duration) (*api.Site, error) {
-			if since != 7 {
-				t.Errorf("since = %d, want 7", since)
-			}
-			return &api.Site{ID: "site123"}, nil
-		},
 	}
+	// An attempt below 7 first, so a wait keyed on a lower id would settle on
+	// the wrong one and never make the second read.
+	client.getSiteFn = client.resolveAt(7)
 
 	var out bytes.Buffer
 	opts := WebAccelOptions{Token: "newtok", Secret: "newsec"}
@@ -37,6 +35,9 @@ func TestRotateCredentialsSuccess(t *testing.T) {
 	}
 	if gotTok != "newtok" || gotSec != "newsec" {
 		t.Errorf("sent token/secret = %q/%q", gotTok, gotSec)
+	}
+	if client.getSiteCalls != 2 {
+		t.Fatalf("GetSite called %d times, want 2: the wait must poll past the older attempt", client.getSiteCalls)
 	}
 	if !strings.Contains(out.String(), "done.") {
 		t.Errorf("missing done: %q", out.String())
@@ -53,9 +54,7 @@ func TestRotateCredentialsBadCreds(t *testing.T) {
 		rotateCredsFn: func(_, _, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 8}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
-			return nil, errors.New("sync_attempt errored: cdn_provider http_401")
-		},
+		getSiteFn: reconcileFailed("cdn_provider http_401"),
 	}
 
 	var out bytes.Buffer
@@ -64,10 +63,10 @@ func TestRotateCredentialsBadCreds(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for rejected credentials")
 	}
-	// A timeout means the change is still applying and a rejected token means
-	// it never will, so the two must not collapse into one classification.
-	if errors.Is(err, api.ErrSyncTimeout) {
-		t.Errorf("bad-creds error must not be ErrSyncTimeout: %v", err)
+	// The reconciler's own reason is what says which token was refused, so it
+	// has to reach the error rather than being replaced by the rotation copy.
+	if !strings.Contains(err.Error(), "cdn_provider http_401") {
+		t.Errorf("the rejection reason must travel: %v", err)
 	}
 	// The actionable copy is already on stdout, so the error must be marked as
 	// reported: the user should see one report, not two.
@@ -93,7 +92,7 @@ func TestRotateCredentialsAbortsOnAVersionRefusal(t *testing.T) {
 		rotateCredsFn: func(_, _, _ string) (*api.CDNSetResponse, error) {
 			return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 9}, nil
 		},
-		waitForSyncFn: func(string, int64, time.Duration) (*api.Site, error) {
+		getSiteFn: func(string) (*api.Site, error) {
 			return nil, api.ErrUpgradeRequired
 		},
 	}
@@ -117,15 +116,61 @@ func TestRotateCredentialsAbortsOnAVersionRefusal(t *testing.T) {
 	for _, banned := range []string{
 		i18n.T("cdn.rotate_failed"),
 		i18n.T("cdn.rotate_rejected"),
-		i18n.T("cdn.rotate_still_applying"),
 		i18n.T("cdn.rotate_done"),
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("output must not carry %q: %q", banned, got)
 		}
 	}
-	if !strings.HasSuffix(got, "\n") {
-		t.Errorf("the working line must be closed before the upgrade message: %q", got)
+	// The working line is the whole of the output, off a terminal with its
+	// trailing space restored, closed by the newline this arm prints so the
+	// upgrade message starts on a line of its own.
+	if want := i18n.T("cdn.rotate_working") + "\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+	assertCleanCopy(t, got)
+}
+
+// On Ctrl-C the sentinel must propagate, since the 130 exit depends on
+// recognizing it, and the stop line the wait prints is the whole report: the
+// rejection copy would condemn a token the reconciler has not judged yet.
+func TestRotateCredentialsInterruptStopsAndPropagatesSentinel(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
+
+	client := &mockClient{
+		rotateCredsFn: func(_, _, _ string) (*api.CDNSetResponse, error) {
+			return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 12}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	err := RotateCredentials(client, WebAccelOptions{Token: "t", Secret: "s"}, false, nil, &out)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("err = %v, want syncwait.ErrInterrupted", err)
+	}
+	if errors.Is(err, ErrCdnReported) {
+		t.Errorf("an interrupt is not a reported failure: %v", err)
+	}
+	// A signal already delivered wins over a site that would answer at once, so
+	// the wait never reaches its first read.
+	if client.getSiteCalls != 0 {
+		t.Errorf("GetSite called %d times, want none after an interrupt", client.getSiteCalls)
+	}
+	got := out.String()
+	if !strings.Contains(got, syncwait.SharedStopLine()) {
+		t.Errorf("missing the stop line: %q", got)
+	}
+	for _, banned := range []string{
+		i18n.T("cdn.rotate_failed"),
+		i18n.T("cdn.rotate_rejected"),
+		i18n.T("cdn.rotate_done"),
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("output must not carry %q: %q", banned, got)
+		}
 	}
 	assertCleanCopy(t, got)
 }
@@ -165,6 +210,45 @@ func TestRotateCredentialsNoWaitQueued(t *testing.T) {
 	if !strings.Contains(out.String(), "queued") {
 		t.Errorf("missing queued hint: %q", out.String())
 	}
+}
+
+// A site endpoint that keeps failing ends the wait once it has failed past what
+// the wait tolerates, before any verdict on the new credentials can be read:
+// the row carries the transport reason and the token is not blamed.
+func TestRotateCredentialsFailsOnAPersistentTransportFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+	fastPolls(t)
+
+	client := &mockClient{
+		rotateCredsFn: func(_, _, _ string) (*api.CDNSetResponse, error) {
+			return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 14}, nil
+		},
+		getSiteFn: func(string) (*api.Site, error) {
+			return nil, errors.New("connection refused")
+		},
+	}
+
+	var out bytes.Buffer
+	err := RotateCredentials(client, WebAccelOptions{Token: "t", Secret: "s"}, false, nil, &out)
+	if !errors.Is(err, ErrCdnReported) {
+		t.Fatalf("err = %v, want ErrCdnReported", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("err = %v, want the transport failure's reason carried out", err)
+	}
+	// Off a terminal the whole wait is the working row, its held whitespace
+	// restored, and the terminator reads on from it.
+	got := out.String()
+	want := i18n.T("cdn.rotate_working") + i18n.Tf("cdn.rotate_failed_reason", "connection refused") + "\n"
+	if got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+	if strings.Contains(got, i18n.T("cdn.rotate_rejected")) {
+		t.Errorf("output must not blame the token: %q", got)
+	}
+	assertCleanCopy(t, got)
 }
 
 func TestParseCredentialsArgsRejectsDomainID(t *testing.T) {

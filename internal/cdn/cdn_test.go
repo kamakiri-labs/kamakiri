@@ -2,7 +2,7 @@ package cdn
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -33,6 +33,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// resolvedAttemptID sits above every attempt id these tests await, so the
+// default site below resolves whichever own-side wait reaches it.
+const resolvedAttemptID = 1000
+
+// mockClient answers GetSite from getSiteFn where a test scripts one and from a
+// site whose reconcile has already succeeded otherwise. The own-side waits have
+// no bound, so a default that never resolved would hang a test rather than fail
+// it.
+//
+// getSiteCalls is incremented from the poll goroutine, so a test may read it
+// only once the wait has returned, and a script may read it only from inside
+// its own answer.
 type mockClient struct {
 	setCDNFn         func(siteID, mode string) (*api.CDNSetResponse, error)
 	setCDNWebAccelFn func(siteID, token, secret string) (*api.CDNSetResponse, error)
@@ -41,8 +53,8 @@ type mockClient struct {
 	cdnStatusFn      func(siteID string) (*api.CDNStatusResponse, error)
 	purgeCDNFn       func(siteID string) (*api.CDNPurgeResponse, error)
 	getSiteFn        func(id string) (*api.Site, error)
-	waitForSyncFn    func(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
 	listDomainsFn    func(siteID string) (*api.DomainList, error)
+	getSiteCalls     int
 }
 
 func (m *mockClient) SetCDN(siteID, mode string) (*api.CDNSetResponse, error) {
@@ -75,17 +87,59 @@ func (m *mockClient) PurgeCDN(siteID string) (*api.CDNPurgeResponse, error) {
 }
 
 func (m *mockClient) GetSite(id string) (*api.Site, error) {
+	m.getSiteCalls++
 	if m.getSiteFn == nil {
-		return nil, errors.New("GetSite: no mock configured")
+		return &api.Site{
+			ID:   id,
+			Sync: &api.Sync{Outcome: "ok", LatestAttemptID: resolvedAttemptID},
+		}, nil
 	}
 	return m.getSiteFn(id)
 }
 
-func (m *mockClient) WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error) {
-	if m.waitForSyncFn == nil {
-		return &api.Site{ID: siteID}, nil
+// resolveAt scripts GetSite to answer ok one attempt below want first and at
+// want second. A wait started at any lower id would resolve on the first
+// answer, so the call count is what proves which id was awaited.
+func (m *mockClient) resolveAt(want int64) func(string) (*api.Site, error) {
+	return func(id string) (*api.Site, error) {
+		attempt := want
+		if m.getSiteCalls == 1 {
+			attempt = want - 1
+		}
+		return &api.Site{ID: id, Sync: &api.Sync{Outcome: "ok", LatestAttemptID: attempt}}, nil
 	}
-	return m.waitForSyncFn(siteID, sinceAttemptID, timeout)
+}
+
+// reconcileFailed scripts GetSite to answer with a failed attempt carrying the
+// reconciler's own reason.
+func reconcileFailed(reason string) func(string) (*api.Site, error) {
+	return func(id string) (*api.Site, error) {
+		return &api.Site{
+			ID:   id,
+			Sync: &api.Sync{Outcome: "error", LatestAttemptID: resolvedAttemptID, Error: reason},
+		}, nil
+	}
+}
+
+// fastPolls runs the own-side waits on a millisecond cadence for one test, so a
+// scripted sequence of answers plays out without waiting out the production
+// bands.
+func fastPolls(t *testing.T) {
+	t.Helper()
+	prev := pollSchedule
+	t.Cleanup(func() { pollSchedule = prev })
+	pollSchedule = func(time.Duration) time.Duration { return time.Millisecond }
+}
+
+// interruptBeforeWait hands the wait a context that is already cancelled, which
+// is how Ctrl-C reaches it without a real signal.
+func interruptBeforeWait(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prev := signalCtx
+	t.Cleanup(func() { signalCtx = prev })
+	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
 }
 
 // The exits type-assert their client to the domain package's interface to run

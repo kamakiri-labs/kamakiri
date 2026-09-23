@@ -23,6 +23,8 @@ Kamakiri Pages is an invitation-only private beta today, so `kamakiri login`
 only succeeds for an email that has been invited. To request an invitation,
 email beta@kamakiri-labs.jp.
 
-The full documentation, the other ways to install the CLI, and the source are
-at [github.com/kamakiri-labs/kamakiri](https://github.com/kamakiri-labs/kamakiri).
+The documentation is at
+[kamakiri-labs.jp/en/docs/cli/](https://kamakiri-labs.jp/en/docs/cli/). The
+other ways to install the CLI, and the source, are at
+[github.com/kamakiri-labs/kamakiri](https://github.com/kamakiri-labs/kamakiri).
 The CLI is MIT licensed.

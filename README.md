@@ -7,6 +7,10 @@ Kamakiri Pages is an invitation-only private beta today, so `kamakiri login`
 only succeeds for an email that has been invited. To request an invitation,
 email beta@kamakiri-labs.jp.
 
+The documentation is at
+[kamakiri-labs.jp/en/docs/cli/](https://kamakiri-labs.jp/en/docs/cli/), one page
+per command.
+
 The CLI is a single static Go binary with no runtime dependencies. Most commands
 that change something are synchronous: they return once the change is actually
 live for a visitor, not once the request was accepted. Where a command waits,
@@ -199,6 +203,10 @@ you have already built; your source never leaves your machine. It uploads, then
 waits, and finishes with a `✓ live` line once the site is really serving the new
 content. After that, a deploy is just that one command again, and
 `kamakiri status` shows where a site stands at any time.
+
+The [getting-started guide](https://kamakiri-labs.jp/en/docs/pages/getting-started/)
+walks through the same session, from the install to a first deploy, with what
+each command prints.
 
 Running `kamakiri` with no arguments prints the usage message, which lists every
 command: custom domains, CDN modes, rollbacks and the rest. There is no separate

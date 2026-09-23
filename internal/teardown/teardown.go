@@ -2,28 +2,36 @@ package teardown
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
-
-// defaultTeardownSyncTimeout is how long teardown waits for the reconcile to
-// converge before printing "still syncing" and exiting nonzero.
-const defaultTeardownSyncTimeout = 60 * time.Second
 
 // APIClient is the API surface the teardown flow needs.
 type APIClient interface {
 	GetSite(id string) (*api.Site, error)
 	DeleteSite(id string) (*api.Site, error)
-	WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
 }
+
+var signalCtx = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// pollSchedule is the cadence the teardown wait polls on, a seam so a test can
+// drive several polls without waiting out the production bands.
+var pollSchedule = syncwait.DefaultSchedule
 
 // Run drives the teardown flow: confirm, commit the deletion, wait for the
 // reconcile unless noWait is set, and remove the local config. The config goes
@@ -96,10 +104,7 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 		return nil
 	}
 
-	// The prefix prints before the wait, so the user sees the request land
-	// rather than a silent terminal.
-	fmt.Fprint(out, i18n.T("teardown.tearing_down"))
-	final, syncErr := client.WaitForSync(config.ID, resp.SyncAttemptID, defaultTeardownSyncTimeout)
+	final, syncErr := waitForTeardown(client, config.ID, resp.SyncAttemptID, out)
 
 	switch {
 	case syncErr == nil:
@@ -109,8 +114,10 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 		// same floor refuses, and no teardown step failed anyway. Closing the open
 		// line is all this outcome needs; the sentinel carries the message.
 		fmt.Fprintln(out)
-	case errors.Is(syncErr, api.ErrSyncTimeout):
-		fmt.Fprintln(out, i18n.T("teardown.still_syncing"))
+	case errors.Is(syncErr, syncwait.ErrInterrupted):
+		// The wait has closed its own line and said the teardown carries on,
+		// and no step failed, so a label here would report a failure that did
+		// not happen.
 	default:
 		fmt.Fprintln(out, failureLabel(final))
 	}
@@ -121,6 +128,25 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 
 	removeProjectConfig(out)
 	return syncErr
+}
+
+// waitForTeardown blocks until the accepted deletion is reconciled, leaving the
+// in-progress line open for Run to terminate. Its stop copy is teardown's own
+// rather than the shared one: the local config goes on every outcome, so by the
+// time an interrupted run is back at the prompt there is no linked site left
+// for `kamakiri status` to report on.
+func waitForTeardown(client APIClient, siteID string, attemptID int64, out io.Writer) (*api.Site, error) {
+	ctx, stop := signalCtx()
+	defer stop()
+
+	return syncwait.Sync(ctx, client, siteID, attemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   i18n.T("teardown.tearing_down"),
+		StopLine: i18n.T("teardown.stopped"),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    streamui.IsTerminalWriter(out),
+	})
 }
 
 // failureLabel names the teardown step a partial reconcile stopped at, inferred

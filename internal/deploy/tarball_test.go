@@ -204,7 +204,7 @@ func TestCreateEnforcesFileCountLimit(t *testing.T) {
 	if prepErr == nil {
 		t.Fatal("prepareDirTarball() = nil, want the file-count message")
 	}
-	if want := "upload exceeds 50,000 file limit. Reduce your build output and try again"; prepErr.Error() != want {
+	if want := "upload exceeds 20,000 file limit. Reduce your build output and try again"; prepErr.Error() != want {
 		t.Errorf("prepareDirTarball() error = %q, want %q", prepErr.Error(), want)
 	}
 }

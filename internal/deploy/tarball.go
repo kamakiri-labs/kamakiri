@@ -31,7 +31,7 @@ type FileStats struct {
 const MaxTotalSize = 500 * 1024 * 1024
 
 // MaxFileCount is the largest number of files a deploy may carry.
-const MaxFileCount = 50000
+const MaxFileCount = 20000
 
 // tempTarball is the archive Create hands back: the temp file it packed into,
 // with a Close that also removes the file from disk. It embeds *os.File so the

@@ -5,10 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 func TestCleanupNothingToClean(t *testing.T) {
@@ -66,7 +66,7 @@ func TestCleanupWaitsUntilGone(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
-	restoreCleanupTiming(t, time.Millisecond, time.Second)
+	fastPolls(t)
 
 	var polls int
 	client := &mockClient{
@@ -86,6 +86,11 @@ func TestCleanupWaitsUntilGone(t *testing.T) {
 	if err := Cleanup(client, false, &out); err != nil {
 		t.Fatal(err)
 	}
+	// Read once the wait has returned, which the mock's counter rule allows.
+	// A count of one would mean the still-orphaned answer ended the wait.
+	if polls != 2 {
+		t.Errorf("polls = %d, want 2: the wait must poll on past an orphan count that is still standing", polls)
+	}
 	got := out.String()
 	if !strings.Contains(got, "Cleaning up 2 orphaned CDN resource(s)") || !strings.Contains(got, "done.") {
 		t.Errorf("missing progress/done copy: %q", got)
@@ -97,12 +102,15 @@ func TestCleanupBlockedTerminal(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	fastPolls(t)
 
+	polls := 0
 	client := &mockClient{
 		cleanupCDNFn: func(string) (*api.CDNCleanupResponse, error) {
 			return &api.CDNCleanupResponse{OrphanCount: 2}, nil
 		},
 		cdnStatusFn: func(string) (*api.CDNStatusResponse, error) {
+			polls++
 			return &api.CDNStatusResponse{CleanupOrphanCount: 2, CleanupBlockedCount: 2}, nil
 		},
 	}
@@ -111,6 +119,11 @@ func TestCleanupBlockedTerminal(t *testing.T) {
 	err := Cleanup(client, false, &out)
 	if !errors.Is(err, ErrCdnReported) {
 		t.Fatalf("err = %v, want ErrCdnReported", err)
+	}
+	// The blocked answer must end the wait on the poll that sees it, not
+	// travel the transient-budget route to the same user-visible arm.
+	if polls != 1 {
+		t.Errorf("polls = %d, want 1: the blocked answer must end the wait immediately", polls)
 	}
 	got := out.String()
 	for _, want := range []string{"blocked.", "no longer valid", "Remove them in your Sakura panel."} {
@@ -121,19 +134,77 @@ func TestCleanupBlockedTerminal(t *testing.T) {
 	assertCleanCopy(t, got)
 }
 
-func TestCleanupTimeout(t *testing.T) {
+// On Ctrl-C the sentinel must propagate, since the 130 exit depends on
+// recognizing it, and the stop line the wait prints is the whole report: the
+// deletion carries on server-side, so no outcome line may claim otherwise.
+func TestCleanupInterruptStopsAndPropagatesSentinel(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
 
-	restoreCleanupTiming(t, time.Millisecond, 5*time.Millisecond)
+	var polls int
+	client := &mockClient{
+		cleanupCDNFn: func(string) (*api.CDNCleanupResponse, error) {
+			return &api.CDNCleanupResponse{OrphanCount: 2}, nil
+		},
+		cdnStatusFn: func(string) (*api.CDNStatusResponse, error) {
+			polls++
+			return &api.CDNStatusResponse{CleanupOrphanCount: 2}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	err := Cleanup(client, false, &out)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("err = %v, want syncwait.ErrInterrupted", err)
+	}
+	if errors.Is(err, ErrCdnReported) {
+		t.Errorf("an interrupt is not a reported failure: %v", err)
+	}
+	// A signal already delivered wins over a status that would answer at once,
+	// so the wait never reaches its first read.
+	if polls != 0 {
+		t.Errorf("CDNStatus called %d times, want none after an interrupt", polls)
+	}
+	got := out.String()
+	if n := strings.Count(got, syncwait.SharedStopLine()); n != 1 {
+		t.Errorf("stop line appears %d times, want once: %q", n, got)
+	}
+	// The wait closed the row before the stop line, so the working copy stands
+	// as a line of its own with no terminator on it.
+	if want := strings.TrimRight(i18n.Tf("cdn.cleanup_working", 2), " ") + "\n"; !strings.HasPrefix(got, want) {
+		t.Errorf("output = %q, want it to open with the closed working row %q", got, want)
+	}
+	for _, banned := range []string{
+		i18n.T("cdn.cleanup_done"),
+		i18n.T("cdn.cleanup_blocked"),
+		// The failure terminator's frame, with no reason in it, is what every
+		// rendering of that outcome carries.
+		i18n.Tf("cdn.cleanup_failed", ""),
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("output must not carry %q: %q", banned, got)
+		}
+	}
+	assertCleanCopy(t, got)
+}
+
+// A status endpoint that keeps failing ends the wait once it has failed past
+// what the wait tolerates, and that outcome is the command's to report: the row
+// carries the reason and the error says it has already been printed.
+func TestCleanupFailsOnAPersistentStatusError(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+	fastPolls(t)
 
 	client := &mockClient{
 		cleanupCDNFn: func(string) (*api.CDNCleanupResponse, error) {
 			return &api.CDNCleanupResponse{OrphanCount: 2}, nil
 		},
 		cdnStatusFn: func(string) (*api.CDNStatusResponse, error) {
-			return &api.CDNStatusResponse{CleanupOrphanCount: 2}, nil
+			return nil, errors.New("connection refused")
 		},
 	}
 
@@ -142,23 +213,29 @@ func TestCleanupTimeout(t *testing.T) {
 	if !errors.Is(err, ErrCdnReported) {
 		t.Fatalf("err = %v, want ErrCdnReported", err)
 	}
-	if !strings.Contains(out.String(), "still working.") {
-		t.Errorf("missing timeout copy: %q", out.String())
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("err = %v, want the status failure's reason carried out", err)
 	}
-	assertCleanCopy(t, out.String())
+	// Off a terminal the whole wait is the working row, its held whitespace
+	// restored, and the terminator reads on from it.
+	got := out.String()
+	want := i18n.Tf("cdn.cleanup_working", 2) + i18n.Tf("cdn.cleanup_failed", "connection refused") + "\n"
+	if got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+	assertCleanCopy(t, got)
 }
 
-// A refusal says nothing about the cleanup, and the timeout copy points at
-// `kamakiri cdn`, which the same floor refuses. The wait aborts on the first
-// refused poll, closes the working line it left open, and lets the sentinel
-// carry the message.
+// A refusal says nothing about the cleanup, so any copy this command has to
+// offer would misdirect. The wait aborts on the first refused poll, closes the
+// working line it left open, and lets the sentinel carry the message.
 func TestCleanupAbortsOnAVersionRefusal(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
-	// A retried refusal would otherwise sit out the production ceiling.
-	restoreCleanupTiming(t, time.Millisecond, 5*time.Millisecond)
+	// A retried refusal would otherwise sit out the production cadence.
+	fastPolls(t)
 
 	polls := 0
 	client := &mockClient{
@@ -191,10 +268,9 @@ func TestCleanupAbortsOnAVersionRefusal(t *testing.T) {
 	}
 	got := out.String()
 	for _, banned := range []string{
-		i18n.T("cdn.cleanup_still_working"),
-		i18n.T("cdn.cleanup_check_hint"),
 		i18n.T("cdn.cleanup_done"),
 		i18n.T("cdn.cleanup_blocked"),
+		i18n.Tf("cdn.cleanup_failed", ""),
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("output must not carry %q: %q", banned, got)
@@ -204,13 +280,4 @@ func TestCleanupAbortsOnAVersionRefusal(t *testing.T) {
 		t.Errorf("the working line must be closed before the upgrade message: %q", got)
 	}
 	assertCleanCopy(t, got)
-}
-
-// restoreCleanupTiming shortens the poll cadence and ceiling for one test,
-// restoring both when it ends.
-func restoreCleanupTiming(t *testing.T, interval, timeout time.Duration) {
-	t.Helper()
-	oldInterval, oldTimeout := cleanupPollInterval, cleanupWaitTimeout
-	cleanupPollInterval, cleanupWaitTimeout = interval, timeout
-	t.Cleanup(func() { cleanupPollInterval, cleanupWaitTimeout = oldInterval, oldTimeout })
 }

@@ -44,7 +44,7 @@ func (c *framesClient) AddDomain(string, string, string, int) (*api.Domain, erro
 func (c *framesClient) RemoveDomain(string) (*api.RemoveDomainResult, error) {
 	return nil, nil
 }
-func (c *framesClient) WaitForSync(string, int64, time.Duration) (*api.Site, error) {
+func (c *framesClient) GetSite(string) (*api.Site, error) {
 	return nil, nil
 }
 func (c *framesClient) RecheckDomain(string) (*api.Domain, error) {

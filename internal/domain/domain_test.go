@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 // testLang is the catalog every test here renders against. A test that switches
@@ -36,10 +36,22 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// resolvedAttemptID sits above every attempt id these tests await, so the
+// default site below resolves whichever wait reaches it.
+const resolvedAttemptID = 1000
+
+// mockClient answers GetSite from getSiteFn where a test scripts one and from a
+// site whose reconcile has already succeeded otherwise. The wait has no bound,
+// so a script that never resolves would hang a test rather than fail it.
+//
+// getSiteCalls is incremented from the poll goroutine, so a test may read it
+// only once the wait has returned, and a script may read it only from inside
+// its own answer.
 type mockClient struct {
 	setCanonicalFn   func(siteID, domain string) (*api.Domain, error)
 	unsetCanonicalFn func(siteID string) (*api.UnsetCanonicalResult, error)
-	waitForSyncFn    func(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error)
+	getSiteFn        func(id string) (*api.Site, error)
+	getSiteCalls     int
 	addDomainFn      func(siteID, domain, role string, redirectStatus int) (*api.Domain, error)
 	removeDomainFn   func(domain string) (*api.RemoveDomainResult, error)
 	listDomainsFn    func(siteID string) (*api.DomainList, error)
@@ -48,6 +60,54 @@ type mockClient struct {
 	registerDomainFn    func(name string) (*api.Registration, error)
 	unregisterDomainFn  func(name string) error
 	listRegistrationsFn func() (*api.RegistrationList, error)
+}
+
+// fastPolls runs the our-side waits on a millisecond cadence for one test, so a
+// scripted sequence of answers plays out without waiting out the production
+// bands.
+func fastPolls(t *testing.T) {
+	t.Helper()
+	prev := pollSchedule
+	t.Cleanup(func() { pollSchedule = prev })
+	pollSchedule = func(time.Duration) time.Duration { return time.Millisecond }
+}
+
+// interruptBeforeWait hands the wait a context that is already cancelled, which
+// is how Ctrl-C reaches it without a real signal.
+func interruptBeforeWait(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prev := signalCtx
+	t.Cleanup(func() { signalCtx = prev })
+	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
+}
+
+// flunkGetSite fails the test if the wait polls at all, which is what a
+// --no-wait run and a run interrupted before its first poll must both do.
+//
+// It reports and then answers as a resolved site rather than calling Fatal.
+// Each poll runs in a goroutine, where Fatal ends the goroutine without ever
+// answering and leaves the wait blocked until the whole suite gives up;
+// answering resolves the wait on that poll, so the regression that reached
+// here fails in seconds carrying this message.
+func flunkGetSite(t *testing.T, why string) func(string) (*api.Site, error) {
+	t.Helper()
+	return func(id string) (*api.Site, error) {
+		t.Error(why)
+		return &api.Site{ID: id, Sync: &api.Sync{LatestAttemptID: resolvedAttemptID, Outcome: "ok"}}, nil
+	}
+}
+
+// reconcileFailed scripts GetSite to answer with a failed attempt carrying the
+// reconciler's own reason.
+func reconcileFailed(attemptID int64, reason string) func(string) (*api.Site, error) {
+	return func(id string) (*api.Site, error) {
+		return &api.Site{
+			ID:   id,
+			Sync: &api.Sync{LatestAttemptID: attemptID, Outcome: "error", Error: reason},
+		}, nil
+	}
 }
 
 func (m *mockClient) RegisterDomain(name string) (*api.Registration, error) {
@@ -74,11 +134,12 @@ func (m *mockClient) UnsetCanonical(siteID string) (*api.UnsetCanonicalResult, e
 	return m.unsetCanonicalFn(siteID)
 }
 
-func (m *mockClient) WaitForSync(siteID string, sinceAttemptID int64, timeout time.Duration) (*api.Site, error) {
-	if m.waitForSyncFn != nil {
-		return m.waitForSyncFn(siteID, sinceAttemptID, timeout)
+func (m *mockClient) GetSite(id string) (*api.Site, error) {
+	m.getSiteCalls++
+	if m.getSiteFn != nil {
+		return m.getSiteFn(id)
 	}
-	return &api.Site{Sync: &api.Sync{LatestAttemptID: sinceAttemptID, Outcome: "ok"}}, nil
+	return &api.Site{ID: id, Sync: &api.Sync{LatestAttemptID: resolvedAttemptID, Outcome: "ok"}}, nil
 }
 
 func (m *mockClient) AddDomain(siteID, domain, role string, redirectStatus int) (*api.Domain, error) {
@@ -243,7 +304,7 @@ func TestSetHappyPath(t *testing.T) {
 	}
 }
 
-func TestSetNoWaitSkipsWaitForSync(t *testing.T) {
+func TestSetNoWaitSkipsTheWait(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -257,10 +318,7 @@ func TestSetNoWaitSkipsWaitForSync(t *testing.T) {
 				SyncAttemptID: 42,
 			}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Fatal("WaitForSync must NOT be called when noWait=true")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "the wait must not poll when noWait=true"),
 	}
 
 	var out bytes.Buffer
@@ -272,39 +330,38 @@ func TestSetNoWaitSkipsWaitForSync(t *testing.T) {
 	}
 }
 
-func TestSetSyncTimeoutReturnsErrSyncTimeout(t *testing.T) {
+// An interrupt is not a failure. The ⧗ row is closed by the wait and the detach
+// copy follows it, with no outcome line in between claiming our side settled or
+// broke.
+func TestSetInterruptClosesTheOurSideRow(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		setCanonicalFn: func(_, _ string) (*api.Domain, error) {
 			return &api.Domain{Domain: "example.com", DnsTarget: "x.kamakiri-pages.jp", SyncAttemptID: 1}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	// A non-TTY returns before the wait, so only the interactive core reaches
-	// the timeout branch.
+	// the our-side row at all.
 	var out bytes.Buffer
 	err := set(client, "example.com", true, &out)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("expected api.ErrSyncTimeout, got %v", err)
+	if !errors.Is(err, ErrWatchInterrupted) {
+		t.Fatalf("err = %v, want ErrWatchInterrupted (→ exit 130)", err)
 	}
-	// A timeout is in progress, not a failure, so it must keep the ⧗ glyph. The
-	// exact wording is pinned so a revert to plain text or ✗ is caught.
-	s := out.String()
-	if !strings.Contains(s, "⧗ still syncing your domain on our side") {
-		t.Errorf("expected the ⧗ still-syncing our-side line: %q", s)
-	}
-	if strings.Contains(s, "✗ couldn't") {
-		t.Errorf("a timeout must NOT render as a ✗ failure: %q", s)
+	want := ourSideStartLine(syncVerbLink) + "\n" +
+		"\n" + i18n.T("domain.detach_single_headline") + "\n" +
+		i18n.Tf("domain.detach_single_body", "example.com") + "\n"
+	if got := out.String(); !strings.HasSuffix(got, want) {
+		t.Errorf("output must end on the closed ⧗ row and the detach copy alone:\ngot:  %q\nwant suffix: %q", got, want)
 	}
 }
 
-func TestSetNonTimeoutWaitErrorPropagates(t *testing.T) {
+func TestSetWaitErrorPropagates(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -315,9 +372,7 @@ func TestSetNonTimeoutWaitErrorPropagates(t *testing.T) {
 		setCanonicalFn: func(_, _ string) (*api.Domain, error) {
 			return &api.Domain{Domain: "example.com", DnsTarget: "x.kamakiri-pages.jp", SyncAttemptID: 1}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, wantErr
-		},
+		getSiteFn: reconcileFailed(1, "caddy push failed (5xx)"),
 	}
 
 	var out bytes.Buffer
@@ -333,7 +388,7 @@ func TestSetNonTimeoutWaitErrorPropagates(t *testing.T) {
 	// reason a second time, and Unwrap must still yield the reason that was
 	// shown on the ✗ line.
 	if !errors.Is(err, ErrOurSideShown) {
-		t.Errorf("non-timeout our-side failure must wrap ErrOurSideShown, got %v", err)
+		t.Errorf("an our-side failure must wrap ErrOurSideShown, got %v", err)
 	}
 	if u := errors.Unwrap(err); u == nil || u.Error() != wantErr.Error() {
 		t.Errorf("Unwrap must yield the shown reason, got %v", u)
@@ -352,7 +407,7 @@ func TestSetOurSideAbortsOnAVersionRefusal(t *testing.T) {
 		setCanonicalFn: func(_, _ string) (*api.Domain, error) {
 			return &api.Domain{Domain: "example.com", DnsTarget: "x.kamakiri-pages.jp", SyncAttemptID: 1}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
+		getSiteFn: func(string) (*api.Site, error) {
 			return nil, api.ErrUpgradeRequired
 		},
 	}
@@ -378,7 +433,6 @@ func TestSetOurSideAbortsOnAVersionRefusal(t *testing.T) {
 		ourSideFailedLine(syncVerbLink, i18n.T("api.err_upgrade_required"), resume),
 		i18n.T("domain.resume_status"),
 		resume,
-		i18n.Tf("domain.our_side_still_syncing", resume),
 		i18n.T("domain.our_side_linked"),
 	} {
 		if strings.Contains(got, banned) {
@@ -394,18 +448,19 @@ func TestSetOurSideAbortsOnAVersionRefusal(t *testing.T) {
 }
 
 // waitAndRender's outcome words are the wrong frame for a refusal: "failed."
-// would read as the sync failing. The caller's open line still has to be closed,
-// so the refusal writes the newline and nothing else, and the sentinel is the
-// whole report.
+// would read as the sync failing. The row the wait hands back open still has to
+// be closed, so the refusal writes the newline and nothing else, and the
+// sentinel is the whole report.
 func TestWaitAndRenderAbortsOnAVersionRefusal(t *testing.T) {
 	client := &mockClient{
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
+		getSiteFn: func(string) (*api.Site, error) {
 			return nil, api.ErrUpgradeRequired
 		},
 	}
 
+	prefix := i18n.T("domain.unset_removing")
 	var out bytes.Buffer
-	err := waitAndRender(client, "site123", 1, &out)
+	err := waitAndRender(context.Background(), client, "site123", 1, prefix, &out)
 	if !errors.Is(err, api.ErrUpgradeRequired) {
 		t.Fatalf("err = %v, want the refusal returned bare", err)
 	}
@@ -417,21 +472,20 @@ func TestWaitAndRenderAbortsOnAVersionRefusal(t *testing.T) {
 	got := out.String()
 	for _, banned := range []string{
 		i18n.T("domain.wait_failed"),
-		i18n.T("domain.wait_still_syncing"),
 		i18n.T("domain.wait_done"),
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("output must not carry %q: %q", banned, got)
 		}
 	}
-	// The callers open the line and leave it to waitAndRender to close, so the
-	// refusal owes them a newline and owes the upgrade message a clean terminal.
-	if got != "\n" {
-		t.Errorf("output = %q, want just the newline that closes the caller's line", got)
+	// The wait hands back its row open, so the refusal owes it a newline and
+	// owes the upgrade message a clean terminal.
+	if got != prefix+"\n" {
+		t.Errorf("output = %q, want the prefix and the newline that closes its row", got)
 	}
 }
 
-func TestUnsetNoWaitSkipsWaitForSync(t *testing.T) {
+func TestUnsetNoWaitSkipsTheWait(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -440,10 +494,7 @@ func TestUnsetNoWaitSkipsWaitForSync(t *testing.T) {
 		unsetCanonicalFn: func(_ string) (*api.UnsetCanonicalResult, error) {
 			return &api.UnsetCanonicalResult{SyncAttemptID: 7}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Fatal("WaitForSync must NOT be called when noWait=true")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "the wait must not poll when noWait=true"),
 	}
 
 	var out bytes.Buffer
@@ -455,27 +506,60 @@ func TestUnsetNoWaitSkipsWaitForSync(t *testing.T) {
 	}
 }
 
-func TestUnsetSyncTimeoutReturnsErrSyncTimeout(t *testing.T) {
+// Off a terminal `unset` runs the plain wait, so an interrupt there closes its
+// own row and says the teardown carries on, with no outcome word invented for a
+// teardown that has not stopped.
+func TestUnsetInterruptClosesTheRow(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		unsetCanonicalFn: func(_ string) (*api.UnsetCanonicalResult, error) {
 			return &api.UnsetCanonicalResult{SyncAttemptID: 7}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	var out bytes.Buffer
 	err := Unset(client, false, &out)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("expected api.ErrSyncTimeout, got %v", err)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("err = %v, want syncwait.ErrInterrupted (→ exit 130)", err)
 	}
-	if !strings.Contains(out.String(), "still syncing") {
-		t.Errorf("expected 'still syncing' message: %q", out.String())
+	want := strings.TrimRight(i18n.T("domain.unset_removing"), " ") + "\n" +
+		i18n.T("domain.stopped_teardown") + "\n"
+	if got := out.String(); got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// A reconcile that fails closes the plain wait's row with the failed word, and
+// hands back the framed reason for the command layer to print: nothing here
+// swallows it or dresses it as an our-side ✗ line, which only the interactive
+// render has.
+func TestUnsetWaitErrorPropagates(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	const wantErr = "reconcile failed: caddy push failed (5xx)"
+
+	client := &mockClient{
+		unsetCanonicalFn: func(_ string) (*api.UnsetCanonicalResult, error) {
+			return &api.UnsetCanonicalResult{SyncAttemptID: 7}, nil
+		},
+		getSiteFn: reconcileFailed(7, "caddy push failed (5xx)"),
+	}
+
+	var out bytes.Buffer
+	err := Unset(client, false, &out)
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("err = %v, want %q", err, wantErr)
+	}
+	want := i18n.T("domain.unset_removing") + i18n.T("domain.wait_failed") + "\n"
+	if got := out.String(); got != want {
+		t.Errorf("output = %q, want %q", got, want)
 	}
 }
 
@@ -722,15 +806,10 @@ func TestUnsetUnauthorized(t *testing.T) {
 	}
 }
 
-// addClientWithWait builds a client whose sync wait succeeds immediately. Tests
-// for the wait branch override it.
+// addClientWithWait builds a client whose sync wait resolves on its first poll,
+// off the mock's default site. Tests for the wait branch script getSiteFn.
 func addClientWithWait(addFn func(siteID, domain, role string, redirectStatus int) (*api.Domain, error)) *mockClient {
-	return &mockClient{
-		addDomainFn: addFn,
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return &api.Site{}, nil
-		},
-	}
+	return &mockClient{addDomainFn: addFn}
 }
 
 // The fixture's expected records are the delivery CNAME alone, so what the
@@ -953,7 +1032,7 @@ func TestAddNotLoggedIn(t *testing.T) {
 	}
 }
 
-func TestAddNoWaitSkipsWaitForSync(t *testing.T) {
+func TestAddNoWaitSkipsTheWait(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -967,10 +1046,7 @@ func TestAddNoWaitSkipsWaitForSync(t *testing.T) {
 				SyncAttemptID: 21,
 			}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Fatal("WaitForSync must NOT be called when noWait=true")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "the wait must not poll when noWait=true"),
 	}
 
 	var out bytes.Buffer
@@ -982,33 +1058,37 @@ func TestAddNoWaitSkipsWaitForSync(t *testing.T) {
 	}
 }
 
-func TestAddSyncTimeoutReturnsErrSyncTimeout(t *testing.T) {
+// `add` inherits `set`'s interrupt shape: the ⧗ row is closed by the wait and
+// the detach copy is the whole report.
+func TestAddInterruptClosesTheOurSideRow(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		addDomainFn: func(_, _, _ string, _ int) (*api.Domain, error) {
 			return &api.Domain{Domain: "alias.example.com", DnsTarget: "x", SyncAttemptID: 22}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	// A non-TTY returns before the wait, so only the interactive core reaches
-	// the timeout branch.
+	// the our-side row at all.
 	var out bytes.Buffer
 	err := add(client, "alias.example.com", "alias", 0, true, &out)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("expected api.ErrSyncTimeout, got %v", err)
+	if !errors.Is(err, ErrWatchInterrupted) {
+		t.Fatalf("err = %v, want ErrWatchInterrupted (→ exit 130)", err)
 	}
-	if !strings.Contains(out.String(), "still syncing") {
-		t.Errorf("expected 'still syncing' message: %q", out.String())
+	want := ourSideStartLine(syncVerbLink) + "\n" +
+		"\n" + i18n.T("domain.detach_single_headline") + "\n" +
+		i18n.Tf("domain.detach_single_body", "alias.example.com") + "\n"
+	if got := out.String(); !strings.HasSuffix(got, want) {
+		t.Errorf("output must end on the closed ⧗ row and the detach copy alone:\ngot:  %q\nwant suffix: %q", got, want)
 	}
 }
 
-func TestAddNonTimeoutWaitErrorPropagates(t *testing.T) {
+func TestAddWaitErrorPropagates(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -1019,9 +1099,7 @@ func TestAddNonTimeoutWaitErrorPropagates(t *testing.T) {
 		addDomainFn: func(_, _, _ string, _ int) (*api.Domain, error) {
 			return &api.Domain{Domain: "alias.example.com", DnsTarget: "x", SyncAttemptID: 23}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, wantErr
-		},
+		getSiteFn: reconcileFailed(23, "caddy push failed (5xx)"),
 	}
 
 	var out bytes.Buffer
@@ -1035,21 +1113,23 @@ func TestAddNonTimeoutWaitErrorPropagates(t *testing.T) {
 	}
 }
 
-// removeClientWithWait builds a client whose sync wait succeeds immediately and
-// asserts it was waited on with the ids the server returned.
-func removeClientWithWait(siteID string, syncAttemptID int64, removeFn func(domain string) (*api.RemoveDomainResult, error)) *mockClient {
-	return &mockClient{
-		removeDomainFn: removeFn,
-		waitForSyncFn: func(gotSiteID string, gotAttemptID int64, _ time.Duration) (*api.Site, error) {
-			if gotSiteID != siteID {
-				return nil, fmt.Errorf("WaitForSync siteID = %q, want %q", gotSiteID, siteID)
-			}
-			if gotAttemptID != syncAttemptID {
-				return nil, fmt.Errorf("WaitForSync sinceAttemptID = %d, want %d", gotAttemptID, syncAttemptID)
-			}
-			return &api.Site{}, nil
-		},
+// removeClientWithWait builds a client that asserts the wait ran on the ids the
+// server returned: GetSite's argument proves the site id, and two answers, ok
+// one attempt below the expected id and ok at it, prove which id was awaited,
+// since a wait started any lower would resolve on the first.
+func removeClientWithWait(t *testing.T, siteID string, syncAttemptID int64, removeFn func(domain string) (*api.RemoveDomainResult, error)) *mockClient {
+	t.Helper()
+	m := &mockClient{removeDomainFn: removeFn}
+	m.getSiteFn = func(gotSiteID string) (*api.Site, error) {
+		if gotSiteID != siteID {
+			t.Errorf("GetSite id = %q, want %q", gotSiteID, siteID)
+		}
+		if m.getSiteCalls == 1 {
+			return &api.Site{ID: gotSiteID, Sync: &api.Sync{LatestAttemptID: syncAttemptID - 1, Outcome: "ok"}}, nil
+		}
+		return &api.Site{ID: gotSiteID, Sync: &api.Sync{LatestAttemptID: syncAttemptID, Outcome: "ok"}}, nil
 	}
+	return m
 }
 
 func TestRemoveHappyPath(t *testing.T) {
@@ -1057,7 +1137,9 @@ func TestRemoveHappyPath(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
-	client := removeClientWithWait("site123", 31, func(domain string) (*api.RemoveDomainResult, error) {
+	fastPolls(t)
+
+	client := removeClientWithWait(t, "site123", 31, func(domain string) (*api.RemoveDomainResult, error) {
 		if domain != "www.example.com" {
 			t.Errorf("domain = %q", domain)
 		}
@@ -1074,6 +1156,9 @@ func TestRemoveHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "done.") {
 		t.Errorf("expected 'done.' marker: %q", stdout.String())
+	}
+	if client.getSiteCalls != 2 {
+		t.Errorf("GetSite called %d times, want 2: the wait resolved on the wrong attempt id", client.getSiteCalls)
 	}
 }
 
@@ -1156,7 +1241,7 @@ func TestRemoveNotLoggedIn(t *testing.T) {
 	}
 }
 
-func TestRemoveNoWaitSkipsWaitForSync(t *testing.T) {
+func TestRemoveNoWaitSkipsTheWait(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
@@ -1165,10 +1250,7 @@ func TestRemoveNoWaitSkipsWaitForSync(t *testing.T) {
 		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
 			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 41}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			t.Fatal("WaitForSync must NOT be called when noWait=true")
-			return nil, nil
-		},
+		getSiteFn: flunkGetSite(t, "the wait must not poll when noWait=true"),
 	}
 
 	var out bytes.Buffer
@@ -1180,27 +1262,125 @@ func TestRemoveNoWaitSkipsWaitForSync(t *testing.T) {
 	}
 }
 
-func TestRemoveSyncTimeoutReturnsErrSyncTimeout(t *testing.T) {
+// `remove` off a terminal runs the same plain wait as `unset`, with its own
+// prefix naming the domain.
+func TestRemoveInterruptClosesTheRow(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
+	interruptBeforeWait(t)
 
 	client := &mockClient{
 		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
 			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 42}, nil
 		},
-		waitForSyncFn: func(_ string, _ int64, _ time.Duration) (*api.Site, error) {
-			return nil, api.ErrSyncTimeout
-		},
+		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
 	}
 
 	var out bytes.Buffer
 	err := Remove(client, "www.example.com", false, &out)
-	if !errors.Is(err, api.ErrSyncTimeout) {
-		t.Fatalf("expected api.ErrSyncTimeout, got %v", err)
+	if !errors.Is(err, syncwait.ErrInterrupted) {
+		t.Fatalf("err = %v, want syncwait.ErrInterrupted (→ exit 130)", err)
 	}
-	if !strings.Contains(out.String(), "still syncing") {
-		t.Errorf("expected 'still syncing' message: %q", out.String())
+	want := strings.TrimRight(i18n.Tf("domain.remove_removing", "www.example.com"), " ") + "\n" +
+		i18n.T("domain.stopped_teardown") + "\n"
+	if got := out.String(); got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// `remove` shares `unset`'s plain-wait failure shape, with its own prefix
+// naming the domain.
+func TestRemoveWaitErrorPropagates(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	const wantErr = "reconcile failed: caddy push failed (5xx)"
+
+	client := &mockClient{
+		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 42}, nil
+		},
+		getSiteFn: reconcileFailed(42, "caddy push failed (5xx)"),
+	}
+
+	var out bytes.Buffer
+	err := Remove(client, "www.example.com", false, &out)
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("err = %v, want %q", err, wantErr)
+	}
+	want := i18n.Tf("domain.remove_removing", "www.example.com") + i18n.T("domain.wait_failed") + "\n"
+	if got := out.String(); got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// Off a terminal `unset` and `remove` block on the teardown the way an
+// interactive run does, rather than returning as `--no-wait` does, and close
+// their own line with the done word. The second scripted answer is what the
+// wait blocks for: a run that returned promptly would print the queued line and
+// never poll at all.
+func TestUnsetAndRemoveBlockOffATerminal(t *testing.T) {
+	const attemptID = 7
+
+	script := func(m *mockClient) func(string) (*api.Site, error) {
+		return func(id string) (*api.Site, error) {
+			if m.getSiteCalls == 1 {
+				return &api.Site{ID: id, Sync: &api.Sync{LatestAttemptID: attemptID - 1, Outcome: "ok"}}, nil
+			}
+			return &api.Site{ID: id, Sync: &api.Sync{LatestAttemptID: attemptID, Outcome: "ok"}}, nil
+		}
+	}
+
+	cases := []struct {
+		name string
+		call func(client *mockClient, out *bytes.Buffer) error
+		want string
+	}{
+		{
+			name: "unset",
+			call: func(client *mockClient, out *bytes.Buffer) error {
+				client.unsetCanonicalFn = func(string) (*api.UnsetCanonicalResult, error) {
+					return &api.UnsetCanonicalResult{SyncAttemptID: attemptID}, nil
+				}
+				return Unset(client, false, out)
+			},
+			want: i18n.T("domain.unset_removing") + i18n.T("domain.wait_done") + "\n",
+		},
+		{
+			name: "remove",
+			call: func(client *mockClient, out *bytes.Buffer) error {
+				client.removeDomainFn = func(string) (*api.RemoveDomainResult, error) {
+					return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: attemptID}, nil
+				}
+				return Remove(client, "www.example.com", false, out)
+			},
+			want: i18n.Tf("domain.remove_removing", "www.example.com") + i18n.T("domain.wait_done") + "\n",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			setupCredentials(t)
+			setupProjectConfig(t, "site123")
+			fastPolls(t)
+
+			client := &mockClient{}
+			client.getSiteFn = script(client)
+
+			var out bytes.Buffer
+			if err := c.call(client, &out); err != nil {
+				t.Fatalf("error = %v, want the wait to resolve", err)
+			}
+			if got := out.String(); got != c.want {
+				t.Errorf("output = %q, want %q", got, c.want)
+			}
+			if client.getSiteCalls != 2 {
+				t.Errorf("GetSite called %d times, want 2: the command did not block on the teardown", client.getSiteCalls)
+			}
+		})
 	}
 }
 
@@ -1212,18 +1392,17 @@ func TestRemoveResultCarriesSiteID(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "local-project-id")
 
-	var capturedSiteID string
-	var capturedAttemptID int64
+	fastPolls(t)
 
-	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
-			return &api.RemoveDomainResult{SiteID: "remote-site-id", SyncAttemptID: 7}, nil
-		},
-		waitForSyncFn: func(siteID string, attemptID int64, _ time.Duration) (*api.Site, error) {
-			capturedSiteID = siteID
-			capturedAttemptID = attemptID
-			return &api.Site{}, nil
-		},
+	var capturedSiteID string
+
+	client := removeClientWithWait(t, "remote-site-id", 7, func(_ string) (*api.RemoveDomainResult, error) {
+		return &api.RemoveDomainResult{SiteID: "remote-site-id", SyncAttemptID: 7}, nil
+	})
+	inner := client.getSiteFn
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		capturedSiteID = id
+		return inner(id)
 	}
 
 	var out bytes.Buffer
@@ -1231,10 +1410,10 @@ func TestRemoveResultCarriesSiteID(t *testing.T) {
 		t.Fatalf("Remove() error = %v", err)
 	}
 	if capturedSiteID != "remote-site-id" {
-		t.Errorf("WaitForSync siteID = %q, want %q (must use server result, not project config)", capturedSiteID, "remote-site-id")
+		t.Errorf("the wait polled site %q, want %q (must use the server result, not the project config)", capturedSiteID, "remote-site-id")
 	}
-	if capturedAttemptID != 7 {
-		t.Errorf("WaitForSync attemptID = %d, want 7", capturedAttemptID)
+	if client.getSiteCalls != 2 {
+		t.Errorf("GetSite called %d times, want 2: the wait resolved on the wrong attempt id", client.getSiteCalls)
 	}
 }
 

@@ -306,6 +306,34 @@ func TestGetSiteForbidden(t *testing.T) {
 	}
 }
 
+func ptr[T any](v T) *T { return &v }
+
+func TestSitePointerFieldsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	s := Site{
+		ID:                       "x",
+		Subdomain:                "a",
+		SubdomainObserved:        ptr("b"),
+		SubdomainEnabledObserved: ptr(true),
+	}
+
+	body, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Site
+	if err := json.Unmarshal(body, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.SubdomainObserved == nil || *back.SubdomainObserved != "b" {
+		t.Errorf("SubdomainObserved roundtrip failed: %+v", back.SubdomainObserved)
+	}
+	if back.SubdomainEnabledObserved == nil || *back.SubdomainEnabledObserved != true {
+		t.Errorf("SubdomainEnabledObserved roundtrip failed: %+v", back.SubdomainEnabledObserved)
+	}
+}
+
 func TestUpdateSubdomainSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "PUT" {
@@ -842,7 +870,7 @@ func TestMapErrorTarballInvalid(t *testing.T) {
 func TestMapErrorQuotaCodesEchoServerMessage(t *testing.T) {
 	cases := map[string]string{
 		"deploy_too_large":      "Deploy is 142 MB; your account's limit is 100 MB per deploy.",
-		"deploy_too_many_files": "Deploy has 60000 files; the limit is 50000 files per deploy.",
+		"deploy_too_many_files": "Deploy has 25000 files; the limit is 20000 files per deploy.",
 		"config_too_large":      "Deploy config is 512 KB; the limit is 256 KB.",
 		"site_limit_reached":    "This account is at its limit of 5 sites. Delete a site you no longer need, or contact us to raise the limit.",
 	}

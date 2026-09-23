@@ -81,6 +81,36 @@ func TestRendererFirstTransientDoesNotRewind(t *testing.T) {
 	}
 }
 
+// The row is redrawn from column zero with the old text erased, and no newline
+// of its own: a caller opened that row and will terminate it. Without the erase
+// a shorter text would leave the tail of the longer one it replaced standing.
+func TestRewriteRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "text replaces the row",
+			text: "Creating site... (1m)",
+			want: "\r\033[KCreating site... (1m)",
+		},
+		{
+			name: "empty text clears the row",
+			text: "",
+			want: "\r\033[K",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			RewriteRow(&buf, tc.text)
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("output mismatch\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHumanizeElapsed(t *testing.T) {
 	for _, tc := range []struct {
 		d    time.Duration

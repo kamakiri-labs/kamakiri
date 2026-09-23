@@ -9,17 +9,47 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
-// cleanupPollInterval paces the wait for the orphan count to reach zero. A few
-// seconds keeps the wait responsive without hammering the status endpoint,
-// since the deletion normally lands within a pass or two.
-var cleanupPollInterval = 3 * time.Second
+// errCleanupBlocked ends the wait when nothing retryable is left. It never
+// reaches a user: it is how the poll tells the caller which terminal outcome
+// arrived, and the caller prints the blocked copy and returns the reported
+// error in its place.
+var errCleanupBlocked = errors.New("cdn cleanup blocked on invalid credentials")
 
-// cleanupWaitTimeout caps the wait for the orphans to be deleted. A transient
-// delete failure is retried on the reconciler's own cron cadence, so the
-// ceiling is wide enough to absorb a couple of those retries.
-var cleanupWaitTimeout = 5 * time.Minute
+// awaitCleanup blocks until the orphaned resources are gone or the deletion
+// has nothing left it can retry, leaving the working line open for the caller
+// to terminate.
+func awaitCleanup(client APIClient, siteID string, orphans int, out io.Writer) error {
+	ctx, stop := signalCtx()
+	defer stop()
+
+	return syncwait.Poll(ctx, syncwait.Options{
+		Out:      out,
+		Prefix:   i18n.Tf("cdn.cleanup_working", orphans),
+		StopLine: syncwait.SharedStopLine(),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    isTerminalWriter(out),
+	}, func() (bool, error) {
+		st, err := client.CDNStatus(siteID)
+		if err != nil {
+			return false, err
+		}
+		switch {
+		case st.CleanupOrphanCount == 0:
+			// The orphan count includes the blocked ones, so zero means nothing
+			// is left at all, not just nothing retryable. That is what keeps the
+			// blocked case below from claiming a finished cleanup.
+			return true, nil
+		case st.CleanupBlockedCount >= st.CleanupOrphanCount:
+			// Nothing retryable is left, so waiting longer cannot help.
+			return true, errCleanupBlocked
+		}
+		return false, nil
+	})
+}
 
 // Cleanup deletes the linked site's orphaned WebAccel resources.
 //
@@ -29,12 +59,12 @@ var cleanupWaitTimeout = 5 * time.Minute
 // with no check that traffic has moved off first, which is why the copy that
 // leads users here tells them to repoint their DNS beforehand.
 //
-// Unless noWait is set, it returns only once the resources are actually gone,
-// or once every remaining one is blocked on credentials the provider no longer
-// accepts, which no amount of waiting will fix. The wait is bounded: at
-// cleanupWaitTimeout it reports the cleanup still working and returns an error.
-// A version refusal ends it on the poll that sees it, since every later poll
-// would be refused the same way.
+// Unless noWait is set, it returns once the resources are actually gone, once
+// every remaining one is blocked on credentials the provider no longer accepts,
+// which no amount of waiting will fix, once the status endpoint has failed past
+// what the wait tolerates, or once the user interrupts it. A version refusal
+// ends it on the poll that sees it, since every later poll would be refused the
+// same way.
 func Cleanup(client APIClient, noWait bool, out io.Writer) error {
 	config, err := core.RequireProject()
 	if err != nil {
@@ -56,43 +86,32 @@ func Cleanup(client APIClient, noWait bool, out io.Writer) error {
 		return nil
 	}
 
-	fmt.Fprint(out, i18n.Tf("cdn.cleanup_working", result.OrphanCount))
-
-	deadline := time.Now().Add(cleanupWaitTimeout)
-	for {
-		st, sErr := client.CDNStatus(config.ID)
-		// The deletion is the server's to finish and the timeout copy points at
-		// `kamakiri cdn`, which the same floor refuses. The open working line is
-		// closed and the sentinel travels bare, unmarked, so the command layer
-		// prints the upgrade message.
-		if errors.Is(sErr, api.ErrUpgradeRequired) {
+	if waitErr := awaitCleanup(client, config.ID, result.OrphanCount, out); waitErr != nil {
+		// The deletion is the server's to finish, and a refusal says nothing
+		// about how far it got, so any copy this command has would misdirect.
+		// The open working line is closed and the sentinel travels bare,
+		// unmarked, so the command layer prints the upgrade message.
+		if errors.Is(waitErr, api.ErrUpgradeRequired) {
 			fmt.Fprintln(out)
-			return sErr
+			return waitErr
 		}
-		if sErr == nil {
-			switch {
-			case st.CleanupOrphanCount == 0:
-				// The orphan count includes the blocked ones, so zero means
-				// nothing is left at all, not just nothing retryable. That is what
-				// keeps the blocked case below from claiming a finished cleanup.
-				fmt.Fprintln(out, i18n.T("cdn.cleanup_done"))
-				return nil
-
-			case st.CleanupBlockedCount >= st.CleanupOrphanCount:
-				// Nothing retryable is left, so waiting longer cannot help.
-				fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked"))
-				fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked_reason"))
-				fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked_fix"))
-				return fmt.Errorf("%w: %s", ErrCdnReported, i18n.T("cdn.err_cleanup_blocked"))
-			}
+		// The wait has closed the line and said the deletion carries on, so
+		// anything printed here would report on resources still being deleted.
+		if errors.Is(waitErr, syncwait.ErrInterrupted) {
+			return waitErr
 		}
-
-		if time.Now().After(deadline) {
-			fmt.Fprintln(out, i18n.T("cdn.cleanup_still_working"))
-			fmt.Fprintln(out, i18n.T("cdn.cleanup_check_hint"))
-			return fmt.Errorf("%w: %s", ErrCdnReported, i18n.T("cdn.err_cleanup_timed_out"))
+		if errors.Is(waitErr, errCleanupBlocked) {
+			fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked"))
+			fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked_reason"))
+			fmt.Fprintln(out, i18n.T("cdn.cleanup_blocked_fix"))
+			return fmt.Errorf("%w: %s", ErrCdnReported, i18n.T("cdn.err_cleanup_blocked"))
 		}
-
-		time.Sleep(cleanupPollInterval)
+		// The status endpoint failed past what the wait tolerates, so how far
+		// the deletion got is unknown. The terminator carries the reason, which
+		// is the whole report, so the error is marked as already reported.
+		fmt.Fprintln(out, i18n.Tf("cdn.cleanup_failed", waitErr))
+		return fmt.Errorf("%w: %w", ErrCdnReported, waitErr)
 	}
+	fmt.Fprintln(out, i18n.T("cdn.cleanup_done"))
+	return nil
 }

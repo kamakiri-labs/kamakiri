@@ -9,16 +9,30 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/domain"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
 var signalCtx = func() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
+
+// pollSchedule is the cadence the CDN verbs' own-side waits poll on, a seam so
+// a test can drive several polls without waiting out the production bands. The
+// go-live watches have a cadence of their own.
+var pollSchedule = syncwait.DefaultSchedule
+
+// The exit leg type-asserts its client to the domain package's interface to run
+// the climb back, and with a client that does not satisfy it the leg returns
+// without streaming. That failure is silent by construction, so the production
+// client is checked here, where the build catches it.
+var _ domain.APIClient = (*api.Client)(nil)
 
 // SetMode sets the CDN mode for the linked site, either cloudflare or none.
 // WebAccel has its own entry point, SetWebAccel, because it needs credentials.
@@ -280,57 +294,66 @@ func exitToDirect(ctx context.Context, client APIClient, siteID string, priorSta
 		return false, nil, errNoSyncAttempt()
 	}
 
-	// On a TTY this line is redrawn in place into the settled glyph below; a
-	// non-TTY run keeps both lines, since it carries no ANSI.
-	fmt.Fprintln(out, i18n.T("cdn.deactivating"))
+	_, syncErr := syncwait.Sync(ctx, client, siteID, result.SyncAttemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   i18n.T("cdn.deactivating"),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    interactive,
+		// No stop line: the interrupt arm below has stop copy of its own, which
+		// names the CDN change rather than a change in general.
+	})
 
-	// WaitForSync blocks on its own poll loop and cannot be cancelled, so it runs
-	// detached and is raced against ctx. The buffer is what makes abandoning it
-	// safe: on an interrupt nobody reads the result, and an unbuffered send would
-	// leak the goroutine.
-	type syncResult struct{ err error }
-	done := make(chan syncResult, 1)
-	go func() {
-		_, err := client.WaitForSync(siteID, result.SyncAttemptID, ourSideWaitTimeout)
-		done <- syncResult{err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		// No records have been shown and the content domains are still unknown, so
-		// the stop copy stays generic. Once the exit watch is running it prints its
-		// own detach copy for the domains it is watching.
+	// closeRow ends the ⧗ row the wait hands back open, with the line that
+	// reports the outcome: on a terminal that line takes the row's place, off
+	// one it follows on the next. An empty line is for an outcome with nothing
+	// of its own to say: on a terminal it erases the row and leaves the cursor
+	// on it, and off one, where nothing can be erased, it terminates the row and
+	// leaves it standing.
+	closeRow := func(line string) {
+		if interactive {
+			streamui.RewriteRow(out, line)
+			if line == "" {
+				return
+			}
+			fmt.Fprintln(out)
+			return
+		}
 		fmt.Fprintln(out)
-		fmt.Fprintln(out, i18n.T("cdn.stopped_deactivating"))
-		return false, result, domain.ErrWatchInterrupted
-	case r := <-done:
-		if r.err != nil {
-			// The fix copy below names commands the same floor refuses, so the
-			// status line is rewound and the sentinel travels bare, unmarked, for
-			// the command layer to print as the whole message.
-			if errors.Is(r.err, api.ErrUpgradeRequired) {
-				if interactive {
-					fmt.Fprint(out, "\033[1A\033[J") // rewind the ⧗ line
-				}
-				return false, result, r.err
-			}
-			if errors.Is(r.err, api.ErrSyncTimeout) {
-				fmt.Fprintln(out, i18n.T("cdn.change_queued_status"))
-				return false, result, r.err
-			}
-			// The copy below is the report, so the error is marked as already
-			// reported: the caller exits non-zero without echoing the raw sync
-			// error to stderr as well.
-			fmt.Fprintln(out, i18n.T("cdn.change_failed"))
-			fmt.Fprintln(out, i18n.T("cdn.change_failed_fix"))
-			return false, result, fmt.Errorf("%w: %w", ErrCdnReported, r.err)
+		if line != "" {
+			fmt.Fprintln(out, line)
 		}
 	}
 
-	if interactive {
-		fmt.Fprint(out, "\033[1A\033[J") // rewind the ⧗ line
+	switch {
+	case syncErr == nil:
+		closeRow(i18n.T("cdn.deactivated"))
+
+	case errors.Is(syncErr, syncwait.ErrInterrupted):
+		// The wait has terminated the row already, so the blank line below only
+		// separates it from the stop copy. No records have been shown and the
+		// content domains are still unknown, so that copy stays generic; once the
+		// exit watch is running it prints its own detach copy for the domains it
+		// is watching.
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, i18n.T("cdn.stopped_deactivating"))
+		return false, result, domain.ErrWatchInterrupted
+
+	case errors.Is(syncErr, api.ErrUpgradeRequired):
+		// The fix copy names commands the same floor refuses, so the row is
+		// erased with nothing in its place and the sentinel travels bare,
+		// unmarked, for the command layer to print as the whole message.
+		closeRow("")
+		return false, result, syncErr
+
+	default:
+		// The copy here is the report, so the error is marked as already
+		// reported: the caller exits non-zero without echoing the raw sync error
+		// to stderr as well.
+		closeRow(i18n.T("cdn.change_failed"))
+		fmt.Fprintln(out, i18n.T("cdn.change_failed_fix"))
+		return false, result, fmt.Errorf("%w: %w", ErrCdnReported, syncErr)
 	}
-	fmt.Fprintln(out, i18n.T("cdn.deactivated"))
 
 	// The climb back reuses the domain package's cutover view, which needs a
 	// richer client than this package's own interface. A client that does not

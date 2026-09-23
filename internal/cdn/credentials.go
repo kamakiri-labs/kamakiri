@@ -12,12 +12,27 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/cliflags"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/syncwait"
 )
 
-// credentialsSyncTimeout caps the wait for a credential rotation. A rotation
-// is one control-plane round-trip against Sakura, not a per-domain climb, so
-// its budget is much tighter than a provisioning one.
-const credentialsSyncTimeout = 60 * time.Second
+// awaitRotation blocks until the rotation the server accepted is reconciled,
+// leaving the working line open for the caller to terminate. The signal region
+// is minted here rather than around the credential prompts, so Ctrl-C at a
+// prompt still ends the process the ordinary way.
+func awaitRotation(client APIClient, siteID string, attemptID int64, out io.Writer) error {
+	ctx, stop := signalCtx()
+	defer stop()
+
+	_, err := syncwait.Sync(ctx, client, siteID, attemptID, syncwait.Options{
+		Out:      out,
+		Prefix:   i18n.T("cdn.rotate_working"),
+		StopLine: syncwait.SharedStopLine(),
+		Schedule: pollSchedule,
+		Now:      time.Now,
+		IsTTY:    isTerminalWriter(out),
+	})
+	return err
+}
 
 // RotateCredentials replaces the stored WebAccel token and secret, keeping the
 // per-domain resource mapping the server already holds. It resolves the two
@@ -25,9 +40,10 @@ const credentialsSyncTimeout = 60 * time.Second
 //
 // A rotation changes no per-domain state, so there is nothing to watch
 // converge: its correctness is the outcome of the reconciler pass, where the
-// new credentials are tried for the first time. Bad credentials surface as
-// that pass failing, which is why the failure copy here is about the token
-// rather than about the site.
+// new credentials are tried for the first time. Bad credentials surface as that
+// pass failing, so a failure the reconciler judged is reported as a rejected
+// token. Every other way the wait can end leaves that verdict unread, and the
+// copy then reports what went wrong without naming the credentials.
 func RotateCredentials(client APIClient, opts WebAccelOptions, noWait bool, in io.Reader, out io.Writer) error {
 	return rotateCredentialsWithReader(client, opts, noWait, in, out, DefaultSecretReader)
 }
@@ -56,24 +72,36 @@ func rotateCredentialsWithReader(client APIClient, opts WebAccelOptions, noWait 
 		return nil
 	}
 
-	fmt.Fprint(out, i18n.T("cdn.rotate_working"))
-	if _, syncErr := client.WaitForSync(config.ID, result.SyncAttemptID, credentialsSyncTimeout); syncErr != nil {
-		// The refusal says nothing about the credentials, so the rejection copy
-		// below would misdirect. The open line is closed and the sentinel travels
+	if syncErr := awaitRotation(client, config.ID, result.SyncAttemptID, out); syncErr != nil {
+		// The refusal stopped the wait before its verdict, if any, could be
+		// read, and it says nothing about the credentials, so neither failure
+		// copy below fits. The open line is closed and the sentinel travels
 		// bare, unmarked, so the command layer prints the upgrade message.
 		if errors.Is(syncErr, api.ErrUpgradeRequired) {
 			fmt.Fprintln(out)
 			return syncErr
 		}
-		if errors.Is(syncErr, api.ErrSyncTimeout) {
-			fmt.Fprintln(out, i18n.T("cdn.rotate_still_applying"))
+		// The wait has closed the line and said the rotation carries on, so
+		// reporting a failure here would condemn a token whose verdict, if
+		// any, was never read.
+		if errors.Is(syncErr, syncwait.ErrInterrupted) {
 			return syncErr
 		}
 		// The credentials are only tried during the reconciler pass, so a
-		// rejected token arrives here as a sync failure. The copy below is the
-		// report, so the error is marked as already reported.
-		fmt.Fprintln(out, i18n.T("cdn.rotate_failed"))
-		fmt.Fprintln(out, i18n.T("cdn.rotate_rejected"))
+		// rejected token arrives here as that pass failing: the verdict is on
+		// the token and the copy says so. It is the whole report, so the error
+		// is marked as already reported.
+		var rejected *syncwait.ReconcileFailure
+		if errors.As(syncErr, &rejected) {
+			fmt.Fprintln(out, i18n.T("cdn.rotate_failed"))
+			fmt.Fprintln(out, i18n.T("cdn.rotate_rejected"))
+			return fmt.Errorf("%w: %w", ErrCdnReported, syncErr)
+		}
+		// The wait could not read the outcome past what it tolerates, so
+		// whether the credentials were ever tried is unknown and blaming them
+		// would misdirect. The terminator carries the reason, which is the
+		// whole report, so the error is marked as already reported.
+		fmt.Fprintln(out, i18n.Tf("cdn.rotate_failed_reason", syncErr))
 		return fmt.Errorf("%w: %w", ErrCdnReported, syncErr)
 	}
 	fmt.Fprintln(out, i18n.T("cdn.rotate_done"))
