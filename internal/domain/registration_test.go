@@ -401,7 +401,7 @@ func TestVerifyRoutesToRegisterWhenPendingRegistrationExists(t *testing.T) {
 
 	registerCalled := false
 	client := &mockClient{
-		recheckDomainFn: func(_ string) (*api.Domain, error) {
+		recheckDomainFn: func(_, _ string) (*api.Domain, error) {
 			return nil, &api.ErrorResponse{Code: "domain_not_found", Message: "Domain not found."}
 		},
 		listRegistrationsFn: func() (*api.RegistrationList, error) {
@@ -432,7 +432,7 @@ func TestVerifyNotRoutedWhenNoPendingRegistration(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		recheckDomainFn: func(_ string) (*api.Domain, error) {
+		recheckDomainFn: func(_, _ string) (*api.Domain, error) {
 			return nil, &api.ErrorResponse{Code: "domain_not_found", Message: "Domain not found."}
 		},
 		listRegistrationsFn: func() (*api.RegistrationList, error) {

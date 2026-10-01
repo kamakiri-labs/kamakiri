@@ -687,6 +687,22 @@ type ErrorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	SiteID  string `json:"site_id,omitempty"`
+
+	// Subdomain is the subdomain of the site a domain_on_other_site refusal
+	// names: the one of the account's sites the host is attached to.
+	Subdomain string `json:"subdomain,omitempty"`
+
+	// RetryAfter is the whole seconds left before register will issue a new code
+	// for the address, carried by its rate_limited refusal. Zero means the
+	// server did not send it, as an older one does not. The Retry-After header
+	// carries the same number and is not read.
+	RetryAfter int `json:"retry_after,omitempty"`
+
+	// AttemptsLeft is how many failed attempts the code has left, carried by an
+	// invalid_code refusal from verify only when the request's secret is the one
+	// the code was issued to. It is a pointer because 0, no attempts left, is an
+	// answer of its own, while nil means the server did not say.
+	AttemptsLeft *int `json:"attempts_left,omitempty"`
 }
 
 func (e *ErrorResponse) Error() string {
@@ -704,22 +720,25 @@ var ErrUpgradeRequired = i18n.NewError("api.err_upgrade_required")
 // MapError translates common API error codes into user-friendly error messages,
 // looked up from the message catalog so they render in the language the CLI
 // settled on. It returns the original error unchanged if it is not an
-// *ErrorResponse or its code is unrecognized.
+// *ErrorResponse (possibly wrapped) or its code is unrecognized.
 //
 // Several arms return the server's own message verbatim rather than a local
 // copy: that message names a particular thing this side does not hold (a size,
 // a cap, a host, a colliding id, or what made an upload invalid), which a copy
 // here would lose.
 func MapError(err error) error {
-	apiErr, ok := err.(*ErrorResponse)
-	if !ok {
+	var apiErr *ErrorResponse
+	if !errors.As(err, &apiErr) {
 		return err
 	}
 	switch apiErr.Code {
+	case "site_deleted":
+		// The server refuses every state-changing request on a site whose
+		// teardown was accepted. The deploy guard prints the same line before it
+		// packs anything, so one entry serves both.
+		return errors.New(i18n.T("api.err_site_torn_down"))
 	case "site_not_found":
 		return errors.New(i18n.T("api.err_site_not_found"))
-	case "forbidden":
-		return errors.New(i18n.T("api.err_forbidden"))
 	case "unauthorized":
 		return UnauthorizedError()
 	case "tarball_invalid":
@@ -753,8 +772,6 @@ func MapError(err error) error {
 		return errors.New(i18n.T("api.err_domain_reserved"))
 	case "canonical_exists":
 		return errors.New(i18n.T("api.err_canonical_exists"))
-	case "canonical_via_add":
-		return errors.New(i18n.T("api.err_canonical_via_add"))
 	case "no_canonical":
 		return errors.New(i18n.T("api.err_no_canonical"))
 	case "has_redirect_domains":
@@ -784,8 +801,6 @@ func MapError(err error) error {
 		return errors.New(apiErr.Message)
 	case "invalid_mode":
 		return errors.New(i18n.T("api.err_invalid_mode"))
-	case "invalid_credentials":
-		return errors.New(i18n.T("api.err_invalid_credentials"))
 	case "no_cdn_configured":
 		return errors.New(i18n.T("api.err_no_cdn_configured"))
 	case "no_live_deploy":
@@ -797,22 +812,27 @@ func MapError(err error) error {
 		return errors.New(apiErr.Message)
 	case "requires_webaccel_mode":
 		return errors.New(i18n.T("api.err_requires_webaccel_mode"))
-	case "cdn_error":
-		// A CLI-authored frame over the provider's own words: the frame is
-		// localized, the message it carries is passed through as delivered.
-		return errors.New(i18n.Tf("api.err_cdn_error", apiErr.Message))
 	case "invalid_webaccel_credentials":
 		// Eager validation: the token was checked at set time and Sakura rejected
 		// it (401), so the copy can say exactly where to re-mint one.
 		return errors.New(i18n.T("api.err_invalid_webaccel_credentials"))
 	default:
-		return apiErr
+		return err
 	}
 }
 
 // RegisterResponse is the response from POST /v1/auth/register.
 type RegisterResponse struct {
 	Message string `json:"message"`
+
+	// Status is "sent" when a new code went out, or "pending" when nothing was
+	// sent because the request's secret hash is the one stored with a code that
+	// can still be used. An older server leaves it empty, and it sent a code.
+	Status string `json:"status"`
+
+	// ExpiresIn is the seconds until the code the client should now use
+	// expires. Zero means the server did not send it; it never answers 0.
+	ExpiresIn int `json:"expires_in"`
 }
 
 // VerifyResponse is the response from POST /v1/auth/verify.
@@ -820,12 +840,17 @@ type VerifyResponse struct {
 	APIKey string `json:"api_key"`
 }
 
-// Register calls POST /v1/auth/register.
-func (c *Client) Register(email string, tosAccepted bool, secretHash string) (*RegisterResponse, error) {
+// Register calls POST /v1/auth/register. With resend false the server answers
+// "pending" instead of sending a code when secretHash is the one stored with a
+// code that can still be used; with resend true it asks for a new code. The
+// field always goes out as a JSON boolean, since the server refuses any other
+// value.
+func (c *Client) Register(email string, tosAccepted bool, secretHash string, resend bool) (*RegisterResponse, error) {
 	body := map[string]any{
 		"email":        email,
 		"tos_accepted": tosAccepted,
 		"secret_hash":  secretHash,
+		"resend":       resend,
 	}
 
 	var result RegisterResponse
@@ -932,28 +957,40 @@ func (c *Client) AddDomain(siteID, domain, role string, redirectStatus int) (*Do
 	return &result, nil
 }
 
-// RemoveDomain calls DELETE /v1/pages/domains/:domain (authenticated). It
-// returns the queued sync_attempt_id and site_id to wait on.
-func (c *Client) RemoveDomain(domain string) (*RemoveDomainResult, error) {
+// RemoveDomain calls DELETE /v1/pages/domains/:domain?site_id=:id
+// (authenticated). It returns the queued sync_attempt_id and site_id to wait on.
+//
+// The server finds the domain by name across the account's sites; siteID scopes
+// the removal to the linked site, so a host attached to another of the
+// account's sites is refused with 409 domain_on_other_site, whose Subdomain
+// names that site. An empty siteID reads as no scope.
+func (c *Client) RemoveDomain(siteID, domain string) (*RemoveDomainResult, error) {
+	params := url.Values{"site_id": {siteID}}.Encode()
 	var result RemoveDomainResult
-	if err := c.doJSON("DELETE", "/v1/pages/domains/"+url.PathEscape(domain), nil, &result); err != nil {
+	if err := c.doJSON("DELETE", "/v1/pages/domains/"+url.PathEscape(domain)+"?"+params, nil, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
-// RecheckDomain calls POST /v1/pages/domains/:domain/recheck (authenticated).
-// It does not probe: it only opens or extends the domain's verify-priority
-// (Burst) window server-side, so the next one-minute verification tick picks the
-// domain up. The response has the same shape as a domain list entry, so the CLI
-// can render fresh status straight after.
+// RecheckDomain calls POST /v1/pages/domains/:domain/recheck?site_id=:id
+// (authenticated). It does not probe: it only opens or extends the domain's
+// verify-priority (Burst) window server-side, so the next one-minute
+// verification tick picks the domain up. The response has the same shape as a
+// domain list entry, so the CLI can render fresh status straight after.
 //
 // A 404 domain_not_found covers both an unknown and a non-owned domain, so the
 // :domain path param cannot leak another tenant's domain existence; 429
 // rate_limited comes from the per-account recheck limiter.
-func (c *Client) RecheckDomain(domain string) (*Domain, error) {
+//
+// siteID scopes the recheck to the linked site: a host attached to another of
+// the account's sites is refused with 409 domain_on_other_site, whose Subdomain
+// names that site, and no check is requested. An empty siteID reads as no
+// scope.
+func (c *Client) RecheckDomain(siteID, domain string) (*Domain, error) {
+	params := url.Values{"site_id": {siteID}}.Encode()
 	var result Domain
-	if err := c.doJSON("POST", "/v1/pages/domains/"+url.PathEscape(domain)+"/recheck", nil, &result); err != nil {
+	if err := c.doJSON("POST", "/v1/pages/domains/"+url.PathEscape(domain)+"/recheck?"+params, nil, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

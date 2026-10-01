@@ -14,6 +14,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/domain"
 	"github.com/kamakiri-labs/kamakiri/internal/freshness"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/sizelimit"
 	"github.com/kamakiri-labs/kamakiri/internal/timeago"
 )
 
@@ -81,7 +82,7 @@ type SiteClient interface {
 
 	// RecheckDomain backs `status --recheck`. Plain `status` never calls it:
 	// reads stay pure.
-	RecheckDomain(domain string) (*api.Domain, error)
+	RecheckDomain(siteID, domain string) (*api.Domain, error)
 }
 
 // Run prints version, credentials, login state, API server, and site info.
@@ -202,16 +203,18 @@ func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verb
 	// not decide anything the page reports. A recheck the server did not perform
 	// therefore leaves the row as it was and the exit code alone: the server
 	// keeps probing regardless. A rate limit says nothing the page's in-burst
-	// nudge does not already say, so it stays quiet; any other failure is worth
-	// one line.
+	// nudge does not already say, so it stays quiet. A torn-down site's refusal is
+	// quiet too: the status page prints its own teardown line, and the server
+	// does not keep checking a site that is going away. Any other failure is
+	// worth one line.
 	if recheck {
 		for i := range result.Domains {
 			if result.Domains[i].State == domain.StateServing {
 				continue
 			}
-			fresh, err := client.RecheckDomain(result.Domains[i].Domain)
+			fresh, err := client.RecheckDomain(config.ID, result.Domains[i].Domain)
 			if err != nil {
-				if !isErrorCode(err, "rate_limited") {
+				if !isErrorCode(err, "rate_limited") && !isErrorCode(err, "site_deleted") {
 					fmt.Fprintln(errOut, i18n.Tf("status.recheck_failed", result.Domains[i].Domain, api.MapError(err)))
 				}
 				continue
@@ -367,19 +370,7 @@ func renderQuota(out io.Writer, site *api.Site) {
 	fmt.Fprintf(out, "%s%d / %d\n", label(i18n.T("status.label_sites")), q.SitesUsed, q.SitesMax)
 	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_snapshots")),
 		i18n.Tf("status.value_snapshots", q.SnapshotsUsed, q.SnapshotsMax))
-	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_max_deploy")), formatMaxDeploy(q.MaxSnapshotBytes))
-}
-
-// formatMaxDeploy renders the per-deploy byte ceiling in MB, trimming a whole
-// number to "100 MB" rather than "100.0 MB". A ceiling that is not MB-aligned
-// keeps one decimal. A number and its unit symbol read the same in every
-// language, so neither is catalog copy.
-func formatMaxDeploy(bytes int64) string {
-	const mb = 1024 * 1024
-	if bytes%mb == 0 {
-		return fmt.Sprintf("%d MB", bytes/mb)
-	}
-	return fmt.Sprintf("%.1f MB", float64(bytes)/mb)
+	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_max_deploy")), sizelimit.MB(q.MaxSnapshotBytes))
 }
 
 // renderPerDomainStatus prints a per-domain detail block under the top-level
@@ -680,8 +671,6 @@ func renderStatusBranch(out io.Writer, site *api.Site) bool {
 // isErrorCode reports whether err is an API error response carrying the given
 // code.
 func isErrorCode(err error, code string) bool {
-	if apiErr, ok := err.(*api.ErrorResponse); ok {
-		return apiErr.Code == code
-	}
-	return false
+	var apiErr *api.ErrorResponse
+	return errors.As(err, &apiErr) && apiErr.Code == code
 }

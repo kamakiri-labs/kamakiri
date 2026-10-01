@@ -57,25 +57,25 @@ func TestParseRejected(t *testing.T) {
 		content string
 		want    string // substring expected in the error
 	}{
-		{"status 200", "/a /b 200", "line 1: invalid status 200"},
-		{"non-redirect 3xx", "/a /b 304", "line 1: invalid status 304"},
-		{"external http", "/a http://evil.com", "line 1: to must start with /"},
+		{"status 200", "/a /b 200", "_redirects line 1: invalid status 200"},
+		{"non-redirect 3xx", "/a /b 304", "_redirects line 1: invalid status 304"},
+		{"external http", "/a http://evil.com", "_redirects line 1: to must start with /"},
 		{"protocol-relative", "/a //evil.com", "site-absolute"},
-		{"backslash authority", "/a /\\evil.com", "line 1:"},
+		{"backslash authority", "/a /\\evil.com", "_redirects line 1:"},
 		{"encoded slash", "/a /%2f%2fevil.com", "encoded slash or backslash"},
 		{"encoded backslash", "/a /%5cevil.com", "encoded slash or backslash"},
 		{"named placeholder", "/movies/:id /media/:id", "named placeholders"},
-		{"literal star in source", "/a*b /c", "line 1:"},
+		{"literal star in source", "/a*b /c", "_redirects line 1:"},
 		{"literal star in destination", "/a/* /b/*", "use :splat (not *)"},
-		{"splat not at suffix", "/a/* /b/:splat/c", "line 1:"},
-		{"splat in source", "/a/:splat /b", "line 1: :splat is only allowed in the destination"},
-		{"wildcard source without splat", "/a/* /b", "line 1: from ends with *"},
+		{"splat not at suffix", "/a/* /b/:splat/c", "_redirects line 1:"},
+		{"splat in source", "/a/:splat /b", "_redirects line 1: :splat is only allowed in the destination"},
+		{"wildcard source without splat", "/a/* /b", "_redirects line 1: from ends with *"},
 		{"forced rule", "/a /b 301!", "forced"},
-		{"too many fields", "/a /b 302 Country=au", "line 1: too many fields"},
-		{"missing destination", "/only-one-field", "line 1: missing destination"},
+		{"too many fields", "/a /b 302 Country=au", "_redirects line 1: too many fields"},
+		{"missing destination", "/only-one-field", "_redirects line 1: missing destination"},
 		{"control character", "/a\f /b", "control character"},
-		{"brace in source", "/a{b /c", "line 1: from contains forbidden characters"},
-		{"line number reported", "/a /b\n/c /d\n/e http://evil", "line 3:"},
+		{"brace in source", "/a{b /c", "_redirects line 1: from contains forbidden characters"},
+		{"line number reported", "/a /b\n/c /d\n/e http://evil", "_redirects line 3:"},
 	}
 
 	for _, tt := range tests {
@@ -92,11 +92,11 @@ func TestParseRejected(t *testing.T) {
 }
 
 // A rejection the user reads as one line is two catalog lookups in the source:
-// the "line N" frame and the message it fronts. A substring check on the
-// message alone still passes when the frame is looked up from the wrong key, so
-// these cases compare the whole error string. Each rule sits on line 2, behind a
-// comment, so the frame's number is pinned as well as its wording, one case per
-// rejection shape covered here.
+// the "_redirects line N" frame and the message it fronts. A substring check on
+// the message alone still passes when the frame is looked up from the wrong key,
+// so these cases compare the whole error string. Each rule sits on line 2,
+// behind a comment, so the frame's number is pinned as well as its wording, one
+// case per rejection shape covered here.
 func TestParseRejectionsRenderTheWholeLine(t *testing.T) {
 	tests := []struct {
 		name string
@@ -104,27 +104,27 @@ func TestParseRejectionsRenderTheWholeLine(t *testing.T) {
 		want string
 	}{
 		{"line too long", "/old " + strings.Repeat("/b", maxLineBytes),
-			fmt.Sprintf("line 2: line is too long (limit %d bytes)", maxLineBytes)},
+			fmt.Sprintf("_redirects line 2: line is too long (limit %d bytes)", maxLineBytes)},
 		{"status is not a number", "/a /b 404x",
-			"line 2: invalid status code; expected 301, 302, 303, 307, or 308"},
+			"_redirects line 2: invalid status code; expected 301, 302, 303, 307, or 308"},
 		{"forced redirect", "/a /b 301!",
-			"line 2: forced redirects (a '!' suffix) are not supported"},
+			"_redirects line 2: forced redirects (a '!' suffix) are not supported"},
 		{"control character in a path", "/a\x01 /b",
-			"line 2: path contains a control character"},
+			"_redirects line 2: path contains a control character"},
 		{"splat before the last segment of a splat destination", "/a/* /x/:splat/y/:splat",
-			"line 2: :splat is only allowed as the destination's trailing path segment"},
+			"_redirects line 2: :splat is only allowed as the destination's trailing path segment"},
 		{"named placeholder before a trailing splat", "/a/* /x/:name/:splat",
-			"line 2: named placeholders (:name) are not supported"},
+			"_redirects line 2: named placeholders (:name) are not supported"},
 		{"splat not trailing in the destination", "/a/* /x/:splat/y",
-			"line 2: :splat is only allowed as the destination's trailing path segment"},
+			"_redirects line 2: :splat is only allowed as the destination's trailing path segment"},
 		{"named placeholder in the destination", "/a /b/:other",
-			"line 2: named placeholders (:name) are not supported"},
+			"_redirects line 2: named placeholders (:name) are not supported"},
 		{"encoded CRLF in the source", "/a%0d /b",
-			"line 2: from contains encoded CRLF characters"},
+			"_redirects line 2: from contains encoded CRLF characters"},
 		{"wildcard away from the end", "/a*b /c",
-			"line 2: from: wildcard * is only allowed as the last character"},
+			"_redirects line 2: from: wildcard * is only allowed as the last character"},
 		{"destination wildcard without a source one", "/a /b/:splat",
-			"line 2: to ends with * but from does not"},
+			"_redirects line 2: to ends with * but from does not"},
 	}
 
 	for _, tt := range tests {
@@ -138,6 +138,22 @@ func TestParseRejectionsRenderTheWholeLine(t *testing.T) {
 				t.Errorf("Parse(%q) error =\n  %q\nwant:\n  %q", tt.rule, err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+// The Japanese catalog carries its own copy of the frame, so it is pinned on
+// its own. A deploy lints both _redirects and _headers, and a frame without the
+// file name leaves the user guessing which file the line is in.
+func TestParseRejectionFrameInJapanese(t *testing.T) {
+	i18n.Load("ja")
+	t.Cleanup(func() { i18n.Load("en") })
+
+	err := Parse([]byte("# a comment\n/a /b 301!"))
+	if err == nil {
+		t.Fatal("Parse(forced rule) = nil, want error")
+	}
+	if want := "_redirects 2行目: 強制リダイレクト（末尾の '!'）には対応していません"; err.Error() != want {
+		t.Errorf("Parse(forced rule) error =\n  %q\nwant:\n  %q", err.Error(), want)
 	}
 }
 
@@ -224,8 +240,8 @@ func TestLint(t *testing.T) {
 		if err == nil {
 			t.Fatal("Lint(malformed) = nil, want error")
 		}
-		if !strings.Contains(err.Error(), "to must start with /") {
-			t.Errorf("Lint(malformed) error = %q", err.Error())
+		if want := "_redirects line 1: to must start with /"; err.Error() != want {
+			t.Errorf("Lint(malformed) error = %q, want %q", err.Error(), want)
 		}
 	})
 

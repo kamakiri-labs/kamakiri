@@ -104,6 +104,11 @@ func TestCdnExitCode(t *testing.T) {
 		// reach cdnExit too.
 		{"Ctrl-C (cdn purge freshness wait)", freshness.ErrInterrupted, 130, false},
 		{"terminal flush block (cdn purge, ✗ on stdout)", freshness.ErrFlushBlocked, 1, false},
+		// A Ctrl-C at either WebAccel prompt is read as a byte, not taken as a
+		// signal, so it arrives as the prompt's own sentinel. The prompt has
+		// already closed its line, so nothing is echoed.
+		{"Ctrl-C at a WebAccel prompt", cdn.ErrInterrupted, 130, false},
+		{"Ctrl-C at a WebAccel prompt wrapped", fmt.Errorf("x: %w", cdn.ErrInterrupted), 130, false},
 		{"transport / API error", errors.New("connection refused"), 1, true},
 	}
 	for _, c := range cases {

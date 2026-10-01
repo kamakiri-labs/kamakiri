@@ -10,6 +10,7 @@ import (
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
+	"github.com/kamakiri-labs/kamakiri/internal/domain"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 )
 
@@ -142,6 +143,8 @@ func interruptBeforeWait(t *testing.T) {
 	signalCtx = func() (context.Context, context.CancelFunc) { return ctx, func() {} }
 }
 
+var _ domain.APIClient = (*mockClient)(nil)
+
 // The exits type-assert their client to the domain package's interface to run
 // the reverse cutover, so this mock has to satisfy that whole interface too.
 // Only ListDomains below carries behaviour; the rest exist to conform.
@@ -165,11 +168,11 @@ func (m *mockClient) AddDomain(siteID, domainName, role string, redirectStatus i
 	return nil, nil
 }
 
-func (m *mockClient) RemoveDomain(domainName string) (*api.RemoveDomainResult, error) {
+func (m *mockClient) RemoveDomain(siteID, domainName string) (*api.RemoveDomainResult, error) {
 	return nil, nil
 }
 
-func (m *mockClient) RecheckDomain(domainName string) (*api.Domain, error) {
+func (m *mockClient) RecheckDomain(siteID, domainName string) (*api.Domain, error) {
 	return nil, nil
 }
 
@@ -373,5 +376,47 @@ func TestCredentialsHealthAgeFloorRendersThroughItsOwnCopy(t *testing.T) {
 	want := i18n.Tf("cdn.credentials_failing_aged", i18n.Tf("cdn.elapsed_minutes", 1))
 	if !strings.Contains(out.String(), want) {
 		t.Errorf("credentials line = %q, want it to carry %q", out.String(), want)
+	}
+}
+
+// A failing Cloudflare credential axis is ours to fix: the block names
+// Cloudflare, says nothing needs changing, and never points at the WebAccel
+// credentials command.
+func TestWriteCredentialsHealthLineCloudflare(t *testing.T) {
+	var out bytes.Buffer
+	WriteCredentialsHealthLine(&out, &api.CDNStatusResponse{
+		CDNMode:              "cloudflare",
+		CdnCredentialsHealth: "failing",
+	}, "  ")
+	want := "  Cloudflare credentials are failing.\n" +
+		"  Nothing on your side needs to change. If this persists, write to support@kamakiri-labs.jp.\n"
+	if out.String() != want {
+		t.Errorf("Cloudflare credentials block:\n got: %q\nwant: %q", out.String(), want)
+	}
+}
+
+func TestWriteCredentialsHealthLineCloudflareAged(t *testing.T) {
+	var out bytes.Buffer
+	WriteCredentialsHealthLine(&out, &api.CDNStatusResponse{
+		CDNMode:                    "cloudflare",
+		CdnCredentialsHealth:       "failing",
+		CdnCredentialsLastFailedAt: time.Now().UTC().Format(time.RFC3339),
+	}, "")
+	want := "Cloudflare credentials are failing (last checked ~1m ago).\n" +
+		"Nothing on your side needs to change. If this persists, write to support@kamakiri-labs.jp.\n"
+	if out.String() != want {
+		t.Errorf("aged Cloudflare credentials block:\n got: %q\nwant: %q", out.String(), want)
+	}
+}
+
+func TestWriteCredentialsHealthLineWebAccelKeepsCommand(t *testing.T) {
+	var out bytes.Buffer
+	WriteCredentialsHealthLine(&out, &api.CDNStatusResponse{
+		CDNMode:              "webaccel",
+		CdnCredentialsHealth: "failing",
+	}, "")
+	want := "WebAccel API credentials are failing.\nRun `kamakiri cdn credentials` to update them.\n"
+	if out.String() != want {
+		t.Errorf("WebAccel credentials block:\n got: %q\nwant: %q", out.String(), want)
 	}
 }

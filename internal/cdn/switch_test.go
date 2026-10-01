@@ -61,7 +61,7 @@ func TestSwitchWebAccelToCloudflareComposes(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
-	t.Setenv(EnvSkipCertCheck, "1")
+	skipCertGate(t)
 	forceSwitchStreamable(t)
 	stubSignalCtxBackground(t)
 
@@ -124,7 +124,7 @@ func TestSwitchCloudflareToWebAccelComposes(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
-	t.Setenv(EnvSkipCertCheck, "1")
+	skipCertGate(t)
 	forceSwitchStreamable(t)
 	stubSignalCtxBackground(t)
 
@@ -470,7 +470,7 @@ func TestSwitchSourceNeverLiveStillProceedsToLeg2(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
-	t.Setenv(EnvSkipCertCheck, "1")
+	skipCertGate(t)
 	forceSwitchStreamable(t)
 	stubSignalCtxBackground(t)
 
@@ -516,7 +516,7 @@ func TestSwitchToWebAccelNotRefusedOnApex(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
-	t.Setenv(EnvSkipCertCheck, "1")
+	skipCertGate(t)
 	forceSwitchStreamable(t)
 	stubSignalCtxBackground(t)
 

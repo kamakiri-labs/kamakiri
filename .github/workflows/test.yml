@@ -39,6 +39,16 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The steps above check the build users run, which compiles the test-only
+      # environment hooks out. These check the build made with the testhooks
+      # tag, which compiles them in: the tests for the hooks themselves, in the
+      # only packages that read them, and vet over the whole tree.
+      - name: Test with the testhooks tag
+        run: go test -race -timeout 120s -tags testhooks ./internal/cdn/ ./internal/freshness/ ./internal/testhooks/
+
+      - name: Vet with the testhooks tag
+        run: go vet -tags testhooks ./...
+
       # The install and uninstall scripts are piped into whatever /bin/sh the
       # user has, so a bashism in either is a syntax error on a Debian or
       # Alpine machine and nothing else here would read the files at all. The

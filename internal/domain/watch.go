@@ -196,13 +196,20 @@ func watchToLiveCtx(ctx context.Context, client APIClient, siteID, domainName st
 // the priority window the first request opened decays, and the automatic
 // cadence alone would leave a settled row checked rarely.
 func watchVerifyCtx(ctx context.Context, client APIClient, siteID, domainName string, out io.Writer) error {
-	return watchToLive(client, siteID, domainName, out, watchOpts{
+	return watchToLive(client, siteID, domainName, out, verifyWatchOpts(ctx, client, siteID, domainName, out))
+}
+
+// verifyWatchOpts builds the options for watchVerifyCtx. Each re-issued recheck
+// carries siteID, as the first one did, so the server keeps scoping it to the
+// linked site.
+func verifyWatchOpts(ctx context.Context, client APIClient, siteID, domainName string, out io.Writer) watchOpts {
+	return watchOpts{
 		pollSchedule: defaultPollSchedule,
 		now:          time.Now,
 		isTTY:        isTerminalWriter(out),
 		ctx:          ctx,
-		reissue:      func() { _, _ = client.RecheckDomain(domainName) },
-	})
+		reissue:      func() { _, _ = client.RecheckDomain(siteID, domainName) },
+	}
 }
 
 // watchAllToLiveCtx runs the multi-domain go-live watch under a caller-owned

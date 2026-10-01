@@ -145,6 +145,14 @@ func TestFormatBlocker(t *testing.T) {
 			},
 		},
 		{
+			name: "credentials_rejected on Cloudflare has nothing for the user to do",
+			b:    api.Blocker{Provider: "cloudflare", Host: "shop.example.com", Reason: "credentials_rejected"},
+			want: []string{
+				"✗ Deployed, but the Cloudflare cache was not flushed: Cloudflare rejected the credentials Kamakiri uses to flush your cache.",
+				"  Nothing on your side needs to change, and the flush is retried automatically. If this persists, write to support@kamakiri-labs.jp and quote this line.",
+			},
+		},
+		{
 			name: "resource_deleted names the provider command",
 			b:    api.Blocker{Provider: "webaccel", Host: "shop.example.com", Reason: "resource_deleted"},
 			want: []string{
@@ -209,6 +217,19 @@ func TestFormatBlockerWithoutLead(t *testing.T) {
 	}
 	if strings.Contains(got[0], "Deployed, but") || strings.Contains(got[0], "was not flushed") {
 		t.Fatalf("status lead must state a present condition, not a past action: %q", got[0])
+	}
+}
+
+// A Cloudflare credential failure must never send the user to a command that
+// answers 409 for their site, and must never ask them for a key they do not hold.
+func TestFormatBlockerCloudflareCredentialsNamesNoCommand(t *testing.T) {
+	got := FormatBlocker("", api.Blocker{Provider: "cloudflare", Host: "h", Reason: "credentials_rejected"})
+	want := "✗ The Cloudflare cache is not flushed: Cloudflare rejected the credentials Kamakiri uses to flush your cache."
+	if got[0] != want {
+		t.Fatalf("headline:\n got: %q\nwant: %q", got[0], want)
+	}
+	if strings.Contains(strings.Join(got, "\n"), "kamakiri cdn credentials") {
+		t.Fatalf("Cloudflare advice names kamakiri cdn credentials: %q", got)
 	}
 }
 
@@ -792,7 +813,7 @@ func TestWaitCtrlCViaOptsCtx(t *testing.T) {
 	if !errors.Is(err, ErrInterrupted) {
 		t.Fatalf("err = %v, want ErrInterrupted", err)
 	}
-	assertDetach(t, buf.String(), "The deploy", "kamakiri deploy")
+	assertDetach(t, buf.String(), "The deploy", "Run kamakiri status to see when it is live.")
 }
 
 func TestWaitCtrlCViaSignalCtxSeam(t *testing.T) {
@@ -811,16 +832,36 @@ func TestWaitCtrlCViaSignalCtxSeam(t *testing.T) {
 	if !errors.Is(err, ErrInterrupted) {
 		t.Fatalf("err = %v, want ErrInterrupted", err)
 	}
-	assertDetach(t, buf.String(), "The rollback", "kamakiri rollback")
+	assertDetach(t, buf.String(), "The rollback", "Run kamakiri status to see when it is live.")
 }
 
-func assertDetach(t *testing.T, out, noun, reRun string) {
-	t.Helper()
-	if !strings.Contains(out, "Detached. "+noun+" is committed and keeps converging on its own.") {
-		t.Errorf("missing detach line 1 for %q:\n%s", noun, out)
+// A purge makes nothing newly live, so its resume line promises the flush
+// rather than a live site.
+func TestWaitCtrlCDuringAPurge(t *testing.T) {
+	var buf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	clk := &fakeClock{t: base, step: time.Second}
+	pend := sitePending(cdnTarget("webaccel", "shop.example.com", iso(base)))
+	c := &scriptClient{steps: pendingSteps(pend), onPoll: func(int) { cancel() }}
+
+	err := wait(c, "site1", PurgeMsgs(), &buf, testOpts(clk.Now, false, ctx))
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v, want ErrInterrupted", err)
 	}
-	if !strings.Contains(out, "Check kamakiri status, or re-run "+reRun+" to watch again.") {
-		t.Errorf("missing detach line 2 for %q:\n%s", reRun, out)
+	assertDetach(t, buf.String(), "The purge", "Run kamakiri status to see when the caches are flushed.")
+}
+
+// assertDetach pins the two-line detach block exactly, and that it offers no
+// re-run: running the command again would start a second deploy, rollback or
+// purge rather than resume watching the first.
+func assertDetach(t *testing.T, out, noun, resume string) {
+	t.Helper()
+	want := "Detached. " + noun + " is committed and keeps converging on its own.\n" + resume + "\n"
+	if !strings.HasSuffix(out, want) {
+		t.Errorf("detach block for %q: want output ending in\n%q\ngot\n%q", noun, want, out)
+	}
+	if strings.Contains(strings.ToLower(out), "re-run") {
+		t.Errorf("detach block for %q must not advise a re-run:\n%s", noun, out)
 	}
 }
 
@@ -831,17 +872,17 @@ func TestPerCommandCopy(t *testing.T) {
 		gerund      string
 		fresh       string
 		lead        string
-		reRun       string
+		resume      string
 		showLiveURL bool
 	}{
-		{"deploy", DeployMsgs(), "publishing", "✓ live", "Deployed, but", "kamakiri deploy", true},
-		{"rollback", RollbackMsgs(), "rolling back", "✓ live", "Rolled back, but", "kamakiri rollback", true},
-		{"purge", PurgeMsgs(), "flushing caches", "✓ caches flushed", "Caches purged, but", "kamakiri cdn purge", false},
+		{"deploy", DeployMsgs(), "publishing", "✓ live", "Deployed, but", "Run kamakiri status to see when it is live.", true},
+		{"rollback", RollbackMsgs(), "rolling back", "✓ live", "Rolled back, but", "Run kamakiri status to see when it is live.", true},
+		{"purge", PurgeMsgs(), "flushing caches", "✓ caches flushed", "Caches purged, but", "Run kamakiri status to see when the caches are flushed.", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := tc.m
 			if m.gerund != tc.gerund || m.fresh != tc.fresh || m.lead != tc.lead ||
-				m.reRun != tc.reRun || m.showLiveURL != tc.showLiveURL {
+				m.resume != tc.resume || m.showLiveURL != tc.showLiveURL {
 				t.Fatalf("copy mismatch for %s: %+v", tc.name, m)
 			}
 
@@ -874,30 +915,22 @@ func TestWaitPassesSiteID(t *testing.T) {
 	}
 }
 
-// The fallback arms matter as much as the override: a stray or malformed value
-// in a real user's environment must not silently slow, or busy-loop, a wait.
+// pollProbes straddle defaultPollSchedule's boundaries, so a schedule that
+// matches def at each of them is shown to reproduce that schedule rather than
+// any one constant.
+var pollProbes = []struct {
+	elapsed time.Duration
+	def     time.Duration
+}{
+	{time.Second, 2 * time.Second},
+	{5 * time.Minute, 10 * time.Second},
+	{30 * time.Minute, 30 * time.Second},
+}
+
+// The fallback arms still matter: in a testhooks build, a malformed or
+// non-positive value must not busy-loop or stall a wait. Only the tagged leg
+// exercises them, since a build without the tag never reads the variable.
 func TestPollScheduleFromEnv(t *testing.T) {
-	// These straddle defaultPollSchedule's boundaries, so a fallback is shown to
-	// reproduce that schedule rather than any one constant.
-	probes := []struct {
-		elapsed time.Duration
-		def     time.Duration
-	}{
-		{time.Second, 2 * time.Second},
-		{5 * time.Minute, 10 * time.Second},
-		{30 * time.Minute, 30 * time.Second},
-	}
-
-	t.Run("positive value polls at that fixed interval", func(t *testing.T) {
-		t.Setenv(EnvFreshnessPollMS, "200")
-		sched := pollScheduleFromEnv()
-		for _, p := range probes {
-			if got := sched(p.elapsed); got != 200*time.Millisecond {
-				t.Errorf("at elapsed=%s: got %s, want 200ms", p.elapsed, got)
-			}
-		}
-	})
-
 	for _, tc := range []struct {
 		name, val string
 		set       bool
@@ -918,7 +951,7 @@ func TestPollScheduleFromEnv(t *testing.T) {
 				os.Unsetenv(EnvFreshnessPollMS)
 			}
 			sched := pollScheduleFromEnv()
-			for _, p := range probes {
+			for _, p := range pollProbes {
 				if got := sched(p.elapsed); got != p.def {
 					t.Errorf("at elapsed=%s: got %s, want default %s", p.elapsed, got, p.def)
 				}

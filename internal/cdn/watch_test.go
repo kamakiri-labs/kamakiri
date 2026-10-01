@@ -35,6 +35,24 @@ func (s *scriptClient) CDNStatus(string) (*api.CDNStatusResponse, error) {
 	return f, nil
 }
 
+// setLiveCertCheck replaces the probe the production watch hands its gate, for
+// the rest of the test. The probe is package state, so no test that calls this
+// may run in parallel.
+func setLiveCertCheck(t *testing.T, check func(ctx context.Context, host, mode string) error) {
+	t.Helper()
+	prev := liveCertCheck
+	t.Cleanup(func() { liveCertCheck = prev })
+	liveCertCheck = check
+}
+
+// skipCertGate turns the certificate gate off for a test that runs the
+// production watch against hosts with no real edge behind them, where the probe
+// could never pass and the gate would block forever.
+func skipCertGate(t *testing.T) {
+	t.Helper()
+	setLiveCertCheck(t, nil)
+}
+
 // testOpts builds deterministic watch options: a negligible poll cadence, a
 // fake clock that advances a second per read, and append-only output.
 func testOpts(ctx context.Context) cdnWatchOpts {
@@ -1109,24 +1127,6 @@ func TestEvalEdgeResponse(t *testing.T) {
 				t.Errorf("evalEdgeResponse(%q, %d, %v) = %v, want nil", tc.mode, tc.status, tc.header, err)
 			}
 		})
-	}
-}
-
-// With the gate disabled the production entry point still reaches live, just
-// without the certificate milestone.
-func TestWatchToLiveSkipCertCheckEnv(t *testing.T) {
-	t.Setenv(EnvSkipCertCheck, "1")
-	client := &scriptClient{frames: []*api.CDNStatusResponse{cf(CdnStateActive)}}
-	var out bytes.Buffer
-	if err := WatchToLive(client, "s1", "cloudflare", &out); err != nil {
-		t.Fatal(err)
-	}
-	got := out.String()
-	if !strings.Contains(got, "✓ live via Cloudflare") {
-		t.Errorf("missing live line: %q", got)
-	}
-	if strings.Contains(got, "checking SSL certificate") {
-		t.Errorf("cert gate must be skipped when %s is set: %q", EnvSkipCertCheck, got)
 	}
 }
 

@@ -16,13 +16,15 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/headers"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 	"github.com/kamakiri-labs/kamakiri/internal/redirects"
+	"github.com/kamakiri-labs/kamakiri/internal/sizelimit"
 )
 
 const progressThreshold = 50 * 1024 * 1024
 
 // APIClient is the API surface the deploy flow needs. Deploy uploads the
-// tarball and returns once the server has queued it; GetSite backs the
-// freshness wait that follows.
+// tarball and returns once the server has queued it. GetSite reads the site
+// once before packing, for its per-deploy size limit, and then backs the
+// freshness wait that follows the upload.
 type APIClient interface {
 	Deploy(config []byte, tarball io.Reader) (*api.DeployResult, error)
 	GetSite(id string) (*api.Site, error)
@@ -85,7 +87,29 @@ func Run(client APIClient, path string, noWait bool, out io.Writer) error {
 		}
 	}
 
-	info, err := prepareTarball(path)
+	// The site is read for every deploy, archive or directory, before anything
+	// is packed. An answer the upload would get as well (see conclusiveRefusal)
+	// ends the deploy here with the error the upload would have produced. Any
+	// other failed read does not stop it: the server is the authority on every
+	// limit, so the local check falls back to MaxTotalSize and the upload goes
+	// ahead.
+	site, err := client.GetSite(config.ID)
+	if err != nil {
+		if conclusiveRefusal(err) {
+			return api.MapError(err)
+		}
+		site = nil
+	}
+
+	// A desired status of deleted means a teardown was accepted, whether it is
+	// still running, failed and left this directory linked, or has finished.
+	// The server refuses the upload too, but only after it was packed and sent,
+	// so this check stops the deploy before any of that work is done.
+	if site != nil && site.Status == "deleted" {
+		return errors.New(i18n.T("api.err_site_torn_down"))
+	}
+
+	info, err := prepareTarball(path, sizeLimit(site))
 	if err != nil {
 		return err
 	}
@@ -169,7 +193,10 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func prepareTarball(path string) (*tarballInfo, error) {
+// prepareTarball opens what path names for upload. maxTotalSize bounds a
+// directory only: an archive is sent as given, since measuring what it holds
+// would mean decompressing it, and the server checks it on arrival.
+func prepareTarball(path string, maxTotalSize int64) (*tarballInfo, error) {
 	stat, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -179,7 +206,7 @@ func prepareTarball(path string) (*tarballInfo, error) {
 	}
 
 	if stat.IsDir() {
-		return prepareDirTarball(path)
+		return prepareDirTarball(path, maxTotalSize)
 	}
 
 	lower := strings.ToLower(path)
@@ -190,11 +217,11 @@ func prepareTarball(path string) (*tarballInfo, error) {
 	return nil, errors.New(i18n.T("deploy.err_unsupported_archive"))
 }
 
-func prepareDirTarball(dir string) (*tarballInfo, error) {
-	reader, stats, err := Create(dir)
+func prepareDirTarball(dir string, maxTotalSize int64) (*tarballInfo, error) {
+	reader, stats, err := Create(dir, maxTotalSize)
 	if err != nil {
 		if errors.Is(err, ErrTooLarge) {
-			return nil, errors.New(i18n.T("deploy.err_too_large"))
+			return nil, errors.New(i18n.Tf("deploy.err_too_large", sizelimit.MB(maxTotalSize)))
 		}
 		if errors.Is(err, ErrTooManyFiles) {
 			return nil, errors.New(i18n.T("deploy.err_too_many_files"))
@@ -240,6 +267,34 @@ func prepareArchive(path string, info os.FileInfo) (*tarballInfo, error) {
 		size:     info.Size(),
 		fileName: filepath.Base(path),
 	}, nil
+}
+
+// sizeLimit is the uncompressed size a directory deploy may carry: the plan's
+// per-deploy limit from the site read, or MaxTotalSize when there is no site or
+// it carries no usable limit (an older server sends no quota block). A limit of
+// zero or less counts as absent: a quota block without the field decodes to
+// zero, which cannot be told apart from no limit sent, and the server applies
+// its own limit to the upload either way.
+func sizeLimit(site *api.Site) int64 {
+	if site != nil && site.Quota != nil && site.Quota.MaxSnapshotBytes > 0 {
+		return site.Quota.MaxSnapshotBytes
+	}
+	return MaxTotalSize
+}
+
+// conclusiveRefusal reports whether a failed site read is an answer the upload
+// would get too: a rejected key, a CLI version the server refuses, or a site
+// it does not know. A transport error, a server error or any other refusal
+// could be transient or specific to the read, so the deploy carries on.
+func conclusiveRefusal(err error) bool {
+	if errors.Is(err, api.ErrUpgradeRequired) {
+		return true
+	}
+	var apiErr *api.ErrorResponse
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == "unauthorized" || apiErr.Code == "site_not_found"
+	}
+	return false
 }
 
 func formatBytes(b int64) string {

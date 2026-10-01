@@ -53,7 +53,7 @@ func TestRegisterSuccess(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	resp, err := client.Register("user@example.com", true, "abc123hash")
+	resp, err := client.Register("user@example.com", true, "abc123hash", false)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
@@ -73,7 +73,7 @@ func TestRegisterInvalidEmail(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	_, err := client.Register("bad", true, "somehash")
+	_, err := client.Register("bad", true, "somehash", false)
 	if err == nil {
 		t.Fatal("Register() expected error, got nil")
 	}
@@ -167,6 +167,117 @@ func TestVerifyTooManyAttempts(t *testing.T) {
 		t.Errorf("code = %q, want too_many_attempts", apiErr.Code)
 	}
 }
+
+// The server tells a first request from a request for a new code only by the
+// resend field, and refuses a resend that is not a JSON boolean, so the body
+// has to carry it as one on every request, false included.
+func TestRegisterSendsResendAsABoolean(t *testing.T) {
+	for _, resend := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resend=%t", resend), func(t *testing.T) {
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decoding the request body: %v", err)
+				}
+				io.WriteString(w, `{"message":"Confirmation code sent.","status":"sent","expires_in":600}`)
+			}))
+			defer server.Close()
+
+			if _, err := NewClient(server.URL).Register("user@example.com", true, "abc123hash", resend); err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+			server.Close()
+
+			value, present := body["resend"]
+			if !present {
+				t.Fatalf("request body %v carries no resend", body)
+			}
+			got, isBool := value.(bool)
+			if !isBool {
+				t.Fatalf("resend = %#v (%T), want a JSON boolean", value, value)
+			}
+			if got != resend {
+				t.Errorf("resend = %t, want %t", got, resend)
+			}
+		})
+	}
+}
+
+// The field names below are the server's; a register answer decoded under any
+// other name would read as an older server's and silently lose the resume.
+func TestRegisterDecodesStatusAndExpiry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"message":"A confirmation code is already pending.","status":"pending","expires_in":420}`)
+	}))
+	defer server.Close()
+
+	resp, err := NewClient(server.URL).Register("user@example.com", true, "abc123hash", false)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	want := RegisterResponse{Message: "A confirmation code is already pending.", Status: "pending", ExpiresIn: 420}
+	if *resp != want {
+		t.Errorf("Register() = %+v, want %+v", *resp, want)
+	}
+}
+
+func TestRegisterCooldownDecodesRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "37")
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"code":"rate_limited","message":"Please wait.","retry_after":37}`)
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).Register("user@example.com", true, "abc123hash", true)
+	apiErr, ok := err.(*ErrorResponse)
+	if !ok {
+		t.Fatalf("Register() error = %v (%T), want *ErrorResponse", err, err)
+	}
+	if apiErr.Code != "rate_limited" || apiErr.RetryAfter != 37 {
+		t.Errorf("Register() error = {Code: %q, RetryAfter: %d}, want {rate_limited, 37}", apiErr.Code, apiErr.RetryAfter)
+	}
+}
+
+// attempts_left is decoded into a pointer because 0 is an answer of its own
+// (no attempts are left for this code), distinct from the field being absent
+// (the server did not say).
+func TestVerifyDecodesAttemptsLeft(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want *int
+	}{
+		{"zero", `{"code":"invalid_code","message":"Invalid or expired code.","attempts_left":0}`, intPtr(0)},
+		{"three", `{"code":"invalid_code","message":"Invalid or expired code.","attempts_left":3}`, intPtr(3)},
+		{"absent", `{"code":"invalid_code","message":"Invalid or expired code."}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			_, err := NewClient(server.URL).Verify("user@example.com", "WRONG1", "some_secret")
+			apiErr, ok := err.(*ErrorResponse)
+			if !ok {
+				t.Fatalf("Verify() error = %v (%T), want *ErrorResponse", err, err)
+			}
+			switch {
+			case tc.want == nil && apiErr.AttemptsLeft != nil:
+				t.Errorf("AttemptsLeft = %d, want absent", *apiErr.AttemptsLeft)
+			case tc.want != nil && apiErr.AttemptsLeft == nil:
+				t.Errorf("AttemptsLeft absent, want %d", *tc.want)
+			case tc.want != nil && *apiErr.AttemptsLeft != *tc.want:
+				t.Errorf("AttemptsLeft = %d, want %d", *apiErr.AttemptsLeft, *tc.want)
+			}
+		})
+	}
+}
+
+func intPtr(n int) *int { return &n }
 
 func TestCreateSiteSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -656,7 +767,7 @@ func TestRemoveDomainSuccess(t *testing.T) {
 	defer server.Close()
 
 	client := &Client{BaseURL: server.URL, APIKey: "kk_live_test", HTTPClient: http.DefaultClient}
-	result, err := client.RemoveDomain("www.example.com")
+	result, err := client.RemoveDomain("site123", "www.example.com")
 	if err != nil {
 		t.Fatalf("RemoveDomain() error = %v", err)
 	}
@@ -676,13 +787,135 @@ func TestRemoveDomainNotFound(t *testing.T) {
 	defer server.Close()
 
 	client := &Client{BaseURL: server.URL, APIKey: "kk_live_test", HTTPClient: http.DefaultClient}
-	_, err := client.RemoveDomain("nonexistent.com")
+	_, err := client.RemoveDomain("site123", "nonexistent.com")
 	apiErr, ok := err.(*ErrorResponse)
 	if !ok {
 		t.Fatalf("expected *ErrorResponse, got %T", err)
 	}
 	if apiErr.Code != "domain_not_found" {
 		t.Errorf("code = %q", apiErr.Code)
+	}
+}
+
+// The by-name domain calls carry the linked site's id as their only query
+// value, after the escaped host, so the server can refuse a host attached to
+// another of the account's sites.
+func TestDomainByNameCallsSendTheSiteID(t *testing.T) {
+	cases := []struct {
+		name      string
+		siteID    string
+		call      func(c *Client, siteID string) error
+		method    string
+		path      string
+		wantQuery string
+	}{
+		{
+			name:   "remove",
+			siteID: "site123",
+			call: func(c *Client, siteID string) error {
+				_, err := c.RemoveDomain(siteID, "www.example.com")
+				return err
+			},
+			method:    "DELETE",
+			path:      "/v1/pages/domains/www.example.com",
+			wantQuery: "site_id=site123",
+		},
+		{
+			name:   "recheck",
+			siteID: "site123",
+			call: func(c *Client, siteID string) error {
+				_, err := c.RecheckDomain(siteID, "www.example.com")
+				return err
+			},
+			method:    "POST",
+			path:      "/v1/pages/domains/www.example.com/recheck",
+			wantQuery: "site_id=site123",
+		},
+		{
+			name:   "remove encodes the id as a query value",
+			siteID: "a&b=c",
+			call: func(c *Client, siteID string) error {
+				_, err := c.RemoveDomain(siteID, "www.example.com")
+				return err
+			},
+			method:    "DELETE",
+			path:      "/v1/pages/domains/www.example.com",
+			wantQuery: "site_id=a%26b%3Dc",
+		},
+		{
+			name:   "remove sends an empty id as an empty value",
+			siteID: "",
+			call: func(c *Client, siteID string) error {
+				_, err := c.RemoveDomain(siteID, "www.example.com")
+				return err
+			},
+			method:    "DELETE",
+			path:      "/v1/pages/domains/www.example.com",
+			wantQuery: "site_id=",
+		},
+		{
+			name:   "recheck escapes the host in the path",
+			siteID: "site123",
+			call: func(c *Client, siteID string) error {
+				_, err := c.RecheckDomain(siteID, "a?b.example.com")
+				return err
+			},
+			method:    "POST",
+			path:      "/v1/pages/domains/a%3Fb.example.com/recheck",
+			wantQuery: "site_id=site123",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != tc.method {
+					t.Errorf("method = %q, want %q", r.Method, tc.method)
+				}
+				if r.URL.EscapedPath() != tc.path {
+					t.Errorf("path = %q, want %q", r.URL.EscapedPath(), tc.path)
+				}
+				if r.URL.RawQuery != tc.wantQuery {
+					t.Errorf("query = %q, want %q", r.URL.RawQuery, tc.wantQuery)
+				}
+				if got := r.URL.Query()["site_id"]; len(got) != 1 || got[0] != tc.siteID {
+					t.Errorf("site_id values = %q, want exactly [%q]", got, tc.siteID)
+				}
+				w.WriteHeader(200)
+				io.WriteString(w, `{"site_id":"site123","sync_attempt_id":1}`)
+			}))
+			defer server.Close()
+
+			client := &Client{BaseURL: server.URL, APIKey: "kk_live_test", HTTPClient: http.DefaultClient}
+			if err := tc.call(client, tc.siteID); err != nil {
+				t.Fatalf("call error = %v", err)
+			}
+		})
+	}
+}
+
+// A domain_on_other_site refusal names the site the host is attached to in
+// its subdomain field, which the domain commands render.
+func TestErrorResponseCarriesSubdomain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(409)
+		io.WriteString(w, `{"code":"domain_on_other_site","message":"www.example.com is attached to another of your sites (blog).","subdomain":"blog"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, APIKey: "kk_live_test", HTTPClient: http.DefaultClient}
+	_, err := client.RemoveDomain("site123", "www.example.com")
+	apiErr, ok := err.(*ErrorResponse)
+	if !ok {
+		t.Fatalf("expected *ErrorResponse, got %T (%v)", err, err)
+	}
+	if apiErr.Code != "domain_on_other_site" {
+		t.Errorf("code = %q", apiErr.Code)
+	}
+	if apiErr.Subdomain != "blog" {
+		t.Errorf("subdomain = %q, want blog", apiErr.Subdomain)
+	}
+	if apiErr.Message != "www.example.com is attached to another of your sites (blog)." {
+		t.Errorf("message = %q", apiErr.Message)
 	}
 }
 
@@ -778,7 +1011,6 @@ func TestMapError(t *testing.T) {
 		want string
 	}{
 		{"site_not_found", "site not found"},
-		{"forbidden", "you don't own this site"},
 		{"unauthorized", "invalid API key"},
 		{"invalid_subdomain", "invalid subdomain"},
 		{"subdomain_reserved", "that subdomain is reserved. Choose another"},
@@ -786,12 +1018,13 @@ func TestMapError(t *testing.T) {
 		{"domain_taken", "already attached to another site. One host serves one site"},
 		{"registration_limit", "too many pending registrations"},
 		{"domain_reserved", "that domain is part of Kamakiri's own namespace, so it can't be used as a custom domain"},
-		{"canonical_exists", "site already has a canonical domain"},
+		{"canonical_exists", "another domain change on this site landed at the same moment. Run the command again"},
 		{"no_canonical", "set a canonical domain first"},
 		{"has_redirect_domains", "remove redirect domains"},
 		{"is_canonical", "kamakiri domain unset"},
 		{"domain_not_found", "domain not found"},
 		{"invalid_domain", "invalid domain name"},
+		{"site_deleted", "this site is being torn down or has been torn down. Run \"kamakiri teardown\" to retry or finish the teardown"},
 		{"no_live_deploy", "no published content to purge. Run \"kamakiri deploy <path>\" first"},
 	}
 
@@ -854,6 +1087,24 @@ func TestMapErrorUnknownCode(t *testing.T) {
 	err := MapError(apiErr)
 	if err != apiErr {
 		t.Errorf("MapError should return original ErrorResponse for unknown codes, got %v", err)
+	}
+}
+
+// A wrapped *ErrorResponse is still an API refusal: a known code is mapped and
+// an unknown one comes back as the wrapper itself, not the unwrapped response.
+func TestMapErrorWrapped(t *testing.T) {
+	known := fmt.Errorf("rollback: %w", &ErrorResponse{Code: "site_deleted", Message: "raw"})
+	if got := MapError(known).Error(); !strings.Contains(got, "this site is being torn down or has been torn down") {
+		t.Errorf("a wrapped known code must be mapped, got %q", got)
+	}
+
+	unknown := fmt.Errorf("rollback: %w", &ErrorResponse{Code: "unknown_code", Message: "raw"})
+	got := MapError(unknown)
+	if got != unknown {
+		t.Errorf("a wrapped unknown code must come back as the same wrapped error, got %v", got)
+	}
+	if !errors.Is(got, unknown) {
+		t.Errorf("errors.Is on the wrapper must hold, got %v", got)
 	}
 }
 
@@ -1154,13 +1405,6 @@ func TestMapErrorInvalidMode(t *testing.T) {
 	err := MapError(&ErrorResponse{Code: "invalid_mode"})
 	if err.Error() != "unknown CDN mode" {
 		t.Errorf("MapError(invalid_mode) = %q", err.Error())
-	}
-}
-
-func TestMapErrorInvalidCredentials(t *testing.T) {
-	err := MapError(&ErrorResponse{Code: "invalid_credentials"})
-	if err.Error() != "CDN credentials are invalid" {
-		t.Errorf("MapError(invalid_credentials) = %q", err.Error())
 	}
 }
 

@@ -173,3 +173,19 @@ func TestValueIntegrationWithSplitArg(t *testing.T) {
 		t.Errorf("space-form: got (%q, %d, %v)", v, next, err)
 	}
 }
+
+func TestRedact(t *testing.T) {
+	tests := []struct{ arg, want string }{
+		{"--a=b", "--a"},
+		{"-a=b", "-a"},
+		{"--a", "--a"},
+		{"a=b", "a=b"},
+		{"--=x", "--"},
+		{"--a=b=c", "--a"},
+	}
+	for _, tt := range tests {
+		if got := Redact(tt.arg); got != tt.want {
+			t.Errorf("Redact(%q) = %q, want %q", tt.arg, got, tt.want)
+		}
+	}
+}

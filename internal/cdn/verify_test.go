@@ -38,7 +38,7 @@ func TestVerifyResumesWatch(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
-	t.Setenv(EnvSkipCertCheck, "1")
+	skipCertGate(t)
 
 	statusCalls := 0
 	client := &mockClient{

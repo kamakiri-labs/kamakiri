@@ -298,28 +298,6 @@ func TestRollbackSiteNotFound(t *testing.T) {
 	}
 }
 
-func TestRollbackForbidden(t *testing.T) {
-	t.Chdir(t.TempDir())
-	setupCredentials(t)
-	setupProject(t)
-
-	client := &mockClient{
-		rollbackFn: func(_, _ string) (*api.DeployResult, error) {
-			return nil, &api.ErrorResponse{Code: "forbidden", Message: "Not your site."}
-		},
-		getSiteFn: flunkGetSite(t),
-	}
-
-	var out bytes.Buffer
-	err := Run(client, "20260401-100000-000", false, &out)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "don't own") {
-		t.Errorf("expected mapped error, got: %q", err.Error())
-	}
-}
-
 func TestRollbackUnauthorized(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)

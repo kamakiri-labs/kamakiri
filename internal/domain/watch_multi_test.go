@@ -41,13 +41,13 @@ func (c *framesClient) UnsetCanonical(string) (*api.UnsetCanonicalResult, error)
 func (c *framesClient) AddDomain(string, string, string, int) (*api.Domain, error) {
 	return nil, nil
 }
-func (c *framesClient) RemoveDomain(string) (*api.RemoveDomainResult, error) {
+func (c *framesClient) RemoveDomain(string, string) (*api.RemoveDomainResult, error) {
 	return nil, nil
 }
 func (c *framesClient) GetSite(string) (*api.Site, error) {
 	return nil, nil
 }
-func (c *framesClient) RecheckDomain(string) (*api.Domain, error) {
+func (c *framesClient) RecheckDomain(string, string) (*api.Domain, error) {
 	return nil, nil
 }
 

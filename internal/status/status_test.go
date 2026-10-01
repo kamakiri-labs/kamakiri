@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -43,12 +44,12 @@ type mockClient struct {
 	getSiteFn       func(id string) (*api.Site, error)
 	listDomainsFn   func(siteID string) (*api.DomainList, error)
 	cdnStatusFn     func(siteID string) (*api.CDNStatusResponse, error)
-	recheckDomainFn func(domain string) (*api.Domain, error)
+	recheckDomainFn func(siteID, domain string) (*api.Domain, error)
 }
 
-func (m *mockClient) RecheckDomain(domain string) (*api.Domain, error) {
+func (m *mockClient) RecheckDomain(siteID, domain string) (*api.Domain, error) {
 	if m.recheckDomainFn != nil {
-		return m.recheckDomainFn(domain)
+		return m.recheckDomainFn(siteID, domain)
 	}
 	return nil, errors.New("RecheckDomain not stubbed")
 }
@@ -294,17 +295,35 @@ func TestStatusWithQuota(t *testing.T) {
 	assertContains(t, out, "Max deploy:   100 MB")
 }
 
-func TestFormatMaxDeploy(t *testing.T) {
-	cases := map[int64]string{
-		100 * 1024 * 1024:       "100 MB",
-		25 * 1024 * 1024:        "25 MB",
-		25*1024*1024 + 512*1024: "25.5 MB", // a non-MB-aligned override keeps one decimal
-	}
+func TestStatusMaxDeployRendersAsTheServerDoes(t *testing.T) {
+	for _, tc := range []struct {
+		bytes int64
+		want  string
+	}{
+		{100 << 20, "100 MB"},
+		{3 << 19, "1.5 MB"},
+		{512 << 10, "0.5 MB"},
+		{1 << 18, "0.3 MB"},
+		{1<<20 - 1, "1 MB"},
+		{40000, "0 MB"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	for bytes, want := range cases {
-		if got := formatMaxDeploy(bytes); got != want {
-			t.Errorf("formatMaxDeploy(%d) = %q, want %q", bytes, got, want)
-		}
+			core.SaveCredentials("kk_live_test", "user@example.com")
+			core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+			client := &mockClient{
+				getSiteFn: func(id string) (*api.Site, error) {
+					return &api.Site{ID: id, Quota: &api.Quota{MaxSnapshotBytes: tc.bytes}}, nil
+				},
+			}
+
+			var buf bytes.Buffer
+			Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+			assertContains(t, buf.String(), "Max deploy:   "+tc.want+"\n")
+		})
 	}
 }
 
@@ -971,7 +990,7 @@ func newNudgeClient(t *testing.T, recheckShouldBeCalled bool) *mockClient {
 				},
 			}}, nil
 		},
-		recheckDomainFn: func(d string) (*api.Domain, error) {
+		recheckDomainFn: func(_, d string) (*api.Domain, error) {
 			if !recheckShouldBeCalled {
 				t.Fatalf("RecheckDomain must NOT be called by a pure `status` read (called with %q)", d)
 			}
@@ -1017,11 +1036,13 @@ func TestStatusRecheckOptInCallsRecheckAndUsesInBurstFraming(t *testing.T) {
 	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
 
 	called := false
+	var gotSiteID string
 	client := newNudgeClient(t, true)
 	inner := client.recheckDomainFn
-	client.recheckDomainFn = func(d string) (*api.Domain, error) {
+	client.recheckDomainFn = func(siteID, d string) (*api.Domain, error) {
 		called = true
-		return inner(d)
+		gotSiteID = siteID
+		return inner(siteID, d)
 	}
 
 	var buf, errBuf bytes.Buffer
@@ -1030,6 +1051,11 @@ func TestStatusRecheckOptInCallsRecheckAndUsesInBurstFraming(t *testing.T) {
 
 	if !called {
 		t.Fatal("`status --recheck` must call RecheckDomain")
+	}
+	// The recheck is scoped to the linked site, the one whose domains the page
+	// lists.
+	if gotSiteID != "site123" {
+		t.Errorf("RecheckDomain site id = %q, want the linked site123", gotSiteID)
 	}
 	// The recheck just opened the probe window, so in-burst framing
 	// (with a small ETA) is truthful here.
@@ -1047,7 +1073,7 @@ func TestStatusRecheckRateLimitedIsNonFatal(t *testing.T) {
 	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
 
 	client := newNudgeClient(t, true)
-	client.recheckDomainFn = func(string) (*api.Domain, error) {
+	client.recheckDomainFn = func(string, string) (*api.Domain, error) {
 		return nil, &api.ErrorResponse{Code: "rate_limited", Message: "Too many requests."}
 	}
 
@@ -1065,6 +1091,36 @@ func TestStatusRecheckRateLimitedIsNonFatal(t *testing.T) {
 	}
 }
 
+// A torn-down site's recheck is refused with site_deleted. Status prints its
+// own teardown line, and the "server keeps checking" tail would be false, so
+// the loop says nothing. The refusal is wrapped, so the match must see through
+// a wrapper.
+func TestStatusRecheckSiteDeletedIsQuiet(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	client := newNudgeClient(t, true)
+	called := false
+	client.recheckDomainFn = func(string, string) (*api.Domain, error) {
+		called = true
+		return nil, fmt.Errorf("recheck: %w", &api.ErrorResponse{Code: "site_deleted", Message: "This site is being torn down or has been torn down."})
+	}
+
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	if err != nil {
+		t.Errorf("a refused recheck must not fail the command, got %v", err)
+	}
+	if !called {
+		t.Fatal("the recheck was never requested, so the test proves nothing")
+	}
+	if errBuf.String() != "" {
+		t.Errorf("a site_deleted recheck must be quiet, got %q", errBuf.String())
+	}
+}
+
 func TestStatusRecheckTransientFailureWarnsAndStillRenders(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -1072,7 +1128,7 @@ func TestStatusRecheckTransientFailureWarnsAndStillRenders(t *testing.T) {
 	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
 
 	client := newNudgeClient(t, true)
-	client.recheckDomainFn = func(string) (*api.Domain, error) {
+	client.recheckDomainFn = func(string, string) (*api.Domain, error) {
 		return nil, errors.New("connection refused")
 	}
 
@@ -1096,7 +1152,7 @@ func TestStatusRecheckReplacesTheRowWithTheFreshOne(t *testing.T) {
 	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
 
 	client := newNudgeClient(t, true)
-	client.recheckDomainFn = func(d string) (*api.Domain, error) {
+	client.recheckDomainFn = func(_, d string) (*api.Domain, error) {
 		return &api.Domain{Domain: d, Role: "canonical", State: "serving"}, nil
 	}
 
@@ -1524,6 +1580,39 @@ func TestStatusFreshnessBlockerEntryNonVerbLead(t *testing.T) {
 	// line may sit above it claiming the site is still on its way up.
 	if strings.Contains(out, "still going live") || strings.Contains(out, "Edge cache:") {
 		t.Errorf("a blocked verdict must not print a converging line above its ✗ entry:\n%s", out)
+	}
+}
+
+// A Cloudflare blocker renders the no-action advice through the same caller,
+// and does not send the user to a command that refuses their site.
+func TestStatusFreshnessBlockerCloudflareCredentials(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	client := &mockClient{
+		getSiteFn: func(id string) (*api.Site, error) {
+			return &api.Site{
+				ID: id, Subdomain: "my-site", SubdomainEnabled: true,
+				Freshness: &api.Freshness{
+					State: "blocked",
+					Axes:  api.FreshnessAxes{Origin: "satisfied", Edge: "flushed", Cdn: "blocked"},
+					Blockers: []api.Blocker{
+						{Provider: "cloudflare", Host: "shop.example.com", Reason: "credentials_rejected"},
+					},
+				},
+			}, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	out := buf.String()
+	assertContains(t, out, "✗ The Cloudflare cache is not flushed: Cloudflare rejected the credentials Kamakiri uses to flush your cache.")
+	assertContains(t, out, "  Nothing on your side needs to change, and the flush is retried automatically. If this persists, write to support@kamakiri-labs.jp and quote this line.")
+	if strings.Contains(out, "kamakiri cdn credentials") {
+		t.Errorf("Cloudflare advice must not name kamakiri cdn credentials:\n%s", out)
 	}
 }
 

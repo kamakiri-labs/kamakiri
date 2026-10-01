@@ -116,10 +116,11 @@ func validationRows(expected []api.DNSRecord) [][]string {
 	return rows
 }
 
-// WriteCredentialsHealthLine prints the site-level WebAccel credential-health
-// note when, and only when, the axis reports failing. indent is the leading
-// pad for the block. Both `kamakiri cdn` and `kamakiri status` call it, and
-// they must print the same block.
+// WriteCredentialsHealthLine prints the site-level credential-health note
+// (WebAccel's, or Cloudflare's for a Cloudflare site) when, and only when, the
+// axis reports failing. indent is the leading pad for the block. Both
+// `kamakiri cdn` and `kamakiri status` call it, and they must print the same
+// block.
 //
 // The observed age comes from the most recent of the two outcome timestamps;
 // there is no separate last-checked timestamp to read.
@@ -127,11 +128,22 @@ func WriteCredentialsHealthLine(out io.Writer, result *api.CDNStatusResponse, in
 	if result.CdnCredentialsHealth != "failing" {
 		return
 	}
-	// Two lines and no more: the failing notice and the one command that fixes
-	// it. A failing token gates purge, probe and rotate but not the edge, so
-	// explaining that here would be noise on every status call, and the
-	// per-domain rows below already show the edge serving.
+	// Two lines and no more: the failing notice and what to do about it. A failing
+	// token gates purge, probe and rotate but not the edge, so explaining that
+	// here would be noise on every status call, and the per-domain rows below
+	// already show the edge serving. On Cloudflare the token is the platform's, so
+	// the second line says nothing is needed from the user instead of naming a
+	// command that refuses their site.
 	when := mostRecentAge(result.CdnCredentialsLastFailedAt, result.CdnCredentialsLastOkAt)
+	if result.CDNMode == "cloudflare" {
+		if when != "" {
+			fmt.Fprintf(out, "%s%s\n", indent, i18n.Tf("cdn.credentials_failing_cloudflare_aged", when))
+		} else {
+			fmt.Fprintf(out, "%s%s\n", indent, i18n.T("cdn.credentials_failing_cloudflare"))
+		}
+		fmt.Fprintf(out, "%s%s\n", indent, i18n.T("cdn.credentials_support_hint"))
+		return
+	}
 	if when != "" {
 		fmt.Fprintf(out, "%s%s\n", indent, i18n.Tf("cdn.credentials_failing_aged", when))
 	} else {

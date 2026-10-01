@@ -322,3 +322,58 @@ func mustContain(t *testing.T, got, want string) {
 		t.Errorf("output = %q, missing substring %q", got, want)
 	}
 }
+
+// A Cloudflare domain has no API key to rotate: the 401 and 403 tags read as
+// the platform's problem, with the support address, once purges are broken.
+// The same tags on a WebAccel domain keep the rotate-key advice.
+func TestFormatPurgeStateLine_BrokenCredentialTagsByProvider(t *testing.T) {
+	const cloudflareSuffix = "nothing to change on your side; if it persists, write to support@kamakiri-labs.jp"
+	cases := []struct {
+		mode, tag, want string
+	}{
+		{"cloudflare", "http_401", "✗ broken (HTTP 401: " + cloudflareSuffix + ")"},
+		{"cloudflare", "http_403", "✗ broken (HTTP 403: " + cloudflareSuffix + ")"},
+		{"webaccel", "http_401", "✗ broken (HTTP 401: rotate API key in dashboard)"},
+		{"webaccel", "http_403", "✗ broken (HTTP 403: rotate API key in dashboard)"},
+	}
+	for _, c := range cases {
+		t.Run(c.mode+"/"+c.tag, func(t *testing.T) {
+			d := api.Domain{CdnMode: c.mode, CdnPurgeHealth: "broken", CdnPurgeErrorReason: c.tag}
+			got := FormatPurgeStateLine(&d)
+			mustContain(t, got, c.want)
+			if c.mode == "cloudflare" && strings.Contains(got, "rotate") {
+				t.Errorf("Cloudflare domain must not be told to rotate a key: %q", got)
+			}
+		})
+	}
+}
+
+// While purges are merely failing, a Cloudflare 401 or 403 names Cloudflare
+// rather than an API key the user never held; WebAccel keeps the key wording.
+func TestFormatPurgeStateLine_FailingCredentialHintsByProvider(t *testing.T) {
+	cases := []struct {
+		mode, tag, want string
+	}{
+		{"cloudflare", "http_401", "Cloudflare rejected Kamakiri's credentials"},
+		{"cloudflare", "http_403", "Cloudflare refused Kamakiri's access"},
+		{"webaccel", "http_401", "API key may be invalid"},
+		{"webaccel", "http_403", "API key forbidden"},
+	}
+	for _, c := range cases {
+		t.Run(c.mode+"/"+c.tag, func(t *testing.T) {
+			d := api.Domain{CdnMode: c.mode, CdnPurgeHealth: "failing", CdnPurgeErrorReason: c.tag, CdnPurgeConsecutiveFailures: 1}
+			got := FormatPurgeStateLine(&d)
+			mustContain(t, got, c.want)
+			if c.mode == "cloudflare" && strings.Contains(got, "API key") {
+				t.Errorf("Cloudflare domain must not mention an API key: %q", got)
+			}
+		})
+	}
+}
+
+// missing_credentials is only ever produced for WebAccel, so it keeps its
+// command whatever the mode field says.
+func TestFormatPurgeStateLine_MissingCredentialsUnchanged(t *testing.T) {
+	d := api.Domain{CdnMode: "cloudflare", CdnPurgeHealth: "broken", CdnPurgeErrorReason: "missing_credentials"}
+	mustContain(t, FormatPurgeStateLine(&d), "run `kamakiri cdn credentials` to set them")
+}

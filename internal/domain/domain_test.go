@@ -53,9 +53,9 @@ type mockClient struct {
 	getSiteFn        func(id string) (*api.Site, error)
 	getSiteCalls     int
 	addDomainFn      func(siteID, domain, role string, redirectStatus int) (*api.Domain, error)
-	removeDomainFn   func(domain string) (*api.RemoveDomainResult, error)
+	removeDomainFn   func(siteID, domain string) (*api.RemoveDomainResult, error)
 	listDomainsFn    func(siteID string) (*api.DomainList, error)
-	recheckDomainFn  func(domain string) (*api.Domain, error)
+	recheckDomainFn  func(siteID, domain string) (*api.Domain, error)
 
 	registerDomainFn    func(name string) (*api.Registration, error)
 	unregisterDomainFn  func(name string) error
@@ -122,8 +122,8 @@ func (m *mockClient) ListRegistrations() (*api.RegistrationList, error) {
 	return m.listRegistrationsFn()
 }
 
-func (m *mockClient) RecheckDomain(domain string) (*api.Domain, error) {
-	return m.recheckDomainFn(domain)
+func (m *mockClient) RecheckDomain(siteID, domain string) (*api.Domain, error) {
+	return m.recheckDomainFn(siteID, domain)
 }
 
 func (m *mockClient) SetCanonical(siteID, domain string) (*api.Domain, error) {
@@ -146,8 +146,8 @@ func (m *mockClient) AddDomain(siteID, domain, role string, redirectStatus int) 
 	return m.addDomainFn(siteID, domain, role, redirectStatus)
 }
 
-func (m *mockClient) RemoveDomain(domain string) (*api.RemoveDomainResult, error) {
-	return m.removeDomainFn(domain)
+func (m *mockClient) RemoveDomain(siteID, domain string) (*api.RemoveDomainResult, error) {
+	return m.removeDomainFn(siteID, domain)
 }
 
 func (m *mockClient) ListDomains(siteID string) (*api.DomainList, error) {
@@ -780,8 +780,54 @@ func TestUnsetNoCanonical(t *testing.T) {
 	if err == nil {
 		t.Fatal("Unset() expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "set a canonical domain first") {
-		t.Errorf("error = %q, want 'set a canonical domain first'", err.Error())
+	if want := "this site has no canonical domain to unset"; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// The same code from `add` means the opposite: a redirect needs a canonical
+// domain first, so the shared advice to set one stays there.
+func TestAddNoCanonicalKeepsSetAdvice(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	client := &mockClient{
+		addDomainFn: func(_, _, _ string, _ int) (*api.Domain, error) {
+			return nil, &api.ErrorResponse{Code: "no_canonical", Message: "Set a canonical domain before adding redirect domains."}
+		},
+	}
+
+	var stdout bytes.Buffer
+	err := Add(client, "www.example.com", "redirect", 301, false, &stdout)
+	if err == nil {
+		t.Fatal("Add() expected error")
+	}
+	if want := `set a canonical domain first with "kamakiri domain set"`; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// Adding the host that already is the site's canonical domain names that host
+// and says it is the canonical one, rather than pointing at `unset`.
+func TestAddIsCanonicalNamesTheHost(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	client := &mockClient{
+		addDomainFn: func(_, _, _ string, _ int) (*api.Domain, error) {
+			return nil, &api.ErrorResponse{Code: "is_canonical", Message: "Use unset."}
+		},
+	}
+
+	var stdout bytes.Buffer
+	err := Add(client, "www.example.com", "redirect", 301, false, &stdout)
+	if err == nil {
+		t.Fatal("Add() expected error")
+	}
+	if want := "www.example.com is already this site's canonical domain"; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
 	}
 }
 
@@ -1117,7 +1163,7 @@ func TestAddWaitErrorPropagates(t *testing.T) {
 // server returned: GetSite's argument proves the site id, and two answers, ok
 // one attempt below the expected id and ok at it, prove which id was awaited,
 // since a wait started any lower would resolve on the first.
-func removeClientWithWait(t *testing.T, siteID string, syncAttemptID int64, removeFn func(domain string) (*api.RemoveDomainResult, error)) *mockClient {
+func removeClientWithWait(t *testing.T, siteID string, syncAttemptID int64, removeFn func(siteID, domain string) (*api.RemoveDomainResult, error)) *mockClient {
 	t.Helper()
 	m := &mockClient{removeDomainFn: removeFn}
 	m.getSiteFn = func(gotSiteID string) (*api.Site, error) {
@@ -1139,7 +1185,10 @@ func TestRemoveHappyPath(t *testing.T) {
 
 	fastPolls(t)
 
-	client := removeClientWithWait(t, "site123", 31, func(domain string) (*api.RemoveDomainResult, error) {
+	client := removeClientWithWait(t, "site123", 31, func(siteID, domain string) (*api.RemoveDomainResult, error) {
+		if siteID != "site123" {
+			t.Errorf("siteID = %q, want the linked site123", siteID)
+		}
 		if domain != "www.example.com" {
 			t.Errorf("domain = %q", domain)
 		}
@@ -1162,13 +1211,78 @@ func TestRemoveHappyPath(t *testing.T) {
 	}
 }
 
+// otherSiteRefusal is the server's answer to a by-name domain call scoped to a
+// site the host is not attached to.
+func otherSiteRefusal(subdomain string) error {
+	msg := "www.example.com is attached to another of your sites (" + subdomain + ")."
+	if subdomain == "" {
+		msg = "www.example.com is attached to another of your sites."
+	}
+	return &api.ErrorResponse{Code: "domain_on_other_site", Message: msg, Subdomain: subdomain}
+}
+
+const onOtherSiteLine = "www.example.com is attached to another of your sites (blog), not the one linked here. Run the command from that site's directory"
+
+// A remove refused because the host belongs to another of the account's sites
+// names that site and says where to run the command, and starts no wait.
+func TestRemoveOnOtherSiteNamesTheSite(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	client := &mockClient{
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
+			return nil, otherSiteRefusal("blog")
+		},
+	}
+	client.getSiteFn = flunkGetSite(t, "a refused remove must not start the wait")
+
+	var stdout bytes.Buffer
+	err := Remove(client, "www.example.com", false, &stdout)
+	if err == nil {
+		t.Fatal("Remove() expected error")
+	}
+	if err.Error() != onOtherSiteLine {
+		t.Errorf("error = %q, want %q", err.Error(), onOtherSiteLine)
+	}
+	if client.getSiteCalls != 0 {
+		t.Errorf("GetSite called %d times, want 0", client.getSiteCalls)
+	}
+	if stdout.String() != "" {
+		t.Errorf("stdout = %q, want nothing", stdout.String())
+	}
+}
+
+// Without a subdomain to name, the line would render an empty parenthesis, so
+// the server's own message stands instead.
+func TestRemoveOnOtherSiteWithoutSubdomainUsesServerMessage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProjectConfig(t, "site123")
+
+	client := &mockClient{
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
+			return nil, otherSiteRefusal("")
+		},
+	}
+
+	var stdout bytes.Buffer
+	err := Remove(client, "www.example.com", false, &stdout)
+	if err == nil {
+		t.Fatal("Remove() expected error")
+	}
+	if want := "www.example.com is attached to another of your sites."; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestRemoveNotFound(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return nil, &api.ErrorResponse{Code: "domain_not_found", Message: "Domain not found."}
 		},
 	}
@@ -1189,7 +1303,7 @@ func TestRemoveIsCanonical(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return nil, &api.ErrorResponse{Code: "is_canonical", Message: "Use unset."}
 		},
 	}
@@ -1199,8 +1313,8 @@ func TestRemoveIsCanonical(t *testing.T) {
 	if err == nil {
 		t.Fatal("Remove() expected error")
 	}
-	if !strings.Contains(err.Error(), "kamakiri domain unset") {
-		t.Errorf("error = %q", err.Error())
+	if want := `use "kamakiri domain unset" to remove canonical domains`; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
 	}
 }
 
@@ -1210,7 +1324,7 @@ func TestRemoveUnauthorized(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return nil, &api.ErrorResponse{Code: "unauthorized", Message: "Unauthorized."}
 		},
 	}
@@ -1247,7 +1361,7 @@ func TestRemoveNoWaitSkipsTheWait(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 41}, nil
 		},
 		getSiteFn: flunkGetSite(t, "the wait must not poll when noWait=true"),
@@ -1271,7 +1385,7 @@ func TestRemoveInterruptClosesTheRow(t *testing.T) {
 	interruptBeforeWait(t)
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 42}, nil
 		},
 		getSiteFn: flunkGetSite(t, "a cancelled context must win before the first poll"),
@@ -1299,7 +1413,7 @@ func TestRemoveWaitErrorPropagates(t *testing.T) {
 	const wantErr = "reconcile failed: caddy push failed (5xx)"
 
 	client := &mockClient{
-		removeDomainFn: func(_ string) (*api.RemoveDomainResult, error) {
+		removeDomainFn: func(_, _ string) (*api.RemoveDomainResult, error) {
 			return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 42}, nil
 		},
 		getSiteFn: reconcileFailed(42, "caddy push failed (5xx)"),
@@ -1351,7 +1465,7 @@ func TestUnsetAndRemoveBlockOffATerminal(t *testing.T) {
 		{
 			name: "remove",
 			call: func(client *mockClient, out *bytes.Buffer) error {
-				client.removeDomainFn = func(string) (*api.RemoveDomainResult, error) {
+				client.removeDomainFn = func(string, string) (*api.RemoveDomainResult, error) {
 					return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: attemptID}, nil
 				}
 				return Remove(client, "www.example.com", false, out)
@@ -1396,7 +1510,7 @@ func TestRemoveResultCarriesSiteID(t *testing.T) {
 
 	var capturedSiteID string
 
-	client := removeClientWithWait(t, "remote-site-id", 7, func(_ string) (*api.RemoveDomainResult, error) {
+	client := removeClientWithWait(t, "remote-site-id", 7, func(_, _ string) (*api.RemoveDomainResult, error) {
 		return &api.RemoveDomainResult{SiteID: "remote-site-id", SyncAttemptID: 7}, nil
 	})
 	inner := client.getSiteFn
@@ -2100,10 +2214,10 @@ func TestVerifyHappyPathCallsRecheckAndRendersStatus(t *testing.T) {
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
-	var recheckedWith string
+	var recheckedWith, recheckedSite string
 	client := &mockClient{
-		recheckDomainFn: func(d string) (*api.Domain, error) {
-			recheckedWith = d
+		recheckDomainFn: func(siteID, d string) (*api.Domain, error) {
+			recheckedWith, recheckedSite = d, siteID
 			return &api.Domain{
 				Domain: "next.altstack.jp",
 				Role:   "canonical",
@@ -2128,6 +2242,9 @@ func TestVerifyHappyPathCallsRecheckAndRendersStatus(t *testing.T) {
 	}
 	if recheckedWith != "next.altstack.jp" {
 		t.Errorf("RecheckDomain called with %q, want next.altstack.jp", recheckedWith)
+	}
+	if recheckedSite != "site123" {
+		t.Errorf("RecheckDomain site id = %q, want the linked site123", recheckedSite)
 	}
 	s := out.String()
 	for _, want := range []string{
@@ -2175,14 +2292,14 @@ func TestVerifyWatchReissuesRecheckUntilLive(t *testing.T) {
 			}
 			return &api.DomainList{Domains: []api.Domain{row}}, nil
 		},
-		recheckDomainFn: func(string) (*api.Domain, error) {
+		recheckDomainFn: func(string, string) (*api.Domain, error) {
 			rechecks++
 			return &api.Domain{}, nil
 		},
 	}
 
 	opts := testOpts(clk, context.Background())
-	opts.reissue = func() { _, _ = client.RecheckDomain("next.altstack.jp") }
+	opts.reissue = func() { _, _ = client.RecheckDomain("site123", "next.altstack.jp") }
 
 	var out bytes.Buffer
 	if err := watchToLive(client, "site123", "next.altstack.jp", &out, opts); err != nil {
@@ -2223,7 +2340,7 @@ func TestVerifyWatchSwallowsRecheckRateLimit(t *testing.T) {
 			}
 			return &api.DomainList{Domains: []api.Domain{row}}, nil
 		},
-		recheckDomainFn: func(string) (*api.Domain, error) {
+		recheckDomainFn: func(string, string) (*api.Domain, error) {
 			return nil, &api.ErrorResponse{Code: "rate_limited", Message: "Please wait before re-checking."}
 		},
 	}
@@ -2232,7 +2349,7 @@ func TestVerifyWatchSwallowsRecheckRateLimit(t *testing.T) {
 	reissues := 0
 	opts.reissue = func() {
 		reissues++
-		_, _ = client.RecheckDomain("next.altstack.jp")
+		_, _ = client.RecheckDomain("site123", "next.altstack.jp")
 	}
 
 	var out bytes.Buffer
@@ -2256,7 +2373,7 @@ func TestVerifyInteractiveEntersWatchAfterRecheck(t *testing.T) {
 
 	var recheckedWith string
 	client := &mockClient{
-		recheckDomainFn: func(d string) (*api.Domain, error) {
+		recheckDomainFn: func(_, d string) (*api.Domain, error) {
 			recheckedWith = d
 			return &api.Domain{
 				Domain:     "next.altstack.jp",
@@ -2301,13 +2418,75 @@ func TestVerifyInteractiveEntersWatchAfterRecheck(t *testing.T) {
 	}
 }
 
+// A recheck refused because the host belongs to another of the account's sites
+// names that site up front. It is not a missing domain, so the registration
+// fallback is never consulted.
+func TestVerifyOnOtherSiteNamesTheSite(t *testing.T) {
+	for _, tc := range []struct {
+		subdomain string
+		want      string
+	}{
+		{"blog", onOtherSiteLine},
+		{"", "www.example.com is attached to another of your sites."},
+	} {
+		t.Run("subdomain="+tc.subdomain, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			setupCredentials(t)
+			setupProjectConfig(t, "site123")
+
+			client := &mockClient{
+				recheckDomainFn: func(_, _ string) (*api.Domain, error) {
+					return nil, otherSiteRefusal(tc.subdomain)
+				},
+				listRegistrationsFn: func() (*api.RegistrationList, error) {
+					t.Error("a domain_on_other_site refusal must not consult registrations")
+					return &api.RegistrationList{}, nil
+				},
+			}
+
+			var out bytes.Buffer
+			err := Verify(client, "www.example.com", false, &out)
+			if err == nil {
+				t.Fatal("Verify() expected error")
+			}
+			if err.Error() != tc.want {
+				t.Errorf("error = %q, want %q", err.Error(), tc.want)
+			}
+			if out.String() != "" {
+				t.Errorf("stdout = %q, want nothing", out.String())
+			}
+		})
+	}
+}
+
+// The verify watch's periodic recheck carries the linked site's id, as the
+// first one does, so the server keeps scoping it.
+func TestVerifyWatchReissueCarriesTheSiteID(t *testing.T) {
+	var gotSite, gotDomain string
+	client := &mockClient{
+		recheckDomainFn: func(siteID, d string) (*api.Domain, error) {
+			gotSite, gotDomain = siteID, d
+			return &api.Domain{}, nil
+		},
+	}
+
+	opts := verifyWatchOpts(context.Background(), client, "site123", "next.altstack.jp", io.Discard)
+	if opts.reissue == nil {
+		t.Fatal("the verify watch must carry a reissue hook")
+	}
+	opts.reissue()
+	if gotSite != "site123" || gotDomain != "next.altstack.jp" {
+		t.Errorf("reissue rechecked (siteID=%q, domain=%q), want (site123, next.altstack.jp)", gotSite, gotDomain)
+	}
+}
+
 func TestVerifyDomainNotFound(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		recheckDomainFn: func(string) (*api.Domain, error) {
+		recheckDomainFn: func(string, string) (*api.Domain, error) {
 			return nil, &api.ErrorResponse{Code: "domain_not_found", Message: "Domain not found."}
 		},
 		// No pending registration either, so verify falls through to the
@@ -2333,7 +2512,7 @@ func TestVerifyRateLimited(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		recheckDomainFn: func(string) (*api.Domain, error) {
+		recheckDomainFn: func(string, string) (*api.Domain, error) {
 			return nil, &api.ErrorResponse{Code: "rate_limited", Message: "Too many requests."}
 		},
 	}
@@ -2355,7 +2534,7 @@ func TestVerifyTransportErrorPropagates(t *testing.T) {
 	setupProjectConfig(t, "site123")
 
 	client := &mockClient{
-		recheckDomainFn: func(string) (*api.Domain, error) {
+		recheckDomainFn: func(string, string) (*api.Domain, error) {
 			return nil, errors.New("request failed: connection refused")
 		},
 	}

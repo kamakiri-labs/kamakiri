@@ -19,6 +19,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/dns"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/testhooks"
 )
 
 // ErrCdnWatchInterrupted reports that the user stopped the watch, and is mapped
@@ -80,6 +81,18 @@ type cdnWatchOpts struct {
 // or a buffer gets append-only output instead.
 func isTerminalWriter(out io.Writer) bool {
 	if file, ok := out.(*os.File); ok {
+		return term.IsTerminal(int(file.Fd()))
+	}
+	return false
+}
+
+// isTerminalReader reports whether the credential prompts may read from in.
+// Only a terminal qualifies: from a pipe or a redirected file a prompt would
+// take whatever bytes happen to be there as the answer, where a script that is
+// missing a credential is better told which flag or variable supplies it. It is
+// a variable so a test can stand in for a terminal.
+var isTerminalReader = func(in io.Reader) bool {
+	if file, ok := in.(*os.File); ok {
 		return term.IsTerminal(int(file.Fd()))
 	}
 	return false
@@ -357,8 +370,8 @@ func WatchToLive(client APIClient, siteID, mode string, out io.Writer) error {
 // WatchToLiveCtx runs the go-live watch under a caller-supplied context, so a
 // switch can put both of its legs under one interrupt region.
 func WatchToLiveCtx(ctx context.Context, client APIClient, siteID, mode string, out io.Writer) error {
-	certCheck := httpsHeadCertCheck
-	if os.Getenv(EnvSkipCertCheck) != "" {
+	certCheck := liveCertCheck
+	if testhooks.Getenv(EnvSkipCertCheck) != "" {
 		certCheck = nil
 	}
 
@@ -373,8 +386,15 @@ func WatchToLiveCtx(ctx context.Context, client APIClient, siteID, mode string, 
 
 // EnvSkipCertCheck disables the HTTPS gate, for harnesses that drive a site
 // live with no real edge behind it, where the probe could never pass and the
-// gate would block forever. Production must never set it.
+// gate would block forever. It is honoured only in a build made with the
+// testhooks tag; any other build, a release among them, always runs the gate.
 const EnvSkipCertCheck = "KAMAKIRI_CDN_SKIP_CERT_CHECK"
+
+// liveCertCheck is the probe WatchToLiveCtx hands the gate. It is a variable
+// so unit tests that run the production entry point can replace or disable the
+// gate without going through the environment, which only a testhooks build
+// reads.
+var liveCertCheck = httpsHeadCertCheck
 
 // watchToLive polls until every content-serving row settles, a row this run
 // stops on appears, the user interrupts, a version refusal aborts it, or the

@@ -36,7 +36,9 @@ func awaitRotation(client APIClient, siteID string, attemptID int64, out io.Writ
 
 // RotateCredentials replaces the stored WebAccel token and secret, keeping the
 // per-domain resource mapping the server already holds. It resolves the two
-// values through the same flags, environment and prompts as `cdn webaccel`.
+// values through the same flags, environment and prompts as `cdn webaccel`,
+// and like it prompts only when in is a terminal: from any other reader a
+// missing value is an error naming the environment variable and the flag.
 //
 // A rotation changes no per-domain state, so there is nothing to watch
 // converge: its correctness is the outcome of the reconciler pass, where the
@@ -45,6 +47,11 @@ func awaitRotation(client APIClient, siteID string, attemptID int64, out io.Writ
 // token. Every other way the wait can end leaves that verdict unread, and the
 // copy then reports what went wrong without naming the credentials.
 func RotateCredentials(client APIClient, opts WebAccelOptions, noWait bool, in io.Reader, out io.Writer) error {
+	// The core disables prompting on a nil reader, which has to be a nil
+	// interface rather than a typed nil file.
+	if !isTerminalReader(in) {
+		in = nil
+	}
 	return rotateCredentialsWithReader(client, opts, noWait, in, out, DefaultSecretReader)
 }
 
@@ -186,7 +193,7 @@ func ParseCredentialsArgs(args []string) (WebAccelOptions, error) {
 		case "--domain-id":
 			return WebAccelOptions{}, errors.New(i18n.T("cdn.err_credentials_domain_id"))
 		default:
-			return WebAccelOptions{}, errors.New(i18n.Tf("cdn.err_unknown_flag_credentials", args[i]))
+			return WebAccelOptions{}, errors.New(i18n.Tf("cdn.err_unknown_flag_credentials", cliflags.Redact(args[i])))
 		}
 	}
 	return opts, nil

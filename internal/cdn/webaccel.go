@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 
 	"golang.org/x/term"
 
@@ -22,9 +25,6 @@ import (
 type WebAccelOptions struct {
 	Token  string
 	Secret string
-	// Yes is accepted but changes nothing: running the command is the consent,
-	// and there is no confirmation gate for it to skip.
-	Yes bool
 }
 
 // EnvWebAccelToken and EnvWebAccelSecret name the environment variables read
@@ -41,26 +41,29 @@ const (
 // it and is shared across every prompt in one flow, so buffered bytes are not
 // lost between calls.
 //
-// Masking engages only when raw is the process's own stdin. Anything wrapping
-// stdin, a tee to a log for instance, defeats the check and the value is read
-// and echoed in the clear.
+// The entry points hand the prompts a reader only when it is a terminal, so a
+// terminal is what a reader serves in practice; a plain line read exists for
+// tests that drive the prompts from a buffer.
 type SecretReader func(prompt string, reader *bufio.Reader, raw io.Reader, out io.Writer, masked bool) (string, error)
 
-// DefaultSecretReader is the implementation SetWebAccel uses. An unmasked value
-// echoes as typed, deliberately, so the user can catch a bad paste. Anything
-// that is not a terminal falls back to a plain line read either way.
+// DefaultSecretReader is the implementation SetWebAccel uses. On a terminal
+// both prompts read raw, so Ctrl-C and Ctrl-D arrive as bytes on every
+// platform instead of depending on how the system treats a console interrupt;
+// masked chooses the echo, and whether control bytes are kept (a secret keeps
+// them, a token drops them so its value is what was shown). An unmasked value
+// echoes as typed so the user can catch a bad paste, but only onto a terminal:
+// the raw read echoes through the program, and a token must not land in
+// redirected output. Any other reader falls back to a plain line read.
 func DefaultSecretReader(prompt string, reader *bufio.Reader, raw io.Reader, out io.Writer, masked bool) (string, error) {
 	fmt.Fprint(out, prompt)
 
-	if masked {
-		if file, ok := raw.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
-			value, err := readMasked(int(file.Fd()), out)
-			fmt.Fprintln(out)
-			if err != nil {
-				return "", err
-			}
-			return value, nil
+	if file, ok := raw.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		value, err := readRawTerminal(file, rawEchoWriter(out, masked), out, masked)
+		fmt.Fprintln(out)
+		if err != nil {
+			return "", err
 		}
+		return value, nil
 	}
 
 	line, err := reader.ReadString('\n')
@@ -70,39 +73,163 @@ func DefaultSecretReader(prompt string, reader *bufio.Reader, raw io.Reader, out
 	return strings.TrimSpace(line), nil
 }
 
-// readMasked reads one line from a terminal in raw mode, printing a star per
-// keystroke. It returns ErrCancelled on Ctrl-C or EOF, and an error when raw
-// mode is unavailable, which aborts the prompt rather than echoing the secret.
-func readMasked(fd int, out io.Writer) (string, error) {
+// rawEchoWriter chooses where a raw read echoes. A masked value echoes stars to
+// out, which reveal only its length. An unmasked value echoes the real bytes,
+// and its erase sequences, only when out is a terminal; otherwise nowhere, so
+// the token never reaches a file or pipe that stdout was redirected to.
+func rawEchoWriter(out io.Writer, masked bool) io.Writer {
+	if masked || isTerminalWriter(out) {
+		return out
+	}
+	return io.Discard
+}
+
+// notifySignals, stopSignals and exitProcess are the signal and exit calls
+// readRawTerminal makes. They are variables so a test can hand the handler a
+// SIGTERM and observe the exit without signalling or ending the test binary.
+var (
+	notifySignals = signal.Notify
+	stopSignals   = signal.Stop
+	exitProcess   = os.Exit
+)
+
+// sigtermExitCode is the status a shell reports for a process killed by
+// SIGTERM, which the prompt's own exit keeps.
+const sigtermExitCode = 128 + int(syscall.SIGTERM)
+
+// readRawTerminal puts the terminal behind file into raw mode, reads one line
+// with readRawLine echoing to echo, and restores the mode. An error when raw
+// mode is unavailable aborts the prompt rather than echoing a secret in the
+// clear.
+//
+// It reads through file itself: wrapping the descriptor in a new os.File would
+// close it when that wrapper is collected, taking stdin away from the next
+// prompt.
+//
+// A SIGTERM while the terminal is raw restores it, writes to out the newline
+// that closes the prompt line, the one the prompt writes after any read, and
+// exits 143 with nothing on stderr. out is the caller's output rather than
+// echo, which discards everything for a token typed with stdout redirected.
+// The handler exits from its own goroutine because a blocked terminal read
+// cannot be interrupted, so the read never returns for the caller to act on.
+// The order of the steps around the read is what makes that hold:
+//
+//   - The handler is registered before raw mode is entered. Registered after,
+//     a SIGTERM arriving just as the mode changed would take its default
+//     action and leave the terminal raw; this way a terminal seen in raw mode
+//     always has the handler armed.
+//   - After the read, the terminal is restored and the goroutine is joined
+//     before the handler is removed. The join keeps this function from
+//     returning while a goroutine that took a signal is still exiting, so the
+//     caller never prints a newline of its own or acts on the value read. It
+//     also means a signal that lands while the handler is being removed goes
+//     to the check below, since the goroutine is gone by then. At most one
+//     exit is taken because the real exit never returns: a goroutine that took
+//     a signal is never joined, so the check never runs after it.
+//   - The check for a pending signal follows the removal. A SIGTERM that
+//     arrived after the goroutine stopped selecting, or that it passed over in
+//     favour of done, is still buffered, and none can arrive once stopSignals
+//     has returned, so the non-blocking receive misses none.
+//
+// After the removal SIGTERM is back to its default action, so the signal
+// regions the commands open after the prompts are unaffected.
+func readRawTerminal(file *os.File, echo, out io.Writer, masked bool) (string, error) {
+	fd := int(file.Fd())
+
+	sigs := make(chan os.Signal, 1)
+	notifySignals(sigs, syscall.SIGTERM)
+
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
+		stopSignals(sigs)
+		exitOnPendingSignal(sigs, out)
 		return "", err
 	}
-	defer term.Restore(fd, oldState) //nolint:errcheck
 
-	f := os.NewFile(uintptr(fd), "stdin")
+	done := make(chan struct{})
+	var handler sync.WaitGroup
+	handler.Go(func() {
+		select {
+		case <-sigs:
+			term.Restore(fd, oldState) //nolint:errcheck
+			fmt.Fprintln(out)
+			exitProcess(sigtermExitCode)
+		case <-done:
+		}
+	})
+
+	value, err := readRawLine(file, echo, masked)
+
+	term.Restore(fd, oldState) //nolint:errcheck
+	close(done)
+	handler.Wait()
+	stopSignals(sigs)
+	exitOnPendingSignal(sigs, out)
+	return value, err
+}
+
+// exitOnPendingSignal takes the SIGTERM exit if a signal is waiting on sigs,
+// and returns at once otherwise. The terminal is not raw by then, so there is
+// nothing to restore.
+func exitOnPendingSignal(sigs <-chan os.Signal, out io.Writer) {
+	select {
+	case <-sigs:
+		fmt.Fprintln(out)
+		exitProcess(sigtermExitCode)
+	default:
+	}
+}
+
+// readRawLine reads one line a byte at a time from a terminal in raw mode,
+// where the line discipline does no editing and no signal handling, so it does
+// both here. Enter returns the value. Ctrl-C returns ErrInterrupted, and
+// Ctrl-D, a read error and the end of input return ErrCancelled. Backspace and
+// DEL erase the last byte. Every other byte is kept and echoed to out: as a
+// star when masked, as itself when printable. Unmasked, a control byte is
+// dropped so the value is what the user saw. The bytes are returned as typed,
+// without trimming.
+//
+// A \n that arrives while nothing is kept is skipped rather than ending the
+// line. A value pasted with a CRLF ending ends its own prompt at the \r and
+// leaves the \n queued, and the next prompt would otherwise take it as an
+// empty answer. Raw mode stops the terminal turning \r into \n, so the Enter
+// key still arrives as \r and an empty line can still be entered.
+//
+// A byte delivered together with an error is processed before the error, as the
+// io.Reader contract allows, so a final Enter that arrives with end of input
+// still completes the line.
+func readRawLine(r io.Reader, out io.Writer, masked bool) (string, error) {
 	var buf []byte
 	oneByte := make([]byte, 1)
 	for {
-		n, err := f.Read(oneByte)
-		if err != nil || n == 0 {
+		n, err := r.Read(oneByte)
+		if n == 0 {
 			return "", ErrCancelled
 		}
 		b := oneByte[0]
 		switch {
+		case b == '\n' && len(buf) == 0: // the tail of a CRLF paste
 		case b == '\r' || b == '\n':
 			return string(buf), nil
 		case b == 0x03: // Ctrl-C
+			return "", ErrInterrupted
+		case b == 0x04: // Ctrl-D
 			return "", ErrCancelled
-		case b == 0x7f || b == 0x08: // backspace / DEL
+		case b == 0x7f || b == 0x08: // DEL / backspace
 			if len(buf) > 0 {
 				buf = buf[:len(buf)-1]
-				// Erase the last star: move back, overwrite, move back again.
+				// Erase the last echoed character: move back, overwrite, move back again.
 				fmt.Fprint(out, "\b \b")
 			}
-		default:
+		case masked:
 			buf = append(buf, b)
 			fmt.Fprint(out, "*")
+		case b >= 0x20:
+			buf = append(buf, b)
+			out.Write([]byte{b}) //nolint:errcheck
+		}
+		if err != nil {
+			return "", ErrCancelled
 		}
 	}
 }
@@ -128,10 +255,13 @@ func preflightText() string {
 //     already stored server-side, if the site is on WebAccel already and the
 //     stored token is not being rejected; both values then go out empty, which
 //     is what tells the server to reuse what it holds
-//  4. an interactive prompt for whatever is still missing
+//  4. an interactive prompt for whatever is still missing, only when in, the
+//     reader the prompts are served from, is a terminal
 //
-// in is the reader prompts are served from; a nil reader disables prompting
-// altogether, which makes a missing credential an error rather than a hang.
+// Any other reader, a pipe or a redirected file, is never read: a credential
+// still missing after step 3 is then an error naming the environment variable
+// and the flag that supply it, rather than an answer taken from
+// whatever bytes the pipe holds.
 //
 // Unless noWait is set, the command blocks until every content-serving domain
 // is live. The wait is not passive: WebAccel needs a one-time ownership record
@@ -140,6 +270,11 @@ func preflightText() string {
 // its legs, and without one it queues the exit to direct serving alone and
 // names the command to run next.
 func SetWebAccel(client APIClient, opts WebAccelOptions, noWait bool, in io.Reader, out io.Writer) error {
+	// The core disables prompting on a nil reader, which has to be a nil
+	// interface rather than a typed nil file.
+	if !isTerminalReader(in) {
+		in = nil
+	}
 	return setWebAccelWithReader(client, opts, noWait, in, out, DefaultSecretReader)
 }
 
@@ -252,6 +387,7 @@ func warnApexEligibility(out io.Writer, status *api.CDNStatusResponse) {
 // resolveWebAccelCredentials resolves the token and secret in the order
 // SetWebAccel documents. The third return reports that the server's stored
 // credentials are being reused, in which case both strings come back empty.
+// A nil in disables prompting, so a value still missing is an error.
 func resolveWebAccelCredentials(client APIClient, siteID string, opts WebAccelOptions, in io.Reader, out io.Writer, secretReader SecretReader) (string, string, bool, error) {
 	token := opts.Token
 	secret := opts.Secret
@@ -270,10 +406,17 @@ func resolveWebAccelCredentials(client APIClient, siteID string, opts WebAccelOp
 	// A site already on WebAccel has credentials on file, so re-running the
 	// command resumes the go-live instead of asking again. The exception is a
 	// token the provider is actively rejecting: reusing that would loop forever,
-	// so ask for a fresh one.
+	// so the missing values are asked for afresh. The rejection line asks for a
+	// new token only when the token prompt follows. Otherwise it only states the
+	// rejection, and what comes next explains itself: the secret prompt when a
+	// token was supplied, or the missing-value error when there is no terminal.
 	if status, err := client.CDNStatus(siteID); err == nil && status.CDNMode == "webaccel" {
 		if status.CdnCredentialsHealth == "failing" {
-			fmt.Fprintln(out, i18n.T("cdn.token_rejected_reenter"))
+			if in != nil && token == "" {
+				fmt.Fprintln(out, i18n.T("cdn.token_rejected_reenter"))
+			} else {
+				fmt.Fprintln(out, i18n.T("cdn.token_rejected_on_file"))
+			}
 		} else {
 			fmt.Fprintln(out, i18n.T("cdn.token_reusing"))
 			return "", "", true, nil
@@ -329,22 +472,33 @@ func resolveWebAccelCredentials(client APIClient, siteID string, opts WebAccelOp
 	return token, secret, false, nil
 }
 
-// ErrCancelled reports that the user abandoned an interactive prompt, by
-// Ctrl-C or by closing the input. It carries a readable message rather than a
-// bare "EOF", since it can reach the user's terminal.
+// ErrCancelled reports that the input ended, or could not be read, before a
+// prompt got its value. It carries a readable message rather than a bare "EOF",
+// since it can reach the user's terminal.
 var ErrCancelled = i18n.NewError("cdn.err_cancelled")
 
-// promptField asks for one value and keeps asking while the answer is empty.
+// ErrInterrupted reports a Ctrl-C at either credential prompt, both of which
+// read the terminal raw so the interrupt arrives as a byte. The command exits
+// 130 on it and echoes nothing: the prompt has already closed its line, and an
+// interrupt the user asked for needs no message. The text is never shown.
+var ErrInterrupted = errors.New("interrupted at a credential prompt")
+
+// promptField asks for one value and keeps asking while the answer is empty
+// after trimming surrounding whitespace, which it also removes from the value
+// it returns, whatever the reader does.
 func promptField(prompt, retryMsg string, reader *bufio.Reader, raw io.Reader, out io.Writer, secretReader SecretReader, masked bool) (string, error) {
 	for {
 		value, err := secretReader(prompt, reader, raw, out, masked)
 		if err != nil {
+			if errors.Is(err, ErrInterrupted) {
+				return "", err
+			}
 			if errors.Is(err, io.EOF) || errors.Is(err, ErrCancelled) {
 				return "", ErrCancelled
 			}
 			return "", fmt.Errorf("%s: %w", i18n.T("cdn.err_read_input"), err)
 		}
-		if value != "" {
+		if value = strings.TrimSpace(value); value != "" {
 			return value, nil
 		}
 		fmt.Fprintln(out, retryMsg)
@@ -374,15 +528,10 @@ func ParseWebAccelArgs(args []string) (WebAccelOptions, error) {
 			}
 			opts.Secret = v
 			i = next
-		case "--yes":
-			if err := cliflags.RequireNoValue(name, hasValue); err != nil {
-				return opts, err
-			}
-			opts.Yes = true
 		case "--domain-id":
 			return opts, errors.New(i18n.T("cdn.err_domain_id_removed"))
 		default:
-			return opts, errors.New(i18n.Tf("cdn.err_unknown_flag_webaccel", args[i]))
+			return opts, errors.New(i18n.Tf("cdn.err_unknown_flag_webaccel", cliflags.Redact(args[i])))
 		}
 	}
 	return opts, nil

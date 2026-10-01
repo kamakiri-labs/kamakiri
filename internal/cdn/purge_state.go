@@ -181,7 +181,7 @@ func FormatPurgeStateLine(d *api.Domain) string {
 }
 
 func formatPurgeFailing(d *api.Domain) string {
-	hint := purgeHintFor(d.CdnPurgeErrorReason)
+	hint := purgeHintForDomain(d)
 	// The failure count is a whole message per branch rather than a noun chosen
 	// by number and dropped into a frame: Japanese has no plural to pick, so a
 	// count and a noun the sentence does not need are not the same thing.
@@ -196,7 +196,7 @@ func formatPurgeFailing(d *api.Domain) string {
 }
 
 func formatPurgeBroken(d *api.Domain) string {
-	hint := purgeHintFor(d.CdnPurgeErrorReason)
+	hint := purgeHintForDomain(d)
 	msg := hint.suffix
 	if msg == "" {
 		msg = hint.hint
@@ -210,6 +210,30 @@ func formatPurgeBroken(d *api.Domain) string {
 		return i18n.Tf("cdn.purge_broken_since", age, hint.label, msg)
 	}
 	return i18n.Tf("cdn.purge_broken", hint.label, msg)
+}
+
+// purgeHintForDomain is purgeHintFor with the provider taken into account. A
+// credential rejection on a Cloudflare domain is about the platform's own token,
+// which the user neither holds nor can rotate, so the remediation says nothing
+// is needed from them instead of sending them to a dashboard. The missing
+// credentials tag is left to the generic mapping: it only ever arises for
+// WebAccel, where the user does hold the credentials.
+func purgeHintForDomain(d *api.Domain) purgeHint {
+	hint := purgeHintFor(d.CdnPurgeErrorReason)
+	if d.CdnMode == "cloudflare" {
+		// The generic hints talk about an API key, which a Cloudflare site's
+		// owner never held. Each lookup is a literal key so the catalog checks
+		// can see it.
+		switch d.CdnPurgeErrorReason {
+		case "http_401":
+			hint.hint = i18n.T("cdn.purge_hint_cloudflare_rejected")
+			hint.suffix = i18n.T("cdn.purge_fix_no_action")
+		case "http_403":
+			hint.hint = i18n.T("cdn.purge_hint_cloudflare_forbidden")
+			hint.suffix = i18n.T("cdn.purge_fix_no_action")
+		}
+	}
+	return hint
 }
 
 // purgeHintFor maps a failure tag to the copy that renders it; an unrecognised

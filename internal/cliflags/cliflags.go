@@ -26,6 +26,21 @@ func SplitArg(arg string) (name, value string, hasValue bool) {
 	return arg, "", false
 }
 
+// Redact returns arg as it is safe to echo in an error line. A flag given as
+// "--name=value" is cut to "--name", because the value may be a secret passed
+// under a mistyped flag name (--secert=...), and an error line lands in
+// scrollback and CI logs. Anything that does not start with "-", and a flag
+// with no "=", is returned unchanged.
+func Redact(arg string) string {
+	if !strings.HasPrefix(arg, "-") {
+		return arg
+	}
+	if idx := strings.Index(arg, "="); idx >= 0 {
+		return arg[:idx]
+	}
+	return arg
+}
+
 // Value returns the value for the flag at args[i] and the loop index to carry
 // on from: the same index for the equals form, i+1 once the space form has
 // consumed the next argument. A non-empty hint is appended to a missing-value

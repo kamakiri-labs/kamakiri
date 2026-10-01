@@ -176,7 +176,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 				recheck = true
 			default:
 				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_status"))
-				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", a.args[i]))
+				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[i])))
 				return 1
 			}
 		}
@@ -286,7 +286,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 				a.requireNoExtraPurgeArgs(extras)
 				a.cdnExit(cdn.Purge(client, noWait, a.stdout))
 			default:
-				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_cdn_command", a.args[1]))
+				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_cdn_command", cliflags.Redact(a.args[1])))
 				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_cdn"))
 				return 1
 			}
@@ -374,7 +374,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 				return 1
 			}
 		default:
-			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_domain_command", a.args[1]))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_domain_command", cliflags.Redact(a.args[1])))
 			return 1
 		}
 	case "subdomain":
@@ -405,7 +405,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 					noWait = true
 				default:
 					if positional != "" {
-						fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", a.args[i]))
+						fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[i])))
 						return 1
 					}
 					positional = a.args[i]
@@ -429,11 +429,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 				return a.syncWaitExit(err)
 			}
 		default:
-			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_subdomain_command", a.args[1]))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_subdomain_command", cliflags.Redact(a.args[1])))
 			return 1
 		}
 	default:
-		fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_command", a.args[0]))
+		fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_command", cliflags.Redact(a.args[0])))
 		return 1
 	}
 
@@ -446,7 +446,9 @@ func (a *app) runDomainAdd(client *api.Client) {
 		a.exit(1)
 	}
 	domainName := a.args[2]
-	role := "redirect"
+	// The role flags are recorded and reconciled after the loop, so the verdict
+	// on a conflict does not depend on the order the user typed them in.
+	var aliasGiven, redirectGiven, statusGiven bool
 	redirectStatus := 301
 	noWait := false
 
@@ -455,27 +457,36 @@ func (a *app) runDomainAdd(client *api.Client) {
 		switch name {
 		case "--alias":
 			a.requireNoValueOrExit(name, hasValue)
-			role = "alias"
-			redirectStatus = 0
+			aliasGiven = true
 		case "--redirect":
 			a.requireNoValueOrExit(name, hasValue)
-			role = "redirect"
+			redirectGiven = true
 		case "--status":
 			v, next := a.flagValueOrExit(a.args, i, hasValue, value, "--status", i18n.T("cmd.hint_redirect_status"))
 			i = next
 			redirectStatus = a.parseRedirectStatus(v)
+			statusGiven = true
 		case "--no-wait":
 			a.requireNoValueOrExit(name, hasValue)
 			noWait = true
 		default:
-			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_flag", a.args[i]))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_flag", cliflags.Redact(a.args[i])))
 			a.exit(1)
 		}
 	}
 
-	if role == "alias" && redirectStatus != 0 {
-		fmt.Fprintln(a.stderr, i18n.T("cmd.err_alias_status_exclusive"))
-		a.exit(1)
+	role := "redirect"
+	if aliasGiven {
+		if redirectGiven {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.err_alias_redirect_exclusive"))
+			a.exit(1)
+		}
+		if statusGiven {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.err_alias_status_exclusive"))
+			a.exit(1)
+		}
+		role = "alias"
+		redirectStatus = 0
 	}
 
 	a.domainExit(domain.Add(client, domainName, role, redirectStatus, noWait, a.stdout))
@@ -556,7 +567,7 @@ func domainExitCode(err error) (code int, echoStderr bool) {
 func (a *app) parseDomainUnregisterArgs(args []string) {
 	if len(args) > 0 {
 		fmt.Fprintln(a.stderr, i18n.T("cmd.usage_domain_unregister_line"))
-		fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", args[0]))
+		fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(args[0])))
 		a.exit(1)
 	}
 }
@@ -597,7 +608,7 @@ func (a *app) parseNoWait(args []string, usage string) bool {
 			noWait = true
 		default:
 			fmt.Fprintln(a.stderr, usage)
-			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", args[i]))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(args[i])))
 			a.exit(1)
 		}
 	}
@@ -613,10 +624,10 @@ func (a *app) parseRedirectStatus(raw string) int {
 	return n
 }
 
-// runCDNWebAccel parses `kamakiri cdn webaccel` (--token, --secret, --yes,
+// runCDNWebAccel parses `kamakiri cdn webaccel` (--token, --secret,
 // --no-wait) and dispatches to the cdn package. A missing token or secret falls
 // back to the environment, then to credentials the server already holds, then
-// to an interactive prompt.
+// to an interactive prompt when stdin is a terminal.
 func (a *app) runCDNWebAccel(client *api.Client) {
 	noWait, args := a.splitCDNNoWait(a.args[2:])
 	opts, err := cdn.ParseWebAccelArgs(args)
@@ -631,7 +642,8 @@ func (a *app) runCDNWebAccel(client *api.Client) {
 // runCDNCredentials parses `kamakiri cdn credentials` (--token, --secret,
 // --no-wait) and dispatches to the cdn package. It rejects --domain-id: this
 // command rotates authentication and nothing else. A missing token or secret
-// falls back to the environment, then to a hidden interactive prompt.
+// falls back to the environment, then to an interactive prompt when stdin is a
+// terminal.
 func (a *app) runCDNCredentials(client *api.Client) {
 	noWait, args := a.splitCDNNoWait(a.args[2:])
 	opts, err := cdn.ParseCredentialsArgs(args)
@@ -654,12 +666,18 @@ func (a *app) runCDNCredentials(client *api.Client) {
 //	                              both surfacing as domain.ErrWatchInterrupted;
 //	                              `cdn purge`'s freshness wait; and the own-side
 //	                              wait a verb with no watch to stream blocks on.
+//	cdn.ErrInterrupted     → 130  Ctrl-C at either WebAccel prompt, which
+//	                              reads it as a byte rather than a signal;
+//	                              the prompt has closed its line.
 //	ErrCdnReported,        → 1   the report is already on stdout: a ✗
 //	  freshness.ErrFlushBlocked   breakdown, a failed `cdn none` change, a
 //	                              blocked or unreadable cleanup, rejected
 //	                              credentials, or a rotation whose outcome the
 //	                              wait could not read
 //	other                  → 1   transport or API error; echo to stderr
+//
+// The WebAccel prompts also leave with 143 on SIGTERM, but through os.Exit from
+// the prompt's own signal handler, so that exit never reaches this table or run.
 func (a *app) cdnExit(err error) {
 	code, echo := cdnExitCode(err)
 	if echo {
@@ -675,7 +693,8 @@ func cdnExitCode(err error) (code int, echoStderr bool) {
 	case err == nil:
 		return 0, false
 	case errors.Is(err, cdn.ErrCdnWatchInterrupted), errors.Is(err, domain.ErrWatchInterrupted),
-		errors.Is(err, freshness.ErrInterrupted), errors.Is(err, syncwait.ErrInterrupted):
+		errors.Is(err, freshness.ErrInterrupted), errors.Is(err, syncwait.ErrInterrupted),
+		errors.Is(err, cdn.ErrInterrupted):
 		return 130, false
 	case errors.Is(err, cdn.ErrCdnReported), errors.Is(err, freshness.ErrFlushBlocked):
 		return 1, false
@@ -730,7 +749,7 @@ func (a *app) requireNoUpgradeArgs(extras []string) {
 		return
 	}
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_upgrade"))
-	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", extras[0]))
+	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(extras[0])))
 	a.exit(1)
 }
 
@@ -761,7 +780,7 @@ func (a *app) requireNoExtraVerifyArgs(extras []string) {
 		return
 	}
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_cdn_verify"))
-	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", extras[0]))
+	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(extras[0])))
 	a.exit(1)
 }
 
@@ -793,7 +812,7 @@ func (a *app) requireNoExtraCDNArgs(extras []string) {
 		return
 	}
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_cdn_mode"))
-	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", extras[0]))
+	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(extras[0])))
 	a.exit(1)
 }
 
@@ -804,7 +823,7 @@ func (a *app) requireNoExtraPurgeArgs(extras []string) {
 		return
 	}
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_cdn_purge"))
-	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", extras[0]))
+	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(extras[0])))
 	a.exit(1)
 }
 
@@ -815,7 +834,7 @@ func (a *app) requireNoExtraCleanupArgs(extras []string) {
 		return
 	}
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_cdn_cleanup"))
-	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", extras[0]))
+	fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(extras[0])))
 	a.exit(1)
 }
 

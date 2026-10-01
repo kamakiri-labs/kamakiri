@@ -257,27 +257,6 @@ func TestDeploysSiteNotFound(t *testing.T) {
 	}
 }
 
-func TestDeploysForbidden(t *testing.T) {
-	t.Chdir(t.TempDir())
-	setupCredentials(t)
-	setupProject(t)
-
-	client := &mockClient{
-		listDeploysFn: func(_ string) ([]api.Deploy, error) {
-			return nil, &api.ErrorResponse{Code: "forbidden", Message: "Not your site."}
-		},
-	}
-
-	var out bytes.Buffer
-	err := Run(client, &out)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "don't own") {
-		t.Errorf("expected mapped error, got: %q", err.Error())
-	}
-}
-
 func TestDeploysUnauthorized(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)

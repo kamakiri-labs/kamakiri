@@ -241,6 +241,23 @@ func isErrorCode(err error, code string) bool {
 	return false
 }
 
+// onOtherSiteError renders a domain_on_other_site refusal, naming the host the
+// user typed and the site it is attached to. The refusal carries no host, which
+// is why this lives with the callers that hold one rather than in the shared
+// error mapping. Without a subdomain to name, the server's own message stands,
+// so the line never renders an empty parenthesis. It returns nil for any other
+// error.
+func onOtherSiteError(err error, domainName string) error {
+	apiErr, ok := err.(*api.ErrorResponse)
+	if !ok || apiErr.Code != "domain_on_other_site" {
+		return nil
+	}
+	if apiErr.Subdomain == "" {
+		return errors.New(apiErr.Message)
+	}
+	return errors.New(i18n.Tf("domain.err_on_other_site", domainName, apiErr.Subdomain))
+}
+
 // hasPendingRegistration reports whether the account holds a registration at
 // the exact name that has not verified. A transport failure reads as no pending
 // registration, so `verify` falls back to its normal not-found handling rather

@@ -297,3 +297,69 @@ func TestRotationCredentialPromptsAndRefusals(t *testing.T) {
 	// keeps asking until it has a value, and a reader that runs out returns
 	// ErrCancelled instead, so no vector reaches them.
 }
+
+// A rotation prompts only on a terminal, like `cdn webaccel`: a pipe carrying
+// answers is left unread and the missing-value error is the outcome.
+func TestRotateCredentialsPromptsOnlyOnATerminal(t *testing.T) {
+	setup := func(t *testing.T) (*mockClient, *string, *string) {
+		t.Helper()
+		t.Chdir(t.TempDir())
+		setupCredentials(t)
+		setupProjectConfig(t, "site123")
+		t.Setenv(EnvWebAccelToken, "")
+		t.Setenv(EnvWebAccelSecret, "")
+		var gotTok, gotSec string
+		client := &mockClient{
+			rotateCredsFn: func(_, tok, sec string) (*api.CDNSetResponse, error) {
+				gotTok, gotSec = tok, sec
+				return &api.CDNSetResponse{CDNMode: "webaccel", SyncAttemptID: 7}, nil
+			},
+		}
+		return client, &gotTok, &gotSec
+	}
+
+	t.Run("not a terminal", func(t *testing.T) {
+		stubTerminalReader(t, false)
+		client, gotTok, _ := setup(t)
+		in := strings.NewReader("tok\nsec\n")
+		var out bytes.Buffer
+		err := RotateCredentials(client, WebAccelOptions{}, true, in, &out)
+		if want := i18n.Tf("cdn.err_token_missing", EnvWebAccelToken); err == nil || err.Error() != want {
+			t.Errorf("err = %v, want %q", err, want)
+		}
+		if in.Len() != len("tok\nsec\n") {
+			t.Errorf("%d bytes of the piped answers were read", len("tok\nsec\n")-in.Len())
+		}
+		if *gotTok != "" {
+			t.Errorf("a piped token reached the server: %q", *gotTok)
+		}
+		if strings.Contains(out.String(), i18n.T("cdn.prompt_access_token")) {
+			t.Errorf("prompted with no terminal to answer:\n%s", out.String())
+		}
+	})
+
+	t.Run("terminal", func(t *testing.T) {
+		stubTerminalReader(t, true)
+		client, gotTok, gotSec := setup(t)
+		var out bytes.Buffer
+		if err := RotateCredentials(client, WebAccelOptions{}, true, strings.NewReader("tok\nsec\n"), &out); err != nil {
+			t.Fatal(err)
+		}
+		if *gotTok != "tok" || *gotSec != "sec" {
+			t.Errorf("sent token/secret = %q/%q, want the prompted tok/sec", *gotTok, *gotSec)
+		}
+		if !strings.Contains(out.String(), i18n.T("cdn.prompt_access_token")) {
+			t.Errorf("missing the token prompt:\n%s", out.String())
+		}
+	})
+}
+
+func TestParseCredentialsArgsUnknownFlagEchoesOnlyTheName(t *testing.T) {
+	_, err := ParseCredentialsArgs([]string{"--secert=TOPSECRET"})
+	if err == nil {
+		t.Fatal("expected error for unknown flag")
+	}
+	if !strings.Contains(err.Error(), "--secert") || strings.Contains(err.Error(), "TOPSECRET") {
+		t.Errorf("error = %q, want the flag name and not its value", err)
+	}
+}

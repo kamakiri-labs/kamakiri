@@ -216,6 +216,9 @@ func TestTeardownHappyPath(t *testing.T) {
 	if strings.Contains(output, "Sakura") {
 		t.Errorf("non-WebAccel teardown must not print a WebAccel notice: %q", output)
 	}
+	if strings.Contains(output, i18n.T("teardown.failed_still_linked")) {
+		t.Errorf("a converged teardown removes the link, so the still-linked line is absent: %q", output)
+	}
 
 	config, _ := core.LoadProject()
 	if config != nil {
@@ -223,10 +226,11 @@ func TestTeardownHappyPath(t *testing.T) {
 	}
 }
 
-// Every failure label ends in "Check `kamakiri status`", a command the same
-// floor refuses, so a refusal only closes the open line and lets the sentinel
-// carry the message. The rest of the error arm is unchanged: the retained
-// resource is still named and the local config still goes.
+// A version refusal is not a failed teardown step, so no failure label and no
+// still-linked line: those point at `kamakiri teardown` and `kamakiri status`,
+// commands the same floor refuses. The refusal only closes the open line and
+// lets the sentinel carry the message; the retained resource is still named
+// and the local config still goes.
 func TestTeardownAbortsOnAVersionRefusal(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
@@ -271,6 +275,7 @@ func TestTeardownAbortsOnAVersionRefusal(t *testing.T) {
 		i18n.T("teardown.failed"),
 		i18n.T("teardown.failed_edge_delete"),
 		i18n.T("teardown.done"),
+		i18n.T("teardown.failed_still_linked"),
 	} {
 		if strings.Contains(output, banned) {
 			t.Errorf("output must not carry %q:\n%s", banned, output)
@@ -427,6 +432,10 @@ func TestTeardownNoWait(t *testing.T) {
 	if !strings.Contains(output, "Removed .kamakiri/config.json") {
 		t.Errorf("output should remove config: %q", output)
 	}
+	if strings.Contains(output, i18n.T("teardown.failed_still_linked")) {
+		t.Errorf("a queued teardown reported no failure, so the still-linked line is absent: %q", output)
+	}
+	assertConfigRemoved(t)
 }
 
 // On Ctrl-C the sentinel propagates, so the 130 exit can recognize it, the stop
@@ -468,8 +477,11 @@ func TestTeardownInterruptStopsAndRemovesConfig(t *testing.T) {
 	if strings.Contains(output, i18n.T("teardown.failed")) {
 		t.Errorf("an interrupt is not a failure, so no label belongs here:\n%q", output)
 	}
-	// A config left behind here would point a later deploy at a site that is
-	// being torn down.
+	// No step failed, so the link goes as it does when the teardown finishes;
+	// only a failure the user may have to act on keeps it.
+	if strings.Contains(output, i18n.T("teardown.failed_still_linked")) {
+		t.Errorf("an interrupt is not a failure, so the link is not kept:\n%q", output)
+	}
 	if !strings.Contains(output, "Removed .kamakiri/config.json") {
 		t.Errorf("output should remove config on an interrupt: %q", output)
 	}
@@ -478,8 +490,46 @@ func TestTeardownInterruptStopsAndRemovesConfig(t *testing.T) {
 	}
 }
 
-// A real reconcile failure prints a step-specific label, propagates, and still
-// removes the local config.
+// stillLinked is the line a failed teardown ends on, in English.
+const stillLinked = "This directory is still linked to the site. Run `kamakiri teardown` to retry, or `kamakiri status` to see where it stands."
+
+// assertKeptAndStillLinked checks a failed teardown's ending: the label closing
+// the tearing-down line, with no advice of its own, the still-linked line as
+// the last thing printed, and the local config left on disk for the retry to
+// run from.
+func assertKeptAndStillLinked(t *testing.T, output, label string) {
+	t.Helper()
+	if !strings.Contains(output, "Tearing down... "+label+"\n") {
+		t.Errorf("want the line %q, got:\n%q", "Tearing down... "+label, output)
+	}
+	if !strings.HasSuffix(output, "\n"+stillLinked+"\n") {
+		t.Errorf("want the output to end on the still-linked line, got:\n%q", output)
+	}
+	if strings.Contains(output, "Check") {
+		t.Errorf("the failure label must not carry advice of its own:\n%q", output)
+	}
+	if strings.Contains(output, "Removed .kamakiri/config.json") {
+		t.Errorf("a failed teardown must keep the local config:\n%q", output)
+	}
+	if _, err := os.Stat(core.ProjectPath()); err != nil {
+		t.Errorf("config file should still be on disk after a failed teardown: %v", err)
+	}
+	if config, _ := core.LoadProject(); config == nil || config.ID != "site123" {
+		t.Errorf("config = %+v, want the link to site123 kept", config)
+	}
+}
+
+// assertConfigRemoved checks the local link is gone from disk.
+func assertConfigRemoved(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat(core.ProjectPath()); !os.IsNotExist(err) {
+		t.Errorf("config file should be gone, stat err = %v", err)
+	}
+}
+
+// A reconcile failure with no changes to name a step from prints the
+// unqualified label, propagates the reconciler's reason, and keeps the local
+// config so `kamakiri teardown` can retry from this directory.
 func TestTeardownReconcileError(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
@@ -504,21 +554,74 @@ func TestTeardownReconcileError(t *testing.T) {
 	if err.Error() != "reconcile failed: caddy push timed out" {
 		t.Errorf("err = %q, want the reconciler's own reason framed", err.Error())
 	}
+	var failure *syncwait.ReconcileFailure
+	if !errors.As(err, &failure) {
+		t.Errorf("err = %#v, want the *syncwait.ReconcileFailure returned unchanged", err)
+	}
 
-	output := stdout.String()
-	if !strings.Contains(output, "failed") {
-		t.Errorf("output should print failure label: %q", output)
+	assertKeptAndStillLinked(t, stdout.String(), "failed.")
+}
+
+// The first missing step in the reported changes is the one named, and every
+// per-step failure keeps the local config just as the unqualified one does.
+func TestTeardownPerStepFailureLabel(t *testing.T) {
+	cases := []struct {
+		changes []string
+		label   string
+	}{
+		{nil, "failed."},
+		{[]string{"reconcile_started"}, "failed (edge delete)."},
+		{[]string{"caddy_delete"}, "failed (DNS delete)."},
+		{[]string{"caddy_delete", "dns_delete:example.com"}, "failed (CDN deregister)."},
+		{[]string{"caddy_delete", "dns_delete:example.com", "cdn_deregister:cloudflare"}, "failed (storage purge)."},
 	}
-	if !strings.Contains(output, "kamakiri status") {
-		t.Errorf("output should hint at `kamakiri status`: %q", output)
-	}
-	if !strings.Contains(output, "Removed .kamakiri/config.json") {
-		t.Errorf("output should remove config on reconcile error: %q", output)
+
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			setupCredentials(t)
+			setupConfig(t, "site123")
+			fastPolls(t)
+
+			client := &mockClient{
+				deleteSiteFn: func(id string) (*api.Site, error) {
+					return &api.Site{
+						ID:            id,
+						SyncAttemptID: 42,
+						RetainedWebAccelResources: []api.WebAccelResource{
+							{ID: "1001", Subdomain: "abc123.user.webaccel.ne.jp"},
+						},
+					}, nil
+				},
+				getSiteFn: reconcileFailed("cloudflare 500", tc.changes),
+			}
+
+			stdin := strings.NewReader("y\n")
+			var stdout bytes.Buffer
+
+			if err := Run(client, stdin, &stdout, false); err == nil {
+				t.Fatal("Run() expected error, got nil")
+			}
+
+			output := stdout.String()
+			assertKeptAndStillLinked(t, output, tc.label)
+			// The retained resource is the user's own whatever the outcome, so
+			// its notice still prints, after the failure label and before the
+			// still-linked line, which is the advice the run ends on.
+			notice := strings.Index(output, "abc123.user.webaccel.ne.jp")
+			label := strings.Index(output, tc.label)
+			linked := strings.Index(output, stillLinked)
+			if notice < 0 || !(label < notice && notice < linked) {
+				t.Errorf("want label, then WebAccel notice, then still-linked line:\n%q", output)
+			}
+		})
 	}
 }
 
-// The first missing step in the reported changes is the one named.
-func TestTeardownPerStepFailureLabel(t *testing.T) {
+// A wait that could not read the outcome at all (its read budget spent on
+// transport errors) has no evidence the site is gone, so it keeps the local
+// config the same way a reported failure does, with the unqualified label.
+func TestTeardownUnreadableOutcomeKeepsConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
 	setupConfig(t, "site123")
@@ -528,19 +631,23 @@ func TestTeardownPerStepFailureLabel(t *testing.T) {
 		deleteSiteFn: func(id string) (*api.Site, error) {
 			return &api.Site{ID: id, SyncAttemptID: 42}, nil
 		},
-		getSiteFn: reconcileFailed("cloudflare 500",
-			[]string{"caddy_delete", "dns_delete:example.com"}),
+	}
+	client.getSiteFn = func(id string) (*api.Site, error) {
+		if client.getSiteCalls == 1 {
+			return &api.Site{ID: id, Subdomain: "my-site"}, nil
+		}
+		return nil, errors.New("connection refused")
 	}
 
 	stdin := strings.NewReader("y\n")
 	var stdout bytes.Buffer
 
-	_ = Run(client, stdin, &stdout, false)
-
-	output := stdout.String()
-	if !strings.Contains(output, "CDN deregister") {
-		t.Errorf("output should name the failing step (CDN deregister): %q", output)
+	err := Run(client, stdin, &stdout, false)
+	if err == nil || err.Error() != "connection refused" {
+		t.Fatalf("Run() error = %v, want the transport error that spent the budget", err)
 	}
+
+	assertKeptAndStillLinked(t, stdout.String(), "failed.")
 }
 
 func TestTeardownAbort(t *testing.T) {
@@ -666,33 +773,6 @@ func TestTeardownSiteNotFoundCleansUp(t *testing.T) {
 	}
 }
 
-func TestTeardownGetSiteForbidden(t *testing.T) {
-	t.Chdir(t.TempDir())
-	setupCredentials(t)
-	setupConfig(t, "site123")
-
-	client := &mockClient{
-		getSiteFn: func(_ string) (*api.Site, error) {
-			return nil, &api.ErrorResponse{Code: "forbidden", Message: "You do not own this site."}
-		},
-		deleteSiteFn: func(_ string) (*api.Site, error) {
-			t.Error("DeleteSite should not be called")
-			return nil, nil
-		},
-	}
-
-	stdin := strings.NewReader("")
-	var stdout bytes.Buffer
-
-	err := Run(client, stdin, &stdout, false)
-	if err == nil {
-		t.Fatal("Run() expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "you don't own this site") {
-		t.Errorf("error = %q, want 'you don't own this site'", err.Error())
-	}
-}
-
 func TestTeardownGetSiteUnauthorized(t *testing.T) {
 	t.Chdir(t.TempDir())
 	setupCredentials(t)
@@ -717,32 +797,6 @@ func TestTeardownGetSiteUnauthorized(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid API key") {
 		t.Errorf("error = %q, want 'invalid API key'", err.Error())
-	}
-}
-
-func TestTeardownDeleteForbidden(t *testing.T) {
-	t.Chdir(t.TempDir())
-	setupCredentials(t)
-	setupConfig(t, "site123")
-
-	client := &mockClient{
-		getSiteFn: func(id string) (*api.Site, error) {
-			return &api.Site{ID: id, Subdomain: "my-site"}, nil
-		},
-		deleteSiteFn: func(_ string) (*api.Site, error) {
-			return nil, &api.ErrorResponse{Code: "forbidden", Message: "You do not own this site."}
-		},
-	}
-
-	stdin := strings.NewReader("y\n")
-	var stdout bytes.Buffer
-
-	err := Run(client, stdin, &stdout, false)
-	if err == nil {
-		t.Fatal("Run() expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "you don't own this site") {
-		t.Errorf("error = %q, want 'you don't own this site'", err.Error())
 	}
 }
 

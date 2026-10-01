@@ -25,12 +25,13 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 	"github.com/kamakiri-labs/kamakiri/internal/streamui"
+	"github.com/kamakiri-labs/kamakiri/internal/testhooks"
 )
 
 // ErrInterrupted is returned when the user interrupts the wait. The work
-// continues server-side and the detach copy on stdout already says how to
-// resume, so a command must not echo this error on top of it; the 130 exit is
-// the whole report.
+// continues server-side and the detach copy on stdout already says so and
+// where to follow it, so a command must not echo this error on top of it; the
+// 130 exit is the whole report.
 var ErrInterrupted = errors.New("freshness wait interrupted by signal")
 
 // ErrFlushBlocked is returned when the server reports a terminal flush failure
@@ -89,7 +90,7 @@ type msgs struct {
 	lead        string
 	fresh       string
 	detachNoun  string
-	reRun       string
+	resume      string
 	showLiveURL bool
 }
 
@@ -100,7 +101,7 @@ func DeployMsgs() msgs {
 		lead:        i18n.T("freshness.lead_deploy"),
 		fresh:       i18n.T("freshness.fresh_live"),
 		detachNoun:  i18n.T("freshness.detach_noun_deploy"),
-		reRun:       "kamakiri deploy",
+		resume:      i18n.T("freshness.detach_resume_live"),
 		showLiveURL: true,
 	}
 }
@@ -112,7 +113,7 @@ func RollbackMsgs() msgs {
 		lead:        i18n.T("freshness.lead_rollback"),
 		fresh:       i18n.T("freshness.fresh_live"),
 		detachNoun:  i18n.T("freshness.detach_noun_rollback"),
-		reRun:       "kamakiri rollback",
+		resume:      i18n.T("freshness.detach_resume_live"),
 		showLiveURL: true,
 	}
 }
@@ -125,7 +126,7 @@ func PurgeMsgs() msgs {
 		lead:        i18n.T("freshness.lead_purge"),
 		fresh:       i18n.T("freshness.fresh_caches_flushed"),
 		detachNoun:  i18n.T("freshness.detach_noun_purge"),
-		reRun:       "kamakiri cdn purge",
+		resume:      i18n.T("freshness.detach_resume_caches_flushed"),
 		showLiveURL: false,
 	}
 }
@@ -157,16 +158,18 @@ func defaultPollSchedule(elapsed time.Duration) time.Duration {
 
 // EnvFreshnessPollMS names the environment variable that overrides the wait's
 // poll cadence with a fixed interval in milliseconds. It exists so an automated
-// suite can watch a deploy converge without waiting out the production backoff,
-// and is not meant for production use. Only Wait consults it.
+// suite can watch a deploy converge without waiting out the production backoff.
+// It is honoured only in a build made with the testhooks tag; any other build,
+// a release among them, keeps the production schedule. Only Wait consults it.
 const EnvFreshnessPollMS = "KAMAKIRI_FRESHNESS_POLL_MS"
 
-// pollScheduleFromEnv returns the cadence Wait uses. With EnvFreshnessPollMS set
-// to a positive integer N it polls every N milliseconds regardless of elapsed
-// time; an unset, empty, non-positive, or unparseable value falls back to
+// pollScheduleFromEnv returns the cadence Wait uses. In a testhooks build, with
+// EnvFreshnessPollMS set to a positive integer N, it polls every N milliseconds
+// regardless of elapsed time; an unset, empty, non-positive, or unparseable
+// value falls back to defaultPollSchedule. In any other build it always returns
 // defaultPollSchedule.
 func pollScheduleFromEnv() func(elapsed time.Duration) time.Duration {
-	if ms, err := strconv.Atoi(os.Getenv(EnvFreshnessPollMS)); err == nil && ms > 0 {
+	if ms, err := strconv.Atoi(testhooks.Getenv(EnvFreshnessPollMS)); err == nil && ms > 0 {
 		interval := time.Duration(ms) * time.Millisecond
 		return func(time.Duration) time.Duration { return interval }
 	}
@@ -531,6 +534,14 @@ func FormatBlocker(lead string, b api.Blocker) []string {
 	opening := blockerOpening(lead, provider)
 	switch b.Reason {
 	case reasonCredentialsRejected:
+		// The Cloudflare token is the platform's, not the user's, so there is no
+		// credential for them to update and the flush is retried without them.
+		if b.Provider == "cloudflare" {
+			return []string{
+				i18n.Tf("freshness.blocker_credentials_rejected_cloudflare", opening),
+				i18n.T("freshness.blocker_credentials_rejected_cloudflare_fix"),
+			}
+		}
 		return []string{
 			i18n.Tf("freshness.blocker_credentials_rejected", opening),
 			i18n.T("freshness.blocker_credentials_rejected_fix"),
@@ -579,11 +590,13 @@ func blockerOpening(lead, provider string) string {
 }
 
 // printDetach writes the detach block: the work is committed, keeps converging,
-// and can be watched again. Only an interrupt reaches it, since the wait has no
-// give-up timeout of its own.
+// and `kamakiri status` shows when it lands. It points at nothing else, since
+// no command re-attaches to this wait, and running a deploy or purge again
+// would start new work rather than watch this one. Only an interrupt reaches
+// it, since the wait has no give-up timeout of its own.
 func printDetach(out io.Writer, m msgs) {
 	fmt.Fprintln(out, i18n.Tf("freshness.detached", m.detachNoun))
-	fmt.Fprintln(out, i18n.Tf("freshness.detach_resume", m.reRun))
+	fmt.Fprintln(out, m.resume)
 }
 
 // providerDisplay maps a wire provider tag to its display name. The "CDN"

@@ -246,6 +246,58 @@ func TestUnknownCommandGoldens(t *testing.T) {
 	})
 }
 
+// A mistyped secret can ride on a flag (--token=...), so every line that echoes
+// an unparsable argument shows only the flag name when the value was attached
+// with an equals sign. The cdn and domain arms read credentials before they
+// parse, so these runs load a key first; each also asserts the redacted name
+// is printed, so a case cannot pass by never reaching the echo.
+func TestParseErrorsNeverEchoAFlagValue(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"domain add unknown flag", []string{"domain", "add", "example.com", "--colour=TOPSECRET"}, "Unknown flag: --colour\n"},
+		{"cdn verb that is a flag", []string{"cdn", "--token=TOPSECRET", "webaccel"}, "Unknown cdn command: --token\n"},
+		{"top level command that is a flag", []string{"--token=TOPSECRET"}, "Unknown command: --token\n"},
+		{"domain verb that is a flag", []string{"domain", "--token=TOPSECRET"}, "Unknown domain command: --token\n"},
+		{"subdomain verb that is a flag", []string{"subdomain", "--token=TOPSECRET"}, "Unknown subdomain command: --token\n"},
+		{"unexpected argument", []string{"upgrade", "--token=TOPSECRET"}, "Unexpected argument: --token\n"},
+		{"cdn webaccel unknown flag", []string{"cdn", "webaccel", "--secert=TOPSECRET"}, "--secert"},
+		{"cdn credentials unknown flag", []string{"cdn", "credentials", "--secert=TOPSECRET"}, "--secert"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_test")
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var stdout, stderr bytes.Buffer
+			code := run(c.args, strings.NewReader(""), &stdout, &stderr)
+
+			if code != 1 {
+				t.Errorf("`kamakiri %s` exited %d, want 1", strings.Join(c.args, " "), code)
+			}
+			got := stderr.String() + stdout.String()
+			if !strings.Contains(got, c.want) {
+				t.Errorf("output:\n%s\nwant it to contain %q", got, c.want)
+			}
+			if strings.Contains(got, "TOPSECRET") {
+				t.Errorf("output echoes the flag value:\n%s", got)
+			}
+		})
+	}
+}
+
+// A positional extra argument carries no secret, so it is still echoed whole.
+func TestUnexpectedPositionalArgumentIsEchoedWhole(t *testing.T) {
+	golden{
+		args:   []string{"upgrade", "extra=thing"},
+		stderr: "Usage: kamakiri upgrade\nUnexpected argument: extra=thing\n",
+		code:   1,
+	}.run(t)
+}
+
 // A command invoked without the argument it needs prints its own usage block
 // and nothing else.
 func TestMissingArgumentUsageGoldens(t *testing.T) {
@@ -491,6 +543,12 @@ func TestFlagErrorGoldens(t *testing.T) {
 			code:   1,
 		},
 		{
+			name:   "--yes is unknown for cdn webaccel",
+			args:   []string{"cdn", "webaccel", "--yes"},
+			stderr: "unknown flag for cdn webaccel: --yes\n",
+			code:   1,
+		},
+		{
 			name:   "unknown flag for cdn credentials",
 			args:   []string{"cdn", "credentials", "--bogus"},
 			stderr: "unknown flag for cdn credentials: --bogus\n",
@@ -521,6 +579,30 @@ func TestFlagErrorGoldens(t *testing.T) {
 			name:   "--alias with --status",
 			args:   []string{"domain", "add", "example.com", "--alias", "--status=302"},
 			stderr: "Error: --alias and --status are mutually exclusive\n",
+			code:   1,
+		},
+		{
+			name:   "--status before --alias",
+			args:   []string{"domain", "add", "example.com", "--status=302", "--alias"},
+			stderr: "Error: --alias and --status are mutually exclusive\n",
+			code:   1,
+		},
+		{
+			name:   "--status matching the default before --alias",
+			args:   []string{"domain", "add", "example.com", "--status=301", "--alias"},
+			stderr: "Error: --alias and --status are mutually exclusive\n",
+			code:   1,
+		},
+		{
+			name:   "--alias with --redirect",
+			args:   []string{"domain", "add", "example.com", "--alias", "--redirect"},
+			stderr: "Error: --alias and --redirect are mutually exclusive\n",
+			code:   1,
+		},
+		{
+			name:   "--redirect before --alias",
+			args:   []string{"domain", "add", "example.com", "--redirect", "--alias"},
+			stderr: "Error: --alias and --redirect are mutually exclusive\n",
 			code:   1,
 		},
 	})

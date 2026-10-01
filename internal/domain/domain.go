@@ -357,7 +357,7 @@ type APIClient interface {
 	SetCanonical(siteID, domain string) (*api.Domain, error)
 	UnsetCanonical(siteID string) (*api.UnsetCanonicalResult, error)
 	AddDomain(siteID, domain, role string, redirectStatus int) (*api.Domain, error)
-	RemoveDomain(domain string) (*api.RemoveDomainResult, error)
+	RemoveDomain(siteID, domain string) (*api.RemoveDomainResult, error)
 	ListDomains(siteID string) (*api.DomainList, error)
 
 	// GetSite is what the our-side waits poll: the domain verbs queue a change
@@ -367,7 +367,7 @@ type APIClient interface {
 	// RecheckDomain asks the server to re-probe the domain soon and returns its
 	// current status. No probe runs as part of the call, so the status it
 	// returns is not yet the result of that re-probe.
-	RecheckDomain(domain string) (*api.Domain, error)
+	RecheckDomain(siteID, domain string) (*api.Domain, error)
 
 	// The account-scoped registration calls. The Domain suffix keeps
 	// RegisterDomain from colliding with the concrete client's auth Register.
@@ -413,8 +413,9 @@ var watchVerifyFn = watchVerifyCtx
 // report the request and the current status, and return before the fresh result
 // lands.
 //
-// A linked project is required even though the server identifies the domain by
-// name and API-key ownership: its site id is what the watch then polls.
+// A linked project is required: its site id scopes the recheck, so a host
+// attached to another of the account's sites is refused rather than rechecked,
+// and it is what the watch then polls.
 func Verify(client APIClient, domainName string, noWait bool, out io.Writer) error {
 	// A piped or captured invocation must neither emit cursor control nor block
 	// on the watch, so it behaves as `--no-wait`.
@@ -430,8 +431,11 @@ func verify(client APIClient, domainName string, interactive bool, out io.Writer
 		return err
 	}
 
-	d, err := client.RecheckDomain(domainName)
+	d, err := client.RecheckDomain(config.ID, domainName)
 	if err != nil {
+		if otherSite := onOtherSiteError(err, domainName); otherSite != nil {
+			return otherSite
+		}
 		// With no domain row but a pending registration at this exact name,
 		// verify nudges and watches that registration instead. The match is by
 		// exact name, since you nudge a registration by the name you registered:
@@ -898,6 +902,11 @@ func unset(client APIClient, noWait, interactive bool, out io.Writer) error {
 
 	result, err := client.UnsetCanonical(config.ID)
 	if err != nil {
+		// The server sends no_canonical from `add` too, where the advice is to
+		// set one. Here the site has nothing to unset.
+		if isErrorCode(err, "no_canonical") {
+			return errors.New(i18n.T("domain.err_unset_no_canonical"))
+		}
 		return api.MapError(err)
 	}
 
@@ -946,6 +955,11 @@ func add(client APIClient, domainName, role string, redirectStatus int, interact
 
 	domain, err := client.AddDomain(config.ID, domainName, role, redirectStatus)
 	if err != nil {
+		// The server sends is_canonical from `remove` too, where the advice is
+		// to unset it. Here the host the user typed already is the canonical one.
+		if isErrorCode(err, "is_canonical") {
+			return errors.New(i18n.Tf("domain.err_add_is_canonical", domainName))
+		}
 		return api.MapError(err)
 	}
 
@@ -969,10 +983,11 @@ func add(client APIClient, domainName, role string, redirectStatus int, interact
 		syncOpts{verb: syncVerbLink, showInstructions: true, watch: true}, out)
 }
 
-// Remove removes a redirect or alias domain from the linked site. RequireProject
-// is a guardrail for the user, not a lookup key: the server identifies the
-// domain by name and API-key ownership, and its response carries the site id, so
-// the CLI can wait on the sync without knowing that id locally.
+// Remove removes a redirect or alias domain from the linked site. The server
+// finds the domain by name across the account's sites, and the linked site's id
+// scopes the removal: a domain attached to another of the account's sites is
+// refused rather than removed. The wait polls the site id the response
+// carries.
 func Remove(client APIClient, domainName string, noWait bool, out io.Writer) error {
 	interactive := !noWait && isTerminalWriter(out)
 	return remove(client, domainName, noWait, interactive, out)
@@ -980,13 +995,16 @@ func Remove(client APIClient, domainName string, noWait bool, out io.Writer) err
 
 // remove is the testable core of Remove, with the same three paths as unset.
 func remove(client APIClient, domainName string, noWait, interactive bool, out io.Writer) error {
-	_, err := core.RequireProject()
+	config, err := core.RequireProject()
 	if err != nil {
 		return err
 	}
 
-	result, err := client.RemoveDomain(domainName)
+	result, err := client.RemoveDomain(config.ID, domainName)
 	if err != nil {
+		if otherSite := onOtherSiteError(err, domainName); otherSite != nil {
+			return otherSite
+		}
 		return api.MapError(err)
 	}
 

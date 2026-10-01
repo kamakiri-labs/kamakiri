@@ -71,13 +71,13 @@ func (c *transitioningClient) UnsetCanonical(string) (*api.UnsetCanonicalResult,
 func (c *transitioningClient) AddDomain(string, string, string, int) (*api.Domain, error) {
 	return nil, errors.New("unexpected")
 }
-func (c *transitioningClient) RemoveDomain(string) (*api.RemoveDomainResult, error) {
+func (c *transitioningClient) RemoveDomain(string, string) (*api.RemoveDomainResult, error) {
 	return nil, errors.New("unexpected")
 }
 func (c *transitioningClient) GetSite(string) (*api.Site, error) {
 	return nil, errors.New("unexpected")
 }
-func (c *transitioningClient) RecheckDomain(string) (*api.Domain, error) {
+func (c *transitioningClient) RecheckDomain(string, string) (*api.Domain, error) {
 	return nil, errors.New("the watch reads status only and never triggers a recheck")
 }
 
@@ -998,7 +998,7 @@ func TestUnsetRemoveInteractiveTeardownOurSideOnly(t *testing.T) {
 
 	t.Run("remove", func(t *testing.T) {
 		client := &mockClient{
-			removeDomainFn: func(string) (*api.RemoveDomainResult, error) {
+			removeDomainFn: func(string, string) (*api.RemoveDomainResult, error) {
 				return &api.RemoveDomainResult{SiteID: "site123", SyncAttemptID: 9}, nil
 			},
 			listDomainsFn: noWatch,

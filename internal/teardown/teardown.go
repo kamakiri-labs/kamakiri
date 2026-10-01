@@ -35,7 +35,11 @@ var pollSchedule = syncwait.DefaultSchedule
 
 // Run drives the teardown flow: confirm, commit the deletion, wait for the
 // reconcile unless noWait is set, and remove the local config. The config goes
-// whatever the reconcile did, since it can only point at a site being deleted.
+// when the site is gone or on its way out with nothing reported wrong: on
+// success, with noWait, when the server no longer knows the site, on a version
+// refusal and on an interrupt. It stays when the wait reports a failed step or
+// cannot read the outcome at all, since neither shows the site gone, and
+// running `kamakiri teardown` again from this directory is the retry.
 func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 	config, err := core.RequireProject()
 	if err != nil {
@@ -56,8 +60,6 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 			return nil
 		case "unauthorized":
 			return api.UnauthorizedError()
-		case "forbidden":
-			return errors.New(i18n.T("api.err_forbidden"))
 		default:
 			return err
 		}
@@ -88,8 +90,6 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 				// that is left to remove.
 				removeProjectConfig(out)
 				return nil
-			case "forbidden":
-				return errors.New(i18n.T("api.err_forbidden"))
 			case "unauthorized":
 				return api.UnauthorizedError()
 			}
@@ -106,33 +106,42 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 
 	final, syncErr := waitForTeardown(client, config.ID, resp.SyncAttemptID, out)
 
+	stillLinked := false
 	switch {
 	case syncErr == nil:
 		fmt.Fprintln(out, i18n.T("teardown.done"))
 	case errors.Is(syncErr, api.ErrUpgradeRequired):
-		// Every failure label ends in "Check `kamakiri status`", a command the
-		// same floor refuses, and no teardown step failed anyway. Closing the open
-		// line is all this outcome needs; the sentinel carries the message.
+		// No failure was reported, and the still-linked line would point at
+		// commands the same floor refuses. Closing the open line is all this
+		// outcome needs; the sentinel carries the message.
 		fmt.Fprintln(out)
 	case errors.Is(syncErr, syncwait.ErrInterrupted):
 		// The wait has closed its own line and said the teardown carries on,
 		// and no step failed, so a label here would report a failure that did
 		// not happen.
 	default:
+		// A reconcile failure, or a wait that spent its read budget without
+		// learning the outcome. Neither shows the site gone, so the link stays
+		// for the retry to run from.
 		fmt.Fprintln(out, failureLabel(final))
+		stillLinked = true
 	}
 
 	// The notice belongs on every outcome, converged or not: what it reports is
 	// the user's own resource, which teardown never deletes either way.
 	printRetainedWebAccelNotice(out, resp.RetainedWebAccelResources)
 
-	removeProjectConfig(out)
+	if stillLinked {
+		fmt.Fprintln(out, i18n.T("teardown.failed_still_linked"))
+	} else {
+		removeProjectConfig(out)
+	}
 	return syncErr
 }
 
 // waitForTeardown blocks until the accepted deletion is reconciled, leaving the
 // in-progress line open for Run to terminate. Its stop copy is teardown's own
-// rather than the shared one: the local config goes on every outcome, so by the
+// rather than the shared one: an interrupt removes the local config, so by the
 // time an interrupted run is back at the prompt there is no linked site left
 // for `kamakiri status` to report on.
 func waitForTeardown(client APIClient, siteID string, attemptID int64, out io.Writer) (*api.Site, error) {
