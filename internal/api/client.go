@@ -726,6 +726,11 @@ var ErrUpgradeRequired = i18n.NewError("api.err_upgrade_required")
 // copy: that message names a particular thing this side does not hold (a size,
 // a cap, a host, a colliding id, or what made an upload invalid), which a copy
 // here would lose.
+//
+// The daily upload budget refusals, upload_budget_exhausted and
+// platform_budget_exhausted, have no arm on purpose: their message names things
+// only the server holds, such as the deploy's charge, what is left of the budget
+// and when it resets, so the server's message is the copy.
 func MapError(err error) error {
 	var apiErr *ErrorResponse
 	if !errors.As(err, &apiErr) {
@@ -791,6 +796,9 @@ func MapError(err error) error {
 	case "register_rate_limited":
 		// Distinct again, so a register flood inherits neither copy above.
 		return errors.New(i18n.T("api.err_register_rate_limited"))
+	case "rollback_rate_limited":
+		// Distinct again, so a rollback flood inherits none of the copies above.
+		return errors.New(i18n.T("api.err_rollback_rate_limited"))
 	case "invalid_domain":
 		return errors.New(i18n.T("api.err_invalid_domain"))
 	case "deploy_not_found":

@@ -460,7 +460,8 @@ func TestDeployEmptyDirectory(t *testing.T) {
 	dir := filepath.Join(".", "dist")
 	os.MkdirAll(dir, 0755)
 
-	// Only dotfiles, which the packer skips, so the directory packs to nothing.
+	// Only a root dotfile, which the packer skips, so the directory packs to
+	// nothing.
 	createFiles(t, dir, map[string]string{
 		".hidden": "hidden file",
 	})

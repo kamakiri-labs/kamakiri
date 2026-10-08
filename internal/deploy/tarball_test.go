@@ -78,7 +78,9 @@ func TestCreateBasicTarball(t *testing.T) {
 	}
 }
 
-func TestCreateSkipsAllDotfiles(t *testing.T) {
+// Every dot-named entry but the root .well-known/ is left out, and this tree
+// holds no .well-known.
+func TestCreateSkipsDotfiles(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "index.html"), []byte("hi"), 0644)
 	os.WriteFile(filepath.Join(dir, ".DS_Store"), []byte("ds"), 0644)
@@ -939,8 +941,8 @@ func TestCreateRefusesALinkToASiblingSharingTheRootsNamePrefix(t *testing.T) {
 	}
 }
 
-// A link whose own name starts with a dot is skipped even when its target is a
-// plain directory.
+// A link whose own name starts with a dot, other than the root .well-known, is
+// skipped even when its target is a plain directory.
 func TestCreateSkipsADotNamedLinkToAPlainDirectory(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, map[string]string{"shared/f.txt": "shared"})
@@ -965,6 +967,312 @@ func TestCreateFollowsAnAbsoluteDirectoryLinkInsideTheTree(t *testing.T) {
 	want := map[string]string{"shared/sub/a.txt": "a", "site/sub/a.txt": "a"}
 	if !reflect.DeepEqual(contents, want) {
 		t.Errorf("packed = %v, want %v", contents, want)
+	}
+}
+
+// The root .well-known/ is the one dot-named directory a deploy publishes.
+// Inside it the ordinary rules apply, so its own dot-named entries stay out,
+// and no other dot-named entry is let in, however close its name.
+func TestCreatePacksTheRootWellKnownDirectory(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"index.html":                     "hi",
+		".well-known/security.txt":       "contact",
+		".well-known/acme-challenge/tok": "token",
+		".well-known/.hidden":            "hidden",
+		".well-known/a/.hidden":          "hidden deeper",
+		"blog/index.html":                "blog",
+		"blog/.well-known/x":             "nested",
+		".well-knownx/y":                 "lookalike",
+		".well-known.bak/y":              "backup",
+		".env":                           "SECRET=x",
+		".git/config":                    "git",
+	})
+
+	_, contents, stats := packTree(t, dir)
+
+	want := map[string]string{
+		"index.html":                     "hi",
+		".well-known/security.txt":       "contact",
+		".well-known/acme-challenge/tok": "token",
+		"blog/index.html":                "blog",
+	}
+	if !reflect.DeepEqual(contents, want) {
+		t.Errorf("packed = %v, want %v", contents, want)
+	}
+	if stats.FileCount != len(want) {
+		t.Errorf("FileCount = %d, want %d", stats.FileCount, len(want))
+	}
+}
+
+// The exception is for the exact name, as the server's is for an archive. The
+// tree holds no .well-known of its own, since a case-insensitive filesystem
+// would take .Well-Known for it.
+func TestCreateSkipsADifferentlyCasedRootWellKnown(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"index.html": "hi", ".Well-Known/x": "cased"})
+
+	_, contents, _ := packTree(t, dir)
+
+	if want := map[string]string{"index.html": "hi"}; !reflect.DeepEqual(contents, want) {
+		t.Errorf("packed = %v, want %v", contents, want)
+	}
+}
+
+func TestCreateSkipsARootFileNamedWellKnown(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"index.html": "hi", ".well-known": "a file"})
+
+	_, contents, _ := packTree(t, dir)
+
+	if want := map[string]string{"index.html": "hi"}; !reflect.DeepEqual(contents, want) {
+		t.Errorf("packed = %v, want %v", contents, want)
+	}
+}
+
+// A root .well-known link is entered only when it resolves, inside the deploy
+// directory, to a directory whose own name is .well-known or plain and that is
+// not already being packed. Every other outcome leaves it out without failing
+// the deploy, as any root dot entry is left out. Each tree is the deploy
+// directory dir, with index.html, next to a directory outside it.
+func TestCreateRootWellKnownLink(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, dir, outside string)
+		want  map[string]string
+	}{
+		{
+			name: "to a plain directory",
+			setup: func(t *testing.T, dir, outside string) {
+				writeFiles(t, dir, map[string]string{"public/wk/security.txt": "contact"})
+				symlinkOrSkip(t, dir, ".well-known", "public/wk")
+			},
+			want: map[string]string{
+				"index.html":               "hi",
+				".well-known/security.txt": "contact",
+				"public/wk/security.txt":   "contact",
+			},
+		},
+		{
+			name: "to a .well-known directory below the root",
+			setup: func(t *testing.T, dir, outside string) {
+				writeFiles(t, dir, map[string]string{
+					"static/.well-known/security.txt": "contact",
+					"static/page.html":                "page",
+				})
+				symlinkOrSkip(t, dir, ".well-known", "static/.well-known")
+			},
+			want: map[string]string{
+				"index.html":               "hi",
+				".well-known/security.txt": "contact",
+				"static/page.html":         "page",
+			},
+		},
+		{
+			// The ordinary target-name check applies to each hop's end, so a
+			// chain that ends in a dot-directory is left out like a direct link.
+			name: "through a plain link to a dot-directory",
+			setup: func(t *testing.T, dir, outside string) {
+				writeFiles(t, dir, map[string]string{".git/config": "git"})
+				symlinkOrSkip(t, dir, "a", ".git")
+				symlinkOrSkip(t, dir, ".well-known", "a")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "to a dot-directory",
+			setup: func(t *testing.T, dir, outside string) {
+				writeFiles(t, dir, map[string]string{".git/config": "git"})
+				symlinkOrSkip(t, dir, ".well-known", ".git")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "to the deploy directory",
+			setup: func(t *testing.T, dir, outside string) {
+				symlinkOrSkip(t, dir, ".well-known", ".")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "dangling",
+			setup: func(t *testing.T, dir, outside string) {
+				symlinkOrSkip(t, dir, ".well-known", "missing")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "outside, absolute",
+			setup: func(t *testing.T, dir, outside string) {
+				symlinkOrSkip(t, dir, ".well-known", filepath.ToSlash(outside))
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "outside, relative",
+			setup: func(t *testing.T, dir, outside string) {
+				symlinkOrSkip(t, dir, ".well-known", "../outside")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			name: "to a file",
+			setup: func(t *testing.T, dir, outside string) {
+				symlinkOrSkip(t, dir, ".well-known", "index.html")
+			},
+			want: map[string]string{"index.html": "hi"},
+		},
+		{
+			// The ordinary target-name check still applies to a plainly named
+			// link, which would publish the root .well-known under its own name.
+			name: "a plain link to the root .well-known",
+			setup: func(t *testing.T, dir, outside string) {
+				writeFiles(t, dir, map[string]string{".well-known/security.txt": "contact"})
+				symlinkOrSkip(t, dir, "wk", ".well-known")
+			},
+			want: map[string]string{"index.html": "hi", ".well-known/security.txt": "contact"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			dir := filepath.Join(base, "site")
+			outside := filepath.Join(base, "outside")
+			writeFiles(t, dir, map[string]string{"index.html": "hi"})
+			writeFiles(t, outside, map[string]string{"secret.txt": "sensitive"})
+			tc.setup(t, dir, outside)
+
+			_, contents, _ := packTree(t, dir)
+
+			if !reflect.DeepEqual(contents, tc.want) {
+				t.Errorf("packed = %v, want %v", contents, tc.want)
+			}
+		})
+	}
+}
+
+func TestCreateRefusesALinkLeavingTheTreeInsideTheRootWellKnown(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"index.html": "hi", ".well-known/security.txt": "contact"})
+	outside := t.TempDir()
+	writeFiles(t, outside, map[string]string{"secret.txt": "sensitive"})
+	symlinkOrSkip(t, dir, ".well-known/esc", filepath.ToSlash(outside))
+
+	resolved, err := filepath.EvalSymlinks(outside)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks: %v", err)
+	}
+	want := fmt.Sprintf("symlink %s points outside directory: %s", filepath.Join(".well-known", "esc"), resolved)
+	if err := createError(t, dir); err.Error() != want {
+		t.Errorf("Create() error = %q, want %q", err, want)
+	}
+}
+
+// .well-known sorts before public, so public/wk is first reached through the
+// root link, and the loop is named by that path.
+func TestCreateRefusesALoopBelowARootWellKnownLink(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"public/wk/sub/page.txt": "page"})
+	symlinkOrSkip(t, dir, ".well-known", "public/wk")
+	symlinkOrSkip(t, dir, "public/wk/sub/up", "..")
+
+	if err := createError(t, dir); err.Error() != loopLine(".well-known/sub/up") {
+		t.Errorf("Create() error = %q, want %q", err, loopLine(".well-known/sub/up"))
+	}
+}
+
+// A root .well-known reached through a link counts toward the linked-directory
+// bound and is the innermost link below it, as any directory link is; a real
+// one counts nothing.
+func TestCreateCountsARootWellKnownLinkAsALinkedDirectory(t *testing.T) {
+	t.Run("a link", func(t *testing.T) {
+		lowerMaxLinkedDirs(t, 0)
+		dir := t.TempDir()
+		writeFiles(t, dir, map[string]string{"public/wk/security.txt": "contact"})
+		symlinkOrSkip(t, dir, ".well-known", "public/wk")
+
+		if err := createError(t, dir); err.Error() != fanoutLine(0, ".well-known") {
+			t.Errorf("Create() error = %q, want %q", err, fanoutLine(0, ".well-known"))
+		}
+	})
+
+	t.Run("a directory", func(t *testing.T) {
+		lowerMaxLinkedDirs(t, 0)
+		dir := t.TempDir()
+		writeFiles(t, dir, map[string]string{".well-known/security.txt": "contact"})
+
+		_, contents, _ := packTree(t, dir)
+
+		if want := map[string]string{".well-known/security.txt": "contact"}; !reflect.DeepEqual(contents, want) {
+			t.Errorf("packed = %v, want %v", contents, want)
+		}
+	})
+}
+
+// Below a root .well-known link the pack path is bounded like any path below a
+// followed link, and the pack path starts at ".well-known". The tree cannot be
+// built with the bound reached under the link alone (a real path as long as the
+// pack path would pass the filesystem's own limit), so a chain of links under
+// it carries the length, as buildLinkChain does, and the innermost link named
+// is the last of the chain. A real root .well-known/ has no link above it, and
+// the same depth cannot be built there for the same reason, so only the link is
+// pinned.
+func TestCreateBoundsThePackPathBelowARootWellKnownLink(t *testing.T) {
+	linkName := strings.Repeat("n", 250)
+	const levels = 16 // ".well-known" plus 16 names of 250 bytes is 4027 bytes before the file
+	build := func(t *testing.T, fileName string) (dir, lastLink string) {
+		t.Helper()
+		dir = t.TempDir()
+		symlinkOrSkip(t, dir, ".well-known", "public/wk")
+		lastLink = wellKnown
+		for i := 0; i < levels; i++ {
+			from := fmt.Sprintf("public/d%d", i)
+			if i == 0 {
+				from = "public/wk"
+			}
+			writeFiles(t, dir, map[string]string{from + "/.keep": ""})
+			symlinkOrSkip(t, dir, from+"/"+linkName, fmt.Sprintf("../d%d", i+1))
+			lastLink += "/" + linkName
+		}
+		writeFiles(t, dir, map[string]string{fmt.Sprintf("public/d%d/%s", levels, fileName): "end"})
+		return dir, lastLink
+	}
+
+	t.Run("exactly the bound packs", func(t *testing.T) {
+		fileName := strings.Repeat("f", 4096-4027-1)
+		dir, lastLink := build(t, fileName)
+
+		_, contents, _ := packTree(t, dir)
+
+		if got := contents[filepath.ToSlash(lastLink)+"/"+fileName]; got != "end" {
+			t.Errorf("the file at the end of the chain was not packed under .well-known")
+		}
+	})
+
+	t.Run("one byte over is refused naming the innermost link", func(t *testing.T) {
+		dir, lastLink := build(t, strings.Repeat("f", 4096-4027))
+
+		if err := createError(t, dir); err.Error() != pathTooLongLine(lastLink) {
+			t.Errorf("Create() error = %q, want %q", err, pathTooLongLine(lastLink))
+		}
+	})
+}
+
+// .well-known sorts before index.html, so the root .well-known/ fills the cap
+// and index.html is the file after it.
+func TestCreateCountsTheRootWellKnownTowardTheFileCountCap(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{"index.html": "hi"}
+	for i := 0; i < MaxFileCount; i++ {
+		files[fmt.Sprintf(".well-known/f%d.txt", i)] = "x"
+	}
+	writeFiles(t, dir, files)
+
+	_, stats, err := Create(dir, MaxTotalSize)
+	if !errors.Is(err, ErrTooManyFiles) {
+		t.Fatalf("Create() error = %v, want ErrTooManyFiles", err)
+	}
+	if stats.FileCount != MaxFileCount {
+		t.Errorf("stats.FileCount = %d, want %d", stats.FileCount, MaxFileCount)
 	}
 }
 

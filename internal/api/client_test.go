@@ -1168,6 +1168,47 @@ func TestMapErrorRegisterRateLimited(t *testing.T) {
 	}
 }
 
+func TestMapErrorRollbackRateLimited(t *testing.T) {
+	const serverMsg = "You're rolling back very frequently. Wait a moment and try again."
+	got := MapError(&ErrorResponse{Code: "rollback_rate_limited", Message: serverMsg}).Error()
+	want := "you're rolling back very frequently. Wait a moment and try again"
+	if got != want {
+		t.Errorf("MapError(rollback_rate_limited) = %q, want the rollback copy %q", got, want)
+	}
+	if got == serverMsg {
+		t.Errorf("MapError(rollback_rate_limited) passed the server message through: %q", got)
+	}
+	// A distinct code again, so a rollback flood inherits none of the other
+	// limiters' copy.
+	if strings.Contains(got, "Automatic checks continue") || strings.Contains(got, "checked very recently") {
+		t.Errorf("MapError(rollback_rate_limited) leaked the recheck copy: %q", got)
+	}
+	if strings.Contains(got, "deploying very frequently") {
+		t.Errorf("MapError(rollback_rate_limited) leaked the deploy copy: %q", got)
+	}
+	if strings.Contains(got, "registering domains very frequently") {
+		t.Errorf("MapError(rollback_rate_limited) leaked the register copy: %q", got)
+	}
+}
+
+// The daily upload budget refusals carry a message naming things only the server
+// holds, such as the deploy's charge, what is left of the budget and when it
+// resets. A future arm for either code must not replace that message with copy of
+// its own.
+func TestMapErrorUploadBudgetCodesEchoServerMessage(t *testing.T) {
+	cases := map[string]string{
+		"upload_budget_exhausted":   "This deploy needs 121 uploads (120 files plus its configuration), and your account has 37 of its 100,000 daily uploads left. The budget resets at 00:00 JST (in about 3h 12m). To ask for a higher budget, email support@kamakiri-labs.jp.",
+		"platform_budget_exhausted": "Deploys are paused for every account until 00:00 JST (in about 3h 12m), when the platform's daily upload budget resets. We are notified automatically when this happens. Sites already live keep serving.",
+	}
+
+	for code, msg := range cases {
+		got := MapError(&ErrorResponse{Code: code, Message: msg}).Error()
+		if got != msg {
+			t.Errorf("MapError(%s) = %q, want the server message %q", code, got, msg)
+		}
+	}
+}
+
 func TestListDeploysSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {

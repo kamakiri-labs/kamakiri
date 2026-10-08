@@ -26,6 +26,7 @@
   "api.err_registration_limit": "確認待ちのドメイン登録が上限に達しています。いずれかを確認するか削除してから、新しいドメインを登録してください",
   "api.err_request_failed": "リクエストの送信",
   "api.err_requires_webaccel_mode": "このサイトには更新対象の WebAccel 設定がありません。先に \"kamakiri cdn webaccel\" を実行してください",
+  "api.err_rollback_rate_limited": "短時間にロールバックが繰り返されています。少し時間をおいてからもう一度お試しください",
   "api.err_server_returned": "サーバーが%dを返しました",
   "api.err_site_not_found": "サイトが見つかりません。\"kamakiri init\" を実行してください",
   "api.err_subdomain_reserved": "このサブドメインは予約されています。別のサブドメインを指定してください",

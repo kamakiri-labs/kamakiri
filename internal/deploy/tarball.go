@@ -59,6 +59,10 @@ var maxLinkedDirs = MaxFileCount
 // so the server's extraction onto disk could not hold a longer one anyway.
 const maxPackPathLen = 4096
 
+// wellKnown is the one dot-named entry a deploy publishes, and only as a
+// directory at the top of the deploy directory.
+const wellKnown = ".well-known"
+
 // tempTarball is the archive Create hands back: the temp file it packed into,
 // with a Close that also removes the file from disk. It embeds *os.File so the
 // value stays an io.ReadSeeker, which callers rely on to measure the archive
@@ -88,7 +92,11 @@ func (t *tempTarball) Close() error {
 // rules hold at every depth, below a followed link included:
 //
 //   - An entry whose own name starts with a dot is skipped, and a
-//     dot-directory is not entered.
+//     dot-directory is not entered, except for an entry at the top of dir
+//     named exactly .well-known. That one is entered when it resolves, inside
+//     dir, to a directory whose own name is .well-known or does not start with
+//     a dot and that is not dir itself; otherwise it is skipped without an
+//     error, whatever it is. Below it every rule here holds as anywhere else.
 //   - Every other entry is resolved through its symlinks. A target outside dir
 //     is an error naming the entry, and a target whose own name starts with a
 //     dot is skipped. Only the entry's name and the target's last component
@@ -196,9 +204,15 @@ func (w *walker) walk(dirPath, prefix string, onPath map[string]bool, link strin
 	}
 
 	for _, entry := range entries {
-		// Dotfiles are never published: .git, .env and the like would put
-		// history and secrets on a public site.
 		name := entry.Name()
+		if prefix == "" && name == wellKnown {
+			if err := w.enterRootWellKnown(filepath.Join(dirPath, name), onPath); err != nil {
+				return err
+			}
+			continue
+		}
+		// Every other dot-named entry is left out: .git, .env and the like
+		// would put history and secrets on a public site.
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
@@ -217,7 +231,7 @@ func (w *walker) walk(dirPath, prefix string, onPath map[string]bool, link strin
 		if err != nil {
 			return fmt.Errorf("%s: %w", i18n.Tf("deploy.err_resolve_symlink", rel), err)
 		}
-		if !strings.HasPrefix(resolved, w.absDir+string(filepath.Separator)) && resolved != w.absDir {
+		if !w.inside(resolved) {
 			return errors.New(i18n.Tf("deploy.err_symlink_outside", rel, resolved))
 		}
 		if strings.HasPrefix(filepath.Base(resolved), ".") {
@@ -250,6 +264,44 @@ func (w *walker) walk(dirPath, prefix string, onPath map[string]bool, link strin
 		}
 	}
 	return nil
+}
+
+// enterRootWellKnown enters the entry named .well-known at the top of the
+// deploy directory, at path, when it is a directory or a link to one that may
+// be published under that name, and otherwise leaves it out without an error,
+// as every other dot-named entry at the top is left out.
+//
+// .well-known is the one dot-named directory a static site needs (RFC 8615:
+// security.txt, ACME challenges, app links), and the server publishes the same
+// directory from an uploaded archive. Its own name skips the dot rule, so the
+// target's name is checked here instead, or a link .well-known -> .git would
+// publish .git. A target already on the descent path, which here can only be
+// the deploy directory itself, is left out here too, before enter would call
+// it a loop and fail the deploy.
+func (w *walker) enterRootWellKnown(path string, onPath map[string]bool) error {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || !w.inside(resolved) || onPath[resolved] {
+		return nil
+	}
+	if base := filepath.Base(resolved); base != wellKnown && strings.HasPrefix(base, ".") {
+		return nil
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	link := ""
+	if resolved != path {
+		link = wellKnown
+	}
+	return w.enter(resolved, wellKnown, onPath, link)
+}
+
+// inside reports whether resolved, a path with every symlink resolved, is the
+// deploy directory or below it. The separator keeps a sibling whose name only
+// starts with the directory's name outside.
+func (w *walker) inside(resolved string) bool {
+	return strings.HasPrefix(resolved, w.absDir+string(filepath.Separator)) || resolved == w.absDir
 }
 
 // enter walks the directory at resolved, packing its entries under prefix, with
@@ -301,8 +353,8 @@ func (w *walker) enter(resolved, prefix string, onPath map[string]bool, link str
 // open would need only search permission. So a file reached through a link
 // into a dot-directory cannot be opened when that dot-directory, or any
 // directory inside it on the way to the file, grants search but not read. The
-// walk itself lists every directory outside dot-directories, which needs read
-// permission anyway.
+// walk itself lists every directory outside dot-directories, and the root
+// .well-known, which needs read permission anyway.
 func (w *walker) pack(resolved, rel string, info os.FileInfo) error {
 	if w.stats.FileCount+1 > MaxFileCount {
 		return ErrTooManyFiles

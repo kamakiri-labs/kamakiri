@@ -248,6 +248,55 @@ func TestRollbackDeployNotFound(t *testing.T) {
 	}
 }
 
+func TestRollbackRateLimited(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProject(t)
+
+	const serverMsg = "You're rolling back very frequently. Wait a moment and try again."
+	client := &mockClient{
+		rollbackFn: func(_, _ string) (*api.DeployResult, error) {
+			return nil, &api.ErrorResponse{Code: "rollback_rate_limited", Message: serverMsg}
+		},
+		getSiteFn: flunkGetSite(t),
+	}
+
+	var out bytes.Buffer
+	err := Run(client, "20260401-100000-000", false, &out)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	want := "you're rolling back very frequently. Wait a moment and try again"
+	if err.Error() != want {
+		t.Errorf("error = %q, want the rollback copy %q", err.Error(), want)
+	}
+}
+
+// The platform-budget refusal names the reset and the time left, which only the
+// server holds, so the rollback reports its message as it is.
+func TestRollbackPlatformBudgetExhausted(t *testing.T) {
+	t.Chdir(t.TempDir())
+	setupCredentials(t)
+	setupProject(t)
+
+	const serverMsg = "Rollbacks and deploys are paused for every account until 00:00 JST (in about 3h 12m), when the platform's daily upload budget resets. We are notified automatically when this happens. Sites already live keep serving."
+	client := &mockClient{
+		rollbackFn: func(_, _ string) (*api.DeployResult, error) {
+			return nil, &api.ErrorResponse{Code: "platform_budget_exhausted", Message: serverMsg}
+		},
+		getSiteFn: flunkGetSite(t),
+	}
+
+	var out bytes.Buffer
+	err := Run(client, "20260401-100000-000", false, &out)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() != serverMsg {
+		t.Errorf("error = %q, want the server message %q", err.Error(), serverMsg)
+	}
+}
+
 // A deploy that is already live must not enter the wait: with nothing enqueued,
 // the wait would settle on an unrelated earlier reconcile and report success for
 // work that never ran.

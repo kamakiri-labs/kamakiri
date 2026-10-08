@@ -26,6 +26,7 @@
   "api.err_registration_limit": "too many pending registrations awaiting verification. Verify or remove one before registering another",
   "api.err_request_failed": "request failed",
   "api.err_requires_webaccel_mode": "this site has no WebAccel configuration to update. Run \"kamakiri cdn webaccel\" first",
+  "api.err_rollback_rate_limited": "you're rolling back very frequently. Wait a moment and try again",
   "api.err_server_returned": "server returned %d",
   "api.err_site_not_found": "site not found. Run \"kamakiri init\"",
   "api.err_subdomain_reserved": "that subdomain is reserved. Choose another",
