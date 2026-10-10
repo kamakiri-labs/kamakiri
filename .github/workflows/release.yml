@@ -91,7 +91,7 @@ jobs:
       # actions number their majors separately, and this v8 download is the one
       # released alongside the v7 upload above.
       - name: Download the built artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dist
           path: dist
@@ -139,7 +139,7 @@ jobs:
       # contents without that prefix, so a download left where it lands by
       # default would leave nothing at that path.
       - name: Download the built artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dist
           path: dist
