@@ -59,12 +59,14 @@ homebrew_casks:
     # clears the attribute by hand. The hook clears the whole staged directory
     # rather than naming the file inside it because the staged file's name is
     # per-architecture (kamakiri-darwin-arm64 and its siblings), and "-dr" is
-    # recursive.
+    # recursive. The body is Homebrew's structured steps language, not Ruby, so
+    # on_macos stands in for an OS check and {{ .StagedPath }} renders to
+    # Homebrew's own staged_path token, resolved at install time.
     hooks:
       post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}"]
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}"]
           end
 
 release:
