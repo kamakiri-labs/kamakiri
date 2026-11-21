@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/keyname"
 )
 
 // devVersion is the token a build that was never stamped with a version states.
@@ -703,6 +704,32 @@ type ErrorResponse struct {
 	// the code was issued to. It is a pointer because 0, no attempts left, is an
 	// answer of its own, while nil means the server did not say.
 	AttemptsLeft *int `json:"attempts_left,omitempty"`
+
+	// Key and Sites are carried by the two refusals of a deploy key that
+	// reached past its scope, deploy_key_refused and site_not_in_key: the key
+	// the request was made with, and the sites it is bound to, in the key's
+	// order. Site, on site_not_in_key only, is the site of the account the key
+	// was refused.
+	Key   *KeyInfo      `json:"key,omitempty"`
+	Sites []LabeledSite `json:"sites,omitempty"`
+	Site  *LabeledSite  `json:"site,omitempty"`
+
+	// Reference is the site a key_site_not_found refusal could not match, as
+	// the server echoes it: normalized, and expanded to a full subdomain host
+	// when it holds no dot, so it may name a host the user never typed.
+	Reference string `json:"reference,omitempty"`
+
+	// Limit is the most deploy keys an account may hold, carried by a
+	// deploy_key_limit refusal. Zero means the server did not say.
+	Limit int `json:"limit,omitempty"`
+}
+
+// LabeledSite is a site as the API names it to a person: its ID, and its
+// label, the site's canonical domain when it has one and its full subdomain
+// host otherwise. A site that is no longer active is labelled with its ID.
+type LabeledSite struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
 func (e *ErrorResponse) Error() string {
@@ -799,6 +826,12 @@ func MapError(err error) error {
 	case "rollback_rate_limited":
 		// Distinct again, so a rollback flood inherits none of the copies above.
 		return errors.New(i18n.T("api.err_rollback_rate_limited"))
+	case "key_create_rate_limited":
+		// Distinct again. The limit is counted over an hour, so the copy says
+		// later rather than in a moment.
+		return errors.New(i18n.T("api.err_key_create_rate_limited"))
+	case "deploy_key_refused", "site_not_in_key", "key_site_not_found", "deploy_key_limit":
+		return deployKeyError(apiErr)
 	case "invalid_domain":
 		return errors.New(i18n.T("api.err_invalid_domain"))
 	case "deploy_not_found":
@@ -829,6 +862,79 @@ func MapError(err error) error {
 	}
 }
 
+// deployKeyError words the refusals a deploy key, or the creation of one, can
+// meet, from the fields their bodies carry. The server always fills those
+// fields, but a body that leaves a slot with nothing to show gets the line that
+// names no particulars, so no sentence prints with a hole in it.
+func deployKeyError(apiErr *ErrorResponse) error {
+	switch apiErr.Code {
+	case "deploy_key_refused":
+		name, sites := deployKeyName(apiErr.Key), siteLabels(apiErr.Sites)
+		if name == "" || sites == "" {
+			return errors.New(i18n.T("api.err_deploy_key_refused_generic"))
+		}
+		return errors.New(i18n.Tf("api.err_deploy_key_refused", name, sites))
+	case "site_not_in_key":
+		name, sites := deployKeyName(apiErr.Key), siteLabels(apiErr.Sites)
+		var refused string
+		if apiErr.Site != nil {
+			refused = siteLabel(*apiErr.Site)
+		}
+		if name == "" || sites == "" || refused == "" {
+			return errors.New(i18n.T("api.err_site_not_in_key_generic"))
+		}
+		return errors.New(i18n.Tf("api.err_site_not_in_key", name, refused, sites))
+	case "key_site_not_found":
+		if apiErr.Reference == "" {
+			return errors.New(i18n.T("api.err_key_site_not_found_generic"))
+		}
+		return errors.New(i18n.Tf("api.err_key_site_not_found", keyname.Escape(apiErr.Reference)))
+	case "deploy_key_limit":
+		if apiErr.Limit <= 0 {
+			return errors.New(i18n.T("api.err_deploy_key_limit_generic"))
+		}
+		return errors.New(i18n.Tf("api.err_deploy_key_limit", apiErr.Limit))
+	default:
+		return apiErr
+	}
+}
+
+// deployKeyName is the escaped name of the key a refusal names, or "" when it
+// names none.
+func deployKeyName(key *KeyInfo) string {
+	if key == nil {
+		return ""
+	}
+	return keyname.Escape(key.Name)
+}
+
+// siteLabel is how a site is shown in a line of copy: its label, or its ID when
+// it has none, as the server labels a site that is no longer active, escaped
+// either way since both come from the server. It is "" for a site with
+// neither.
+func siteLabel(site LabeledSite) string {
+	if site.Label != "" {
+		return keyname.Escape(site.Label)
+	}
+	return keyname.Escape(site.ID)
+}
+
+// siteLabels joins the labels of sites, in their order, with the list
+// separator of the language in force. A site with nothing to show is left out,
+// and it is "" when none has anything. It is the one rendering of a list of
+// sites: the deploy-key refusals here, the Sites column of `key list` and the
+// Sites row of `status` all print it, so a label is escaped and joined the same
+// way wherever it appears.
+func siteLabels(sites []LabeledSite) string {
+	labels := make([]string, 0, len(sites))
+	for _, site := range sites {
+		if label := siteLabel(site); label != "" {
+			labels = append(labels, label)
+		}
+	}
+	return strings.Join(labels, i18n.T("common.list_separator"))
+}
+
 // RegisterResponse is the response from POST /v1/auth/register.
 type RegisterResponse struct {
 	Message string `json:"message"`
@@ -843,9 +949,85 @@ type RegisterResponse struct {
 	ExpiresIn int `json:"expires_in"`
 }
 
-// VerifyResponse is the response from POST /v1/auth/verify.
+// VerifyResponse is the response from POST /v1/auth/verify. Key is nil when the
+// server does not report the key it issued, as an older one does not. Revoked
+// lists the other keys of the account the verify revoked, in list order; the
+// server sends it only when the request asked for the revoke.
 type VerifyResponse struct {
-	APIKey string `json:"api_key"`
+	APIKey  string    `json:"api_key"`
+	Key     *KeyInfo  `json:"key"`
+	Revoked []KeyInfo `json:"revoked"`
+}
+
+// KeyInfo identifies an API key: the ID that is its public handle, and its
+// name.
+type KeyInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// Key is an API key of the account as the key routes describe it. Kind and
+// ResourceIDs say what the key may act on: a login key acts on the whole
+// account and carries no resource IDs, while a deploy key names the sites it is
+// bound to. Sites is those same sites, labelled, in the order of ResourceIDs; it
+// is nil for a login key, which the server sends as null, and for a server too
+// old to send it at all. CreatedAt is when the key was issued, and LastUsedAt
+// when it was last used, both RFC 3339 in UTC; LastUsedAt is nil for a key
+// never used. Current marks the key the request was made with.
+type Key struct {
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Kind        string        `json:"kind"`
+	ResourceIDs []string      `json:"resource_ids"`
+	Sites       []LabeledSite `json:"sites"`
+	CreatedAt   string        `json:"created_at"`
+	LastUsedAt  *string       `json:"last_used_at"`
+	Current     bool          `json:"current"`
+}
+
+// SitesText is the text that names the sites a limited key may act on: the
+// labels the server sent, or, when those yield nothing (no sites at all, an
+// empty list, or entries with neither label nor ID), the resource IDs the key
+// names, rendered the same way. It is "" only when the key names nothing to
+// show, so a limited key is never shown with a hole. It is meaningful for a
+// non-login key; a login key acts on the whole account.
+func (k Key) SitesText() string {
+	if text := siteLabels(k.Sites); text != "" {
+		return text
+	}
+	byID := make([]LabeledSite, len(k.ResourceIDs))
+	for i, id := range k.ResourceIDs {
+		byID[i] = LabeledSite{ID: id}
+	}
+	return siteLabels(byID)
+}
+
+// KindText is the key's kind as the CLI prints it: the two kinds it knows,
+// login and deploy, in the words of the language in force, and any other kind
+// as the server sent it, so a kind added on the server later still shows
+// something true. It is for display only; a decision on the kind reads Kind.
+func (k Key) KindText() string {
+	switch k.Kind {
+	case "login":
+		return i18n.T("key.kind_login")
+	case "deploy":
+		return i18n.T("key.kind_deploy")
+	default:
+		return k.Kind
+	}
+}
+
+// KeyList is the response from GET /v1/keys.
+type KeyList struct {
+	Keys []Key `json:"keys"`
+}
+
+type keyResponse struct {
+	Key Key `json:"key"`
+}
+
+type revokedKeyResponse struct {
+	Key KeyInfo `json:"key"`
 }
 
 // Register calls POST /v1/auth/register. With resend false the server answers
@@ -868,12 +1050,23 @@ func (c *Client) Register(email string, tosAccepted bool, secretHash string, res
 	return &result, nil
 }
 
-// Verify calls POST /v1/auth/verify.
-func (c *Client) Verify(email, code, secret string) (*VerifyResponse, error) {
+// Verify calls POST /v1/auth/verify. The name is what the issued key will be
+// called. An empty one is left out of the body, since the server refuses an
+// empty name and names the key itself when none is sent. With revokeOthers the
+// server also revokes every other key of the account, in the same step that
+// issues this one; without it the field is left out, which the server reads as
+// false.
+func (c *Client) Verify(email, code, secret, name string, revokeOthers bool) (*VerifyResponse, error) {
 	body := map[string]any{
 		"email":  email,
 		"code":   code,
 		"secret": secret,
+	}
+	if name != "" {
+		body["name"] = name
+	}
+	if revokeOthers {
+		body["revoke_others"] = true
 	}
 
 	var result VerifyResponse
@@ -881,6 +1074,149 @@ func (c *Client) Verify(email, code, secret string) (*VerifyResponse, error) {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// ListKeys calls GET /v1/keys (authenticated, account-scoped). It returns every
+// key of the account, oldest first.
+func (c *Client) ListKeys() ([]Key, error) {
+	var result KeyList
+	if err := c.doJSON("GET", "/v1/keys", nil, &result); err != nil {
+		return nil, err
+	}
+	return result.Keys, nil
+}
+
+// CurrentKey calls GET /v1/keys/current (authenticated): the key this client
+// authenticates with, as the list would show it.
+//
+// An answer that names no key is an error, as it is for RevokeCurrentKey, since
+// a 200 may carry an empty object and status, which renders the Key row from
+// the key, would misread one.
+func (c *Client) CurrentKey() (*Key, error) {
+	var result keyResponse
+	if err := c.doJSON("GET", "/v1/keys/current", nil, &result); err != nil {
+		return nil, err
+	}
+	if result.Key.ID == "" {
+		return nil, errResponseNamesNoKey()
+	}
+	return &result.Key, nil
+}
+
+// RenameKey calls PATCH /v1/keys/:id (authenticated) and returns the key as the
+// server stored it. An id that is no key of the account fails with
+// key_not_found.
+func (c *Client) RenameKey(id, name string) (*Key, error) {
+	body := map[string]string{"name": name}
+	var result keyResponse
+	if err := c.doJSON("PATCH", "/v1/keys/"+url.PathEscape(id), body, &result); err != nil {
+		return nil, err
+	}
+	return &result.Key, nil
+}
+
+// CreatedKey is the answer to POST /v1/keys: the new deploy key, described as
+// the list describes a key, and APIKey, the key itself, which the server shows
+// in this answer only.
+type CreatedKey struct {
+	Key    Key    `json:"key"`
+	APIKey string `json:"api_key"`
+}
+
+// CreateKey calls POST /v1/keys (authenticated) to create a deploy key bound to
+// the sites named, in the order given. An empty name is left out of the body
+// rather than sent, since the server refuses an empty or null name and applies
+// its default only to an absent one, so the default lives on the server alone.
+//
+// An answer that carries no key is an error: a 2xx may carry an empty object,
+// and the caller would print an empty line where the key belongs.
+func (c *Client) CreateKey(name string, sites []string) (*CreatedKey, error) {
+	body := map[string]any{"sites": sites}
+	if name != "" {
+		body["name"] = name
+	}
+
+	var result CreatedKey
+	if err := c.doJSON("POST", "/v1/keys", body, &result); err != nil {
+		return nil, err
+	}
+	if result.APIKey == "" {
+		return nil, errResponseNamesNoKey()
+	}
+	return &result, nil
+}
+
+// RotatedKey is the answer to POST /v1/keys/:id/rotate. Key describes the new
+// deploy key as the list describes a key. APIKey is the key itself, which the
+// server shows in this answer only. Replaced holds the ID and name of the key
+// it replaced, which no longer exists.
+type RotatedKey struct {
+	Key      Key     `json:"key"`
+	APIKey   string  `json:"api_key"`
+	Replaced KeyInfo `json:"replaced"`
+}
+
+// RotateKey calls POST /v1/keys/:id/rotate (authenticated) to replace the
+// deploy key id with a new one of the same name and sites, revoking the old
+// one in the same step. The request carries no body. A login key is refused
+// with key_not_rotatable, and an id that is no key of the account fails with
+// key_not_found.
+//
+// An answer that carries no key is an error, as it is for CreateKey: the
+// caller would print an empty line where the key belongs, and the old key may
+// already be gone.
+func (c *Client) RotateKey(id string) (*RotatedKey, error) {
+	var result RotatedKey
+	if err := c.doJSON("POST", "/v1/keys/"+url.PathEscape(id)+"/rotate", nil, &result); err != nil {
+		return nil, err
+	}
+	if result.APIKey == "" {
+		return nil, errResponseNamesNoKey()
+	}
+	return &result, nil
+}
+
+// RevokeKey calls DELETE /v1/keys/:id (authenticated) and returns the ID and
+// name of the key it revoked. The key this client authenticates with is refused
+// with current_key, and an id that is no key of the account fails with
+// key_not_found.
+func (c *Client) RevokeKey(id string) (*KeyInfo, error) {
+	var result revokedKeyResponse
+	if err := c.doJSON("DELETE", "/v1/keys/"+url.PathEscape(id), nil, &result); err != nil {
+		return nil, err
+	}
+	return &result.Key, nil
+}
+
+// errUnsafeRedirect is what a request fails with when the server redirects it
+// to one of another method, one that no longer carries the API key, or one that
+// moves from https to http; doRaw says why each is refused. Its message is
+// looked up when it is printed, since this value is built before the language
+// is resolved.
+var errUnsafeRedirect = i18n.NewError("api.err_unsafe_redirect")
+
+// errResponseNamesNoKey is what a read or revoke of the current key fails with
+// when its answer names no key. It is built on each call so it renders in the
+// language in force.
+func errResponseNamesNoKey() error {
+	return fmt.Errorf("%s: %w", i18n.T("api.err_parse_response"), errors.New(i18n.T("api.err_response_names_no_key")))
+}
+
+// RevokeCurrentKey calls DELETE /v1/keys/current (authenticated): it revokes
+// the key this client authenticates with and returns its ID and name.
+//
+// An answer that names no key is an error: a 200 may carry an empty object,
+// which does not say which key was revoked, and the caller deletes the saved
+// key on success.
+func (c *Client) RevokeCurrentKey() (*KeyInfo, error) {
+	var result revokedKeyResponse
+	if err := c.doJSON("DELETE", "/v1/keys/current", nil, &result); err != nil {
+		return nil, err
+	}
+	if result.Key.ID == "" {
+		return nil, errResponseNamesNoKey()
+	}
+	return &result.Key, nil
 }
 
 // CreateSite calls POST /v1/pages/sites (authenticated).
@@ -1270,17 +1606,41 @@ func (c *Client) userAgent() string {
 	return fmt.Sprintf("kamakiri/%s (%s/%s)", token, runtime.GOOS, runtime.GOARCH)
 }
 
-// doRaw executes req and unmarshals a success body into result. A 4xx or 5xx
-// whose body does not parse as JSON degrades to a line naming the status code
-// and nothing else, so not every failure from here carries a server message. It
-// is the one place every request passes through, JSON calls and the deploy
-// multipart alike, so the User-Agent is stamped, a version refusal is
-// recognized, and the release the server advertises is picked up here rather
+// doRaw executes req and unmarshals a success body into result. It is the one
+// place every request passes through, JSON calls and the deploy multipart
+// alike, so the User-Agent is stamped, redirects are guarded, a version refusal
+// is recognized, and the release the server advertises is picked up here rather
 // than per endpoint.
+//
+// The request goes out through a copy of HTTPClient made for this call, whose
+// CheckRedirect compares each redirect Go is about to follow with the original
+// request and refuses three kinds. A redirect that changes the method: Go
+// re-sends a DELETE or POST redirected by a 301, 302 or 303 as a GET, and a 200
+// to that GET would read as the change having been made, so teardown's DELETE
+// would report a site deleted that never was. A redirect that drops the
+// Authorization header, which Go does when it leaves the original host name and
+// its subdomains: the API's answer to a keyless request would read as the key
+// being invalid. A redirect from https to http: Go keeps the header when the
+// host name stays the same, so the key would cross the network in cleartext.
+// Everything else is followed, http to https and http to http alike (local
+// development runs the API over plain http), and so is a 307 or 308 to another
+// port of the same host, which keeps both the method and the key. A
+// CheckRedirect the caller set runs after the guard; without one, the chain
+// stops after 10 redirects as Go's default does. The caller's HTTPClient is
+// never changed, and a nil one stands for Go's defaults.
+//
+// Only a 2xx is decoded as a success. A 3xx reaching the status check is one Go
+// did not follow (a 301 with no Location, a 304, or a 307 or 308 on a deploy,
+// whose streamed body cannot be sent twice), and a 1xx there is a final answer
+// such as a 101, which Go's HTTP/1 transport hands back as it is; neither is
+// the API's answer, so each fails with a line naming the status code and
+// nothing else, as does a 4xx or 5xx whose body does not parse as JSON. A JSON
+// error with no message takes that line as its message and keeps its code. Not
+// every failure from here carries a server message.
 func (c *Client) doRaw(req *http.Request, result any) error {
 	req.Header.Set("User-Agent", c.userAgent())
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := guardRedirects(c.HTTPClient).Do(req)
 	if err != nil {
 		return fmt.Errorf("%s: %w", i18n.T("api.err_request_failed"), err)
 	}
@@ -1315,7 +1675,18 @@ func (c *Client) doRaw(req *http.Request, result any) error {
 		if apiErr.Code == "upgrade_required" {
 			return ErrUpgradeRequired
 		}
+		// An empty message would print as a blank line. Only the text is filled
+		// in, so every switch on the code still matches.
+		if apiErr.Message == "" {
+			apiErr.Message = i18n.Tf("api.err_server_returned", resp.StatusCode)
+		}
 		return &apiErr
+	}
+
+	// Ahead of the decode rather than inside it, since a call that decodes no
+	// result would otherwise take an unfollowed redirect as its success.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return errors.New(i18n.Tf("api.err_server_returned", resp.StatusCode))
 	}
 
 	if result != nil {
@@ -1324,4 +1695,32 @@ func (c *Client) doRaw(req *http.Request, result any) error {
 		}
 	}
 	return nil
+}
+
+// guardRedirects returns a copy of hc whose CheckRedirect is the guard doRaw
+// describes, wrapping any CheckRedirect hc already had.
+func guardRedirects(hc *http.Client) *http.Client {
+	var guarded http.Client
+	if hc != nil {
+		guarded = *hc
+	}
+	inner := guarded.CheckRedirect
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// Go has already applied its header policy to req by the time this
+		// runs, so a key it stripped shows here as a header that differs.
+		original := via[0]
+		if req.Method != original.Method ||
+			req.Header.Get("Authorization") != original.Header.Get("Authorization") ||
+			(original.URL.Scheme == "https" && req.URL.Scheme == "http") {
+			return errUnsafeRedirect
+		}
+		if inner != nil {
+			return inner(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &guarded
 }

@@ -61,7 +61,7 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 		case "unauthorized":
 			return api.UnauthorizedError()
 		default:
-			return err
+			return api.MapError(err)
 		}
 	}
 
@@ -94,7 +94,7 @@ func Run(client APIClient, in io.Reader, out io.Writer, noWait bool) error {
 				return api.UnauthorizedError()
 			}
 		}
-		return err
+		return api.MapError(err)
 	}
 
 	if noWait {

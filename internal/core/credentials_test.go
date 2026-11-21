@@ -2,9 +2,13 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 )
@@ -201,6 +205,90 @@ func TestSaveCredentialsJSON(t *testing.T) {
 	// looking for Source alone also catches a field added later without a tag.
 	if len(raw) != 3 {
 		t.Errorf("credentials.json holds keys %v, want version, api_key and email only", raw)
+	}
+}
+
+// The credentials file goes, and nothing else does: the config directory stays,
+// and so does every other file in it, a login left half-finished among them, so
+// a logout neither touches another command's state nor a login in progress.
+func TestDeleteCredentialsRemovesTheFileAlone(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	dir := filepath.Join(tmpDir, "kamakiri")
+
+	if err := SaveCredentials("kk_live_testkey123", "test@example.com"); err != nil {
+		t.Fatalf("SaveCredentials() error = %v", err)
+	}
+	if err := SaveLoginSecret("test@example.com", "token", time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("SaveLoginSecret() error = %v", err)
+	}
+	if err := SaveSettings("ja"); err != nil {
+		t.Fatalf("SaveSettings() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "install.json"), []byte(`{"version":1}`), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := DeleteCredentials(); err != nil {
+		t.Fatalf("DeleteCredentials() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "credentials.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("credentials.json after DeleteCredentials: Stat() error = %v, want it gone", err)
+	}
+	creds, err := LoadCredentials()
+	if err != nil || creds != nil {
+		t.Errorf("LoadCredentials() after DeleteCredentials = %+v, %v; want nil, nil", creds, err)
+	}
+	for _, name := range []string{".login_secret", "settings.json", "install.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s after DeleteCredentials: Stat() error = %v, want it kept", name, err)
+		}
+	}
+	secret, err := LoadLoginSecret()
+	if err != nil || secret == nil || secret.Email != "test@example.com" {
+		t.Errorf("LoadLoginSecret() after DeleteCredentials = %+v, %v; want the saved secret", secret, err)
+	}
+}
+
+func TestDeleteCredentialsMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if err := DeleteCredentials(); err != nil {
+		t.Errorf("DeleteCredentials() on a missing file error = %v, want nil", err)
+	}
+}
+
+// A file that cannot be removed is an error carrying its own frame, and the
+// operating system's error stays reachable through it.
+func TestDeleteCredentialsReportsAFileItCannotRemove(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes from a directory whatever its mode says, so no removal here would fail")
+	}
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	dir := filepath.Join(tmpDir, "kamakiri")
+
+	if err := SaveCredentials("kk_live_testkey123", "test@example.com"); err != nil {
+		t.Fatalf("SaveCredentials() error = %v", err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatalf("sealing the config directory: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0700) })
+
+	err := DeleteCredentials()
+	if err == nil {
+		t.Fatal("DeleteCredentials() in a read-only directory: expected an error")
+	}
+	if !strings.HasPrefix(err.Error(), "delete credentials: ") {
+		t.Errorf("error = %q, want it framed with %q", err, "delete credentials: ")
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("errors.Is(err, fs.ErrPermission) = false through %q", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credentials.json")); err != nil {
+		t.Errorf("credentials.json after a failed delete: Stat() error = %v, want it kept", err)
 	}
 }
 

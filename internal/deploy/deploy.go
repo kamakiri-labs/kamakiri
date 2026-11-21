@@ -283,16 +283,17 @@ func sizeLimit(site *api.Site) int64 {
 }
 
 // conclusiveRefusal reports whether a failed site read is an answer the upload
-// would get too: a rejected key, a CLI version the server refuses, or a site
-// it does not know. A transport error, a server error or any other refusal
-// could be transient or specific to the read, so the deploy carries on.
+// would get too: a rejected key, a CLI version the server refuses, a site it
+// does not know, or a site outside a deploy key's list. A transport error, a
+// server error or any other refusal could be transient or specific to the
+// read, so the deploy carries on.
 func conclusiveRefusal(err error) bool {
 	if errors.Is(err, api.ErrUpgradeRequired) {
 		return true
 	}
 	var apiErr *api.ErrorResponse
 	if errors.As(err, &apiErr) {
-		return apiErr.Code == "unauthorized" || apiErr.Code == "site_not_found"
+		return apiErr.Code == "unauthorized" || apiErr.Code == "site_not_found" || apiErr.Code == "site_not_in_key"
 	}
 	return false
 }

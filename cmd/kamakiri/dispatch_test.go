@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
@@ -22,6 +26,8 @@ const usageBlock = "Usage: kamakiri <command>\n" +
 	"\n" +
 	"Commands:\n" +
 	"  login       Log in with your email\n" +
+	"  logout      Log out and revoke this machine's API key\n" +
+	"  key         List, rename and revoke your API keys, and create and rotate deploy keys\n" +
 	"  status      Show current status (--verbose shows DNS records inline; --recheck asks the server to check DNS now)\n" +
 	"  init        Create a new site\n" +
 	"  deploy      Deploy a directory or archive\n" +
@@ -39,7 +45,7 @@ const usageBlock = "Usage: kamakiri <command>\n" +
 	"  KAMAKIRI_API_KEY\n" +
 	"    The API key every command that needs a credential uses, for CI runners\n" +
 	"    with no credentials file. While it is set, the credentials file is not\n" +
-	"    read. Take the key from the file `kamakiri login` saves on your machine.\n" +
+	"    read. Create a deploy key for it with `kamakiri key create`.\n" +
 	"\n" +
 	"  KAMAKIRI_CDN_TOKEN, KAMAKIRI_CDN_SECRET\n" +
 	"    WebAccel API credentials for `kamakiri cdn webaccel`. Prefer these\n" +
@@ -243,6 +249,20 @@ func TestUnknownCommandGoldens(t *testing.T) {
 			stderr: "Unknown subdomain command: bogus\n",
 			code:   1,
 		},
+		{
+			name:   "key verb",
+			args:   []string{"key", "bogus"},
+			stderr: "Unknown key command: bogus\n",
+			code:   1,
+		},
+		{
+			// A verb that reads like one the arm takes, followed by an ID, still
+			// reads as any unknown verb does rather than reaching a route.
+			name:   "key delete",
+			args:   []string{"key", "delete", "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c"},
+			stderr: "Unknown key command: delete\n",
+			code:   1,
+		},
 	})
 }
 
@@ -262,6 +282,10 @@ func TestParseErrorsNeverEchoAFlagValue(t *testing.T) {
 		{"top level command that is a flag", []string{"--token=TOPSECRET"}, "Unknown command: --token\n"},
 		{"domain verb that is a flag", []string{"domain", "--token=TOPSECRET"}, "Unknown domain command: --token\n"},
 		{"subdomain verb that is a flag", []string{"subdomain", "--token=TOPSECRET"}, "Unknown subdomain command: --token\n"},
+		{"key verb that is a flag", []string{"key", "--token=TOPSECRET"}, "Unknown key command: --token\n"},
+		{"key list extra flag", []string{"key", "list", "--token=TOPSECRET"}, "Unexpected argument: --token\n"},
+		{"key create unknown flag", []string{"key", "create", "--token=TOPSECRET"}, "Unexpected argument: --token\n"},
+		{"key rotate unknown flag", []string{"key", "rotate", "--token=TOPSECRET"}, "Unexpected argument: --token\n"},
 		{"unexpected argument", []string{"upgrade", "--token=TOPSECRET"}, "Unexpected argument: --token\n"},
 		{"cdn webaccel unknown flag", []string{"cdn", "webaccel", "--secert=TOPSECRET"}, "--secert"},
 		{"cdn credentials unknown flag", []string{"cdn", "credentials", "--secert=TOPSECRET"}, "--secert"},
@@ -374,6 +398,30 @@ func TestMissingArgumentUsageGoldens(t *testing.T) {
 			name:   "subdomain set with only a flag",
 			args:   []string{"subdomain", "set", "--no-wait"},
 			stderr: "Usage: kamakiri subdomain set <subdomain> [--no-wait]\n",
+			code:   1,
+		},
+		{
+			name:   "key",
+			args:   []string{"key"},
+			stderr: "Usage: kamakiri key <list|create|rename|revoke|rotate>\n",
+			code:   1,
+		},
+		{
+			name:   "key rotate",
+			args:   []string{"key", "rotate"},
+			stderr: "Usage: kamakiri key rotate <id>\n",
+			code:   1,
+		},
+		{
+			name:   "key rename",
+			args:   []string{"key", "rename"},
+			stderr: "Usage: kamakiri key rename <id> <name>\n",
+			code:   1,
+		},
+		{
+			name:   "key rename without a name",
+			args:   []string{"key", "rename", "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c"},
+			stderr: "Usage: kamakiri key rename <id> <name>\n",
 			code:   1,
 		},
 	})
@@ -516,6 +564,55 @@ func TestUnexpectedArgumentGoldens(t *testing.T) {
 			stderr: "Usage: kamakiri cdn cleanup [--no-wait]\nUnexpected argument: x\n",
 			code:   1,
 		},
+		{
+			name:   "key list",
+			args:   []string{"key", "list", "extra"},
+			stderr: "Usage: kamakiri key list\nUnexpected argument: extra\n",
+			code:   1,
+		},
+		{
+			name:   "key create positional",
+			args:   []string{"key", "create", "example.com"},
+			stderr: "Usage: kamakiri key create [--name <name>] [--site <site>]...\nUnexpected argument: example.com\n",
+			code:   1,
+		},
+		{
+			name:   "key create unknown flag",
+			args:   []string{"key", "create", "--site", "example.com", "--yes"},
+			stderr: "Usage: kamakiri key create [--name <name>] [--site <site>]...\nUnexpected argument: --yes\n",
+			code:   1,
+		},
+		{
+			name:   "key rename third positional",
+			args:   []string{"key", "rename", "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c", "ci-box", "extra"},
+			stderr: "Usage: kamakiri key rename <id> <name>\nUnexpected argument: extra\n",
+			code:   1,
+		},
+		{
+			// Refused before the email prompt, which is why stdout stays empty.
+			name:   "login flag",
+			args:   []string{"login", "--bogus"},
+			stderr: "Usage: kamakiri login [--name <name>] [--revoke-others]\nUnexpected argument: --bogus\n",
+			code:   1,
+		},
+		{
+			name:   "login positional",
+			args:   []string{"login", "foo"},
+			stderr: "Usage: kamakiri login [--name <name>] [--revoke-others]\nUnexpected argument: foo\n",
+			code:   1,
+		},
+		{
+			name:   "logout positional",
+			args:   []string{"logout", "extra"},
+			stderr: "Usage: kamakiri logout\nUnexpected argument: extra\n",
+			code:   1,
+		},
+		{
+			name:   "logout flag with a value",
+			args:   []string{"logout", "--token=TOPSECRET"},
+			stderr: "Usage: kamakiri logout\nUnexpected argument: --token\n",
+			code:   1,
+		},
 	})
 }
 
@@ -603,6 +700,76 @@ func TestFlagErrorGoldens(t *testing.T) {
 			name:   "--redirect before --alias",
 			args:   []string{"domain", "add", "example.com", "--redirect", "--alias"},
 			stderr: "Error: --alias and --redirect are mutually exclusive\n",
+			code:   1,
+		},
+		{
+			// No usage line: a valued flag with nothing to take is reported the
+			// same way on every command.
+			name:   "login --name with no value",
+			args:   []string{"login", "--name"},
+			stderr: "Error: --name requires a value\n",
+			code:   1,
+		},
+		{
+			// A forgotten value must not swallow the next flag: taken as the
+			// name, --revoke-others would mint a key called "--revoke-others"
+			// and revoke nothing.
+			name:   "login --name followed by another flag",
+			args:   []string{"login", "--name", "--revoke-others"},
+			stderr: "Error: --name requires a value; write a value that starts with \"--\" as --name=<value>\n",
+			code:   1,
+		},
+		{
+			// The cdn parsers return the line for main to print, with no
+			// "Error:" prefix, and the refused argument is never echoed.
+			name:   "cdn credentials --token followed by another flag",
+			args:   []string{"cdn", "credentials", "--token", "--secret", "x"},
+			stderr: "--token requires a value; write a value that starts with \"--\" as --token=<value>\n",
+			code:   1,
+		},
+		{
+			name:   "login --name= with nothing after the sign",
+			args:   []string{"login", "--name="},
+			stderr: "Error: --name= requires a value after the equals sign\n",
+			code:   1,
+		},
+		{
+			name:   "key create --name with no value",
+			args:   []string{"key", "create", "--site", "example.com", "--name"},
+			stderr: "Error: --name requires a value\n",
+			code:   1,
+		},
+		{
+			// A forgotten name must not swallow the flag after it: taken as the
+			// name, --site would mint a key called "--site" bound to the linked
+			// site rather than the one typed.
+			name:   "key create --name followed by another flag",
+			args:   []string{"key", "create", "--name", "--site", "example.com"},
+			stderr: "Error: --name requires a value; write a value that starts with \"--\" as --name=<value>\n",
+			code:   1,
+		},
+		{
+			name:   "key create --site with no value",
+			args:   []string{"key", "create", "--site"},
+			stderr: "Error: --site requires a value\n",
+			code:   1,
+		},
+		{
+			name:   "key create --site followed by another flag",
+			args:   []string{"key", "create", "--site", "--name", "ci"},
+			stderr: "Error: --site requires a value; write a value that starts with \"--\" as --site=<value>\n",
+			code:   1,
+		},
+		{
+			name:   "key create --site= with nothing after the sign",
+			args:   []string{"key", "create", "--site="},
+			stderr: "Error: --site= requires a value after the equals sign\n",
+			code:   1,
+		},
+		{
+			name:   "login --revoke-others with a value",
+			args:   []string{"login", "--revoke-others=x"},
+			stderr: "Error: --revoke-others takes no value\n",
 			code:   1,
 		},
 	})
@@ -770,6 +937,45 @@ func TestUpdateNudgeRidesTheDispatch(t *testing.T) {
 			t.Errorf("stderr:\n%q\nwant nothing", got)
 		}
 	})
+}
+
+// A trailing slash on KAMAKIRI_API_URL is ignored: the request path is the
+// one the bare URL builds, never one with a doubled slash. The empty-value
+// fallback to the default URL cannot be asserted here without reaching the
+// real API.
+func TestAPIURLTrailingSlashesAreIgnored(t *testing.T) {
+	for _, tc := range []struct{ name, suffix string }{
+		{"one trailing slash", "/"},
+		{"several trailing slashes", "///"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+
+			var path string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				io.WriteString(w, `{"registrations":[]}`)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_slash")
+			t.Setenv("KAMAKIRI_API_URL", server.URL+tc.suffix)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"domain", "list"}, strings.NewReader(""), &stdout, &stderr)
+
+			// Close orders the handler's write of path before the read below.
+			server.Close()
+
+			if code != 0 {
+				t.Fatalf("`kamakiri domain list` exited %d, want 0; stderr: %q", code, stderr.String())
+			}
+			if got, want := path, "/v1/pages/registrations"; got != want {
+				t.Errorf("request path = %q, want %q", got, want)
+			}
+		})
+	}
 }
 
 // The variable is read in one place, deep under every command, so what proves
@@ -986,6 +1192,210 @@ func TestAPIKeyFromEnvironmentRidesTheDispatch(t *testing.T) {
 	})
 }
 
+// The flag reaches the verify body in both forms, and when it is repeated the
+// last value is the one sent, as with every other valued flag. An empty value is
+// refused by the name check, after parsing and before any request: the flag
+// was given, so it is not read as a request for the default name. A separated
+// value starting with "--" is refused as a missing value, so `--name
+// --revoke-others` sends nothing rather than naming a key after the flag.
+func TestLoginNameRidesTheDispatch(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		sent string
+	}{
+		{"space form", []string{"login", "--name", "ci-box"}, "ci-box"},
+		{"equals form", []string{"login", "--name=ci-box"}, "ci-box"},
+		{"repeated", []string{"login", "--name", "first", "--name=ci-box"}, "ci-box"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+
+			var verifyName any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/auth/register":
+					io.WriteString(w, `{"message":"Confirmation code sent."}`)
+				case "/v1/auth/verify":
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decoding the verify body: %v", err)
+					}
+					verifyName = body["name"]
+					io.WriteString(w, `{"api_key":"kk_live_minted","key":{"id":"0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59","name":"ci-box"}}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+
+			// Close waits for the handler's goroutines, which orders the write to
+			// verifyName against the read below.
+			server.Close()
+
+			if code != 0 {
+				t.Fatalf("`kamakiri %s` exited %d, want 0; stderr: %q", strings.Join(tc.args, " "), code, stderr.String())
+			}
+			if verifyName != tc.sent {
+				t.Errorf("verify name = %#v, want %q", verifyName, tc.sent)
+			}
+			if got := stdout.String(); !strings.Contains(got, "\nKey name: ci-box\n") {
+				t.Errorf("stdout:\n%q\nwant the key name line", got)
+			}
+		})
+	}
+
+	t.Run("empty value", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"login", "--name", ""}, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+		server.Close()
+
+		if code != 1 {
+			t.Errorf("`kamakiri login --name \"\"` exited %d, want 1", code)
+		}
+		if n := requests.Load(); n != 0 {
+			t.Errorf("sent %d requests, want none", n)
+		}
+		if got, want := stdout.String(), "Error: --name must be 1 to 64 characters with no control characters.\n"; got != want {
+			t.Errorf("stdout:\n%q\nwant:\n%q", got, want)
+		}
+		if got, want := stderr.String(), "invalid key name\n"; got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+	})
+
+	t.Run("followed by another flag", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"login", "--name", "--revoke-others"}, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+		server.Close()
+
+		if code != 1 {
+			t.Errorf("`kamakiri login --name --revoke-others` exited %d, want 1", code)
+		}
+		if n := requests.Load(); n != 0 {
+			t.Errorf("sent %d requests, want none", n)
+		}
+		if got := stdout.String(); got != "" {
+			t.Errorf("stdout:\n%q\nwant nothing", got)
+		}
+		if got, want := stderr.String(), "Error: --name requires a value; write a value that starts with \"--\" as --name=<value>\n"; got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+	})
+}
+
+// The flag reaches the verify body as a JSON true and the run lists what the
+// server revoked; without it the body carries no such field. A value on the
+// flag is refused before anything is sent, since a revoke the user did not
+// spell plainly must not go out.
+func TestLoginRevokeOthersRidesTheDispatch(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		present bool
+	}{
+		{"given", []string{"login", "--revoke-others"}, true},
+		{"after --name", []string{"login", "--name", "ci-box", "--revoke-others"}, true},
+		{"absent", []string{"login"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/auth/register":
+					io.WriteString(w, `{"message":"Confirmation code sent."}`)
+				case "/v1/auth/verify":
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decoding the verify body: %v", err)
+					}
+					io.WriteString(w, `{"api_key":"kk_live_minted","key":{"id":"0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59","name":"ci-box"},`+
+						`"revoked":[{"id":"5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65","name":"old-laptop"}]}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+
+			// Close waits for the handler's goroutines, which orders the write to
+			// body against the read below.
+			server.Close()
+
+			if code != 0 {
+				t.Fatalf("`kamakiri %s` exited %d, want 0; stderr: %q", strings.Join(tc.args, " "), code, stderr.String())
+			}
+			value, present := body["revoke_others"]
+			if present != tc.present || (present && value != true) {
+				t.Errorf("verify body %v: revoke_others = %#v (present %t), want present %t and true", body, value, present, tc.present)
+			}
+			block := "\nRevoked 1 other key:\n  old-laptop (5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n"
+			if got := stdout.String(); strings.Contains(got, block) != tc.present {
+				t.Errorf("stdout:\n%q\nwant the revoked block %t", got, tc.present)
+			}
+		})
+	}
+
+	t.Run("with a value", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(server.Close)
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"login", "--revoke-others=false"}, strings.NewReader("user@example.com\nY\nABC123\n"), &stdout, &stderr)
+		server.Close()
+
+		if code != 1 {
+			t.Errorf("`kamakiri login --revoke-others=false` exited %d, want 1", code)
+		}
+		if n := requests.Load(); n != 0 {
+			t.Errorf("sent %d requests, want none", n)
+		}
+		if got := stdout.String(); got != "" {
+			t.Errorf("stdout:\n%q\nwant nothing", got)
+		}
+		if got, want := stderr.String(), "Error: --revoke-others takes no value\n"; got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+	})
+}
+
 // A credentials file that holds no key refuses every command that needs a
 // credential, with the login advice, rather than sending a request the server
 // could only reject. `status` is the exception that reports the same file on
@@ -1019,6 +1429,110 @@ func TestAKeylessCredentialsFileRefusesAsNotLoggedIn(t *testing.T) {
 	}
 }
 
+// A project file that cannot be parsed is the load error only when nothing
+// ranks ahead of it: the dispatch prints the credential failure, or a held
+// key-description failure, in its place, as every command needing both does.
+func TestStatusRanksAMalformedProjectFileBehindTheKeyThroughTheDispatch(t *testing.T) {
+	writeMalformedProject := func(t *testing.T) {
+		t.Helper()
+		path := core.ProjectPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("not json"), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	t.Run("no credential", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		writeMalformedProject(t)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		want := "not logged in. Run \"kamakiri login\", or set KAMAKIRI_API_KEY to an API key\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr = %q, want %q", got, want)
+		}
+		if got := stdout.String(); strings.Contains(got, "parse project config") {
+			t.Errorf("stdout:\n%q\nwant no project load error on the page", got)
+		}
+	})
+
+	t.Run("a held key-description error", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		writeMalformedProject(t)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/keys/current" {
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, `{"code":"internal_error","message":"Internal server error."}`)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+		}))
+		t.Cleanup(server.Close)
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if got, want := stderr.String(), "Internal server error.\n"; got != want {
+			t.Errorf("stderr = %q, want %q", got, want)
+		}
+	})
+}
+
+// statusKeyID is the key the local servers below describe as the one in use.
+const statusKeyID = "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c"
+
+// statusNoSiteLinked is the line the English `status` page ends with in a
+// directory that links no site.
+const statusNoSiteLinked = "No site is linked to this directory. Run \"kamakiri init\" to create one.\n"
+
+// statusKey is the answer to GET /v1/keys/current those servers give. With a
+// key in hand, `status` describes it before anything else, so every server a
+// dispatched `status` reaches with a key has to answer it.
+func statusKey() any {
+	return map[string]api.Key{"key": {ID: statusKeyID, Name: "github-ci", Kind: "login", Current: true}}
+}
+
+// currentKeyAPI stands in for the API with only the route that describes the
+// key in use, for a `status` run that links no site and so reads nothing else.
+func currentKeyAPI(t *testing.T) string {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/keys/current" {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+			return
+		}
+		payload, err := json.Marshal(statusKey())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	return server.URL
+}
+
 // An unreadable credentials file is a finding `status` reports rather than a
 // reason to refuse: it renders the whole page with the failure on its own line,
 // prints the same failure on stderr after it, and exits 1, so a check has the
@@ -1027,8 +1541,8 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 	t.Run("the page carries the error and the exit is 1", func(t *testing.T) {
 		pinDispatchEnvironment(t)
 		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
-		// No project is linked here, so the page ends at the site line before
-		// any request and needs no server.
+		// No project is linked here, so the page ends with the sentence saying
+		// so, before any request, and needs no server.
 		t.Chdir(t.TempDir())
 		dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
 		if err := os.MkdirAll(dir, 0700); err != nil {
@@ -1054,8 +1568,8 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 		if !strings.Contains(got, "Logged in:    (error: parse credentials:") {
 			t.Errorf("stdout:\n%q\nwant the logged-in line carrying the load error", got)
 		}
-		if !strings.Contains(got, "Site:         (none)") {
-			t.Errorf("stdout:\n%q\nwant the page rendered to its last line", got)
+		if !strings.HasSuffix(got, statusNoSiteLinked) {
+			t.Errorf("stdout:\n%q\nwant the page rendered to its last line, %q", got, statusNoSiteLinked)
 		}
 	})
 
@@ -1063,7 +1577,8 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 	// nothing it holds reaches the page or the exit code. The Credentials line
 	// pins the precedence, since the page asks APIKeyFromEnvironment directly,
 	// and the exit 0 over a file that cannot be parsed pins that the file
-	// decides nothing.
+	// decides nothing. The variable is a key in hand, so the page describes it,
+	// and the local server is what that request reaches.
 	t.Run("the variable outranks the file for the exit code too", func(t *testing.T) {
 		pinDispatchEnvironment(t)
 		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
@@ -1077,6 +1592,7 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 		}
 
 		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", currentKeyAPI(t))
 
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
@@ -1091,7 +1607,8 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 		for _, want := range []string{
 			"Credentials:  KAMAKIRI_API_KEY (environment)",
 			"Logged in:    yes",
-			"Site:         (none)",
+			"Key:          github-ci (login, " + statusKeyID + ")",
+			statusNoSiteLinked,
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
@@ -1099,7 +1616,7 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 		}
 	})
 
-	// With a site linked and no key, the page still ends at the site line, but
+	// With a site linked and no key, the page ends at the API server row and
 	// nothing is sent: a keyless lookup could only come back unauthorized.
 	t.Run("a linked site is not looked up without a key", func(t *testing.T) {
 		pinDispatchEnvironment(t)
@@ -1142,8 +1659,8 @@ func TestStatusReportsAnUnreadableCredentialsFile(t *testing.T) {
 		if !strings.Contains(got, "Logged in:    (error: parse credentials:") {
 			t.Errorf("stdout:\n%q\nwant the logged-in line carrying the load error", got)
 		}
-		if !strings.Contains(got, "Site:         site123") {
-			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		if !strings.HasSuffix(got, "API server:   "+server.URL+"\n") {
+			t.Errorf("stdout:\n%q\nwant the page ending at the API server row", got)
 		}
 		if requests != 0 {
 			t.Error("a request went out, but a failed load leaves no key to send")
@@ -1203,7 +1720,7 @@ func TestStatusExitsWhenItCannotVouch(t *testing.T) {
 			t.Fatalf("`kamakiri status` exited %d, want 1", code)
 		}
 		got := stdout.String()
-		for _, want := range []string{"Logged in:    no", "Site:         (none)"} {
+		for _, want := range []string{"Logged in:    no", statusNoSiteLinked} {
 			if !strings.Contains(got, want) {
 				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
 			}
@@ -1251,10 +1768,11 @@ func TestStatusExitsWhenItCannotVouch(t *testing.T) {
 			t.Fatalf("`kamakiri status` exited %d, want 1", code)
 		}
 		got := stdout.String()
-		for _, want := range []string{"Logged in:    no", "Site:         site123"} {
-			if !strings.Contains(got, want) {
-				t.Errorf("stdout:\n%q\nwant a line %q", got, want)
-			}
+		if !strings.Contains(got, "Logged in:    no") {
+			t.Errorf("stdout:\n%q\nwant a line %q", got, "Logged in:    no")
+		}
+		if !strings.HasSuffix(got, "API server:   "+server.URL+"\n") {
+			t.Errorf("stdout:\n%q\nwant the page ending at the API server row", got)
 		}
 		if strings.Contains(got, "(not found)") {
 			t.Errorf("stdout:\n%q\nwant the credentials line naming the file that is there", got)
@@ -1292,11 +1810,93 @@ func TestStatusExitsWhenItCannotVouch(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("`kamakiri status` exited %d, want 1", code)
 		}
-		if got := stdout.String(); !strings.Contains(got, "Site:         site123") {
-			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		if got := stdout.String(); !strings.HasSuffix(got, "API server:   "+server.URL+"\n") {
+			t.Errorf("stdout:\n%q\nwant the page ending at the API server row", got)
 		}
 		if got := stderr.String(); !strings.Contains(got, "The key came from KAMAKIRI_API_KEY; check the value that variable holds") {
 			t.Errorf("stderr:\n%q\nwant the copy naming the variable", got)
+		}
+	})
+
+	// The page's own unit tests hold every branch of a rejected key; what only
+	// the dispatch can show is that the error the page returns knows where the
+	// key came from, since the arm is what stamps the source. No site is linked,
+	// so the key's description is the one request the run makes, and a rejected
+	// key still fails the run.
+	t.Run("a rejected key from the variable with no linked site", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		wantRows := "Credentials:  KAMAKIRI_API_KEY (environment)\n" +
+			"Logged in:    no\n" +
+			"Key:          rejected\n"
+		if got := stdout.String(); !strings.Contains(got, wantRows) || !strings.HasSuffix(got, statusNoSiteLinked) {
+			t.Errorf("stdout:\n%q\nwant the rows:\n%q\nand the page ending with %q", got, wantRows, statusNoSiteLinked)
+		}
+		want := "invalid API key. The key came from KAMAKIRI_API_KEY; check the value that variable holds\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+		if len(paths) != 1 || paths[0] != "/v1/keys/current" {
+			t.Errorf("requests went to %q, want the one describing the key", paths)
+		}
+	})
+
+	// A 200 that names no key describes nothing, so the Key row carries the
+	// error rather than an empty description, and the run cannot vouch for the
+	// key.
+	t.Run("an answer that names no key with no linked site", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			io.WriteString(w, `{}`)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+		server.Close()
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		wantRows := "Credentials:  KAMAKIRI_API_KEY (environment)\n" +
+			"Logged in:    yes\n" +
+			"Key:          (error: parse response: the response names no key)\n"
+		if got := stdout.String(); !strings.Contains(got, wantRows) || !strings.HasSuffix(got, statusNoSiteLinked) {
+			t.Errorf("stdout:\n%q\nwant the rows:\n%q\nand the page ending with %q", got, wantRows, statusNoSiteLinked)
+		}
+		want := "parse response: the response names no key\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr:\n%q\nwant:\n%q", got, want)
+		}
+		if len(paths) != 1 || paths[0] != "/v1/keys/current" {
+			t.Errorf("requests went to %q, want the one describing the key", paths)
 		}
 	})
 
@@ -1321,14 +1921,103 @@ func TestStatusExitsWhenItCannotVouch(t *testing.T) {
 		if code != 1 {
 			t.Fatalf("`kamakiri status` exited %d, want 1", code)
 		}
-		if got := stdout.String(); !strings.Contains(got, "Site:         site123") {
-			t.Errorf("stdout:\n%q\nwant the site line carrying the site ID", got)
+		if got := stdout.String(); !strings.HasSuffix(got, "API server:   http://127.0.0.1:1\n") {
+			t.Errorf("stdout:\n%q\nwant the page ending at the API server row", got)
 		}
 		if line := stderr.String(); !strings.HasPrefix(line, "request failed:") ||
 			strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
 			t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "request failed:")
 		}
 	})
+
+	// A project file that is there but does not parse is reported as the load
+	// error, the very line `deploy` prints over the same file, and only the key's
+	// description is asked for: no site is read over a project the run could
+	// not load.
+	t.Run("a project file that does not parse", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		if err := os.MkdirAll(".kamakiri", 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(core.ProjectPath(), []byte("not json"), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var paths []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			if r.URL.Path != "/v1/keys/current" {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+				return
+			}
+			payload, err := json.Marshal(statusKey())
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Write(payload)
+		}))
+		t.Cleanup(server.Close)
+
+		t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		line := stderr.String()
+		if !strings.HasPrefix(line, "parse project config: ") ||
+			strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+			t.Errorf("stderr:\n%q\nwant one line starting with %q", line, "parse project config: ")
+		}
+		if got := stdout.String(); !strings.HasSuffix(got, "API server:   "+server.URL+"\n") {
+			t.Errorf("stdout:\n%q\nwant the page ending at the API server row", got)
+		}
+		if len(paths) != 1 || paths[0] != "/v1/keys/current" {
+			t.Errorf("requests went to %q, want the one describing the key", paths)
+		}
+
+		var deployOut, deployErr bytes.Buffer
+		if code := run([]string{"deploy", "."}, strings.NewReader(""), &deployOut, &deployErr); code != 1 {
+			t.Fatalf("`kamakiri deploy .` exited %d, want 1", code)
+		}
+		if got := deployErr.String(); got != line {
+			t.Errorf("`kamakiri deploy .` printed %q over the same file, want the line status printed, %q", got, line)
+		}
+	})
+}
+
+// A directory with no linked site is a finding the page states, not a reason
+// to fail: the page ends with the sentence naming `kamakiri init`, stderr stays
+// empty and the exit is 0.
+func TestStatusWithNoLinkedSiteExitsZero(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+	t.Chdir(t.TempDir())
+
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	url := currentKeyAPI(t)
+	t.Setenv("KAMAKIRI_API_URL", url)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("`kamakiri status` exited %d, want 0; stderr: %q", code, stderr.String())
+	}
+	if got := stderr.String(); got != "" {
+		t.Errorf("stderr:\n%q\nwant nothing", got)
+	}
+	want := "API server:   " + url + "\n" + statusNoSiteLinked
+	if got := stdout.String(); !strings.HasSuffix(got, want) {
+		t.Errorf("stdout:\n%q\nwant it to end with:\n%q", got, want)
+	}
 }
 
 // Drift is the one exit 1 the page reaches with no error in hand, so the arm
@@ -1375,6 +2064,8 @@ func TestStatusDriftExitsWithALine(t *testing.T) {
 			}}
 		case r.URL.Path == "/v1/pages/cdn/status":
 			body = api.CDNStatusResponse{CDNMode: "cloudflare", Provider: "cloudflare"}
+		case r.URL.Path == "/v1/keys/current":
+			body = statusKey()
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
@@ -1402,6 +2093,88 @@ func TestStatusDriftExitsWithALine(t *testing.T) {
 		t.Errorf("stdout:\n%q\nwant the drift block", got)
 	}
 	want := "A records do not match the current edge. The kamakiri status page lists the expected and observed values.\n"
+	if got := stderr.String(); got != want {
+		t.Errorf("stderr = %q, want %q", got, want)
+	}
+}
+
+// TestStatusKeyErrorAndDriftBothReachStderr pins that a held key error does not
+// hide the drift line: the page found drift and could not describe the key, so
+// a script log gets the error first and then the line saying the page has a
+// drift block.
+func TestStatusKeyErrorAndDriftBothReachStderr(t *testing.T) {
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+	t.Chdir(t.TempDir())
+
+	if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+		t.Fatalf("SaveProject: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body any
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/pages/sites/"):
+			body = api.Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}
+		case r.URL.Path == "/v1/pages/domains":
+			body = api.DomainList{Domains: []api.Domain{
+				{
+					Domain: "example.com",
+					Role:   "canonical",
+					State:  "serving",
+					// The server-derived verdict says the customer publishes
+					// direct apex A records, so the drift check applies.
+					DnsMatchedAlternative: "a",
+					DNSRecordsExpected: []api.DNSRecord{
+						{Name: "example.com", Type: "alias_or_aname", Value: "x.kamakiri-pages.site.", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+						{Name: "example.com", Type: "a", Value: "173.245.48.0", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+						{Name: "example.com", Type: "a", Value: "103.21.244.0", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+					},
+					DNSRecordsObserved: []api.DNSRecordObserved{
+						{
+							Name: "example.com", Type: "a",
+							// The old cluster IPs, against the post-flip anycast
+							// set expected above.
+							Values:           []string{"198.51.100.10", "198.51.100.11"},
+							AlternativeGroup: "apex_primary",
+						},
+					},
+				},
+			}}
+		case r.URL.Path == "/v1/pages/cdn/status":
+			body = api.CDNStatusResponse{CDNMode: "cloudflare", Provider: "cloudflare"}
+		case r.URL.Path == "/v1/keys/current":
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"code":"internal_error","message":"Internal server error."}`)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+			return
+		}
+		payload, err := json.Marshal(body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("`kamakiri status` exited %d, want 1; stderr: %q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "✗ A records do not match the current edge for cloudflare mode") {
+		t.Errorf("stdout:\n%q\nwant the drift block", got)
+	}
+	want := "Internal server error.\n" +
+		"A records do not match the current edge. The kamakiri status page lists the expected and observed values.\n"
 	if got := stderr.String(); got != want {
 		t.Errorf("stderr = %q, want %q", got, want)
 	}
@@ -1446,6 +2219,8 @@ func TestStatusRecheckWarningRidesTheDispatch(t *testing.T) {
 			}}
 		case r.URL.Path == "/v1/pages/cdn/status":
 			body = api.CDNStatusResponse{CDNMode: "none", Provider: "none"}
+		case r.URL.Path == "/v1/keys/current":
+			body = statusKey()
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":"not_found","message":"not found"}`)
@@ -1480,6 +2255,125 @@ func TestStatusRecheckWarningRidesTheDispatch(t *testing.T) {
 	if line := stderr.String(); line != want {
 		t.Errorf("stderr = %q, want %q", line, want)
 	}
+}
+
+// A deploy key's `status` runs through the real client against a server that
+// answers as one would for such a key: --recheck sends no recheck request and
+// prints its one line, and a linked site outside the key's list ends the page at
+// the API server row and exits 1 with the refusal's line.
+func TestStatusWithADeployKeyRidesTheDispatch(t *testing.T) {
+	const (
+		deployKeyJSON = `{"key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"github-actions","kind":"deploy",` +
+			`"resource_ids":["k3j9x2m4p7q1w8e5"],"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}],` +
+			`"created_at":"2026-11-13T02:05:59Z","last_used_at":null,"current":true}}`
+		notInKey = `{"code":"site_not_in_key","message":"This deploy key cannot act on this site.",` +
+			`"key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"github-actions"},` +
+			`"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}],"site":{"id":"site123","label":"blog.example.org"}}`
+	)
+
+	// serve answers the reads a deploy key's status makes, refusing the site
+	// read when refuseSite is set, and counts every recheck request that arrives.
+	serve := func(t *testing.T, refuseSite bool) *atomic.Int32 {
+		t.Helper()
+		var rechecks atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body any
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/recheck"):
+				rechecks.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+				io.WriteString(w, `{"code":"deploy_key_refused","message":"This is a deploy key."}`)
+				return
+			case r.URL.Path == "/v1/keys/current":
+				io.WriteString(w, deployKeyJSON)
+				return
+			case strings.HasPrefix(r.URL.Path, "/v1/pages/sites/"):
+				if refuseSite {
+					w.WriteHeader(http.StatusForbidden)
+					io.WriteString(w, notInKey)
+					return
+				}
+				body = api.Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}
+			case r.URL.Path == "/v1/pages/domains":
+				body = api.DomainList{Domains: []api.Domain{{
+					Domain: "next.altstack.jp", Role: "canonical", State: "awaiting_dns", DnsVerdict: "absent",
+					DNSRecordsExpected: []api.DNSRecord{
+						{Name: "next.altstack.jp", Type: "cname", Value: "t.kamakiri-pages.site.", Purpose: "primary", Required: true},
+					},
+				}}}
+			case r.URL.Path == "/v1/pages/cdn/status":
+				body = api.CDNStatusResponse{CDNMode: "none", Provider: "none"}
+			default:
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"code":"not_found","message":"not found"}`)
+				return
+			}
+			payload, err := json.Marshal(body)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Write(payload)
+		}))
+		t.Cleanup(server.Close)
+		t.Setenv("KAMAKIRI_API_URL", server.URL)
+		t.Setenv("KAMAKIRI_API_KEY", "kk_deploy_fromenv")
+		return &rechecks
+	}
+
+	t.Run("--recheck sends no recheck", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+		rechecks := serve(t, false)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status", "--recheck"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 0 {
+			t.Fatalf("`kamakiri status --recheck` exited %d, want 0; stderr: %q", code, stderr.String())
+		}
+		if n := rechecks.Load(); n != 0 {
+			t.Errorf("%d recheck requests arrived, want none", n)
+		}
+		want := "--recheck needs a login key; this run uses a deploy key, so no domain was rechecked.\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr = %q, want %q", got, want)
+		}
+		got := stdout.String()
+		for _, line := range []string{"Sites:        example.com\n", "next.altstack.jp"} {
+			if !strings.Contains(got, line) {
+				t.Errorf("stdout:\n%s\nwant it to hold %q", got, line)
+			}
+		}
+	})
+
+	t.Run("a linked site outside the key's list", func(t *testing.T) {
+		pinDispatchEnvironment(t)
+		t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+		t.Chdir(t.TempDir())
+		if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+			t.Fatalf("SaveProject: %v", err)
+		}
+		serve(t, true)
+
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"status"}, strings.NewReader(""), &stdout, &stderr)
+
+		if code != 1 {
+			t.Fatalf("`kamakiri status` exited %d, want 1", code)
+		}
+		if got, want := stdout.String(), "API server:   "+os.Getenv("KAMAKIRI_API_URL")+"\n"; !strings.HasSuffix(got, want) {
+			t.Errorf("stdout:\n%s\nwant the page to end at the API server row, %q", got, want)
+		}
+		want := `this deploy key ("github-actions") cannot act on blog.example.org: it can deploy to example.com and nothing else` + "\n"
+		if got := stderr.String(); got != want {
+			t.Errorf("stderr = %q, want %q", got, want)
+		}
+	})
 }
 
 // TestAccountScopedDomainVerbsRefuseBeforeSending pins that the domain verbs
@@ -1551,4 +2445,894 @@ func TestAccountScopedDomainVerbsRefuseBeforeSending(t *testing.T) {
 			t.Error("a request went out, but there is no credential to send")
 		}
 	})
+}
+
+// The key arm hands the client it armed to the key package and prints what the
+// package returns on stderr. Each run is driven against a server, so the
+// wiring is held as well as the parse: the route reached, the bearer sent, and
+// both streams. The listing's last-used column reads `never` so the page does
+// not depend on the clock the arm passes.
+func TestKeyCommandsRideTheDispatch(t *testing.T) {
+	const keyID = "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c"
+	cases := []struct {
+		name   string
+		args   []string
+		status int
+		answer string
+		route  string
+		stdout string
+		stderr string
+		code   int
+	}{
+		{
+			name:   "key list",
+			args:   []string{"key", "list"},
+			status: http.StatusOK,
+			answer: `{"keys":[{"id":"` + keyID + `","name":"github-ci","kind":"login","resource_ids":[],"created_at":"2026-11-13T02:05:00Z","last_used_at":null,"current":true}]}`,
+			route:  "GET /v1/keys",
+			stdout: "  ID                                    Name       Kind   Sites  Created           Last used\n" +
+				"* c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c  github-ci  login  all    2026-11-13 02:05  never\n" +
+				"\n" +
+				"* the key this command ran with\n",
+		},
+		{
+			name:   "key rename",
+			args:   []string{"key", "rename", keyID, "ci-box"},
+			status: http.StatusOK,
+			answer: `{"key":{"id":"` + keyID + `","name":"ci-box","kind":"login","resource_ids":[],"created_at":"2026-11-13T02:05:00Z","last_used_at":null,"current":false}}`,
+			route:  "PATCH /v1/keys/" + keyID,
+			stdout: "Renamed key " + keyID + " to ci-box.\n",
+		},
+		{
+			name:   "key revoke",
+			args:   []string{"key", "revoke", keyID},
+			status: http.StatusOK,
+			answer: `{"key":{"id":"` + keyID + `","name":"github-ci"}}`,
+			route:  "DELETE /v1/keys/" + keyID,
+			stdout: "Revoked key github-ci (" + keyID + "). It no longer works anywhere it was used.\n",
+		},
+		{
+			// The key comes from the variable here, so the refusal says to
+			// revoke it with another key rather than to log out.
+			name:   "key revoke of the key the command runs with",
+			args:   []string{"key", "revoke", keyID},
+			status: http.StatusConflict,
+			answer: `{"code":"current_key","message":"This is the key the request was made with."}`,
+			route:  "DELETE /v1/keys/" + keyID,
+			stderr: "this is the key in KAMAKIRI_API_KEY, which this command runs with. Revoke it using another key, such as the one on your own machine\n",
+			code:   1,
+		},
+		{
+			// Every command but logout meets a deploy key's refusal through
+			// the line every refusal is worded with, and nothing else.
+			name:   "key list with a deploy key",
+			args:   []string{"key", "list"},
+			status: http.StatusForbidden,
+			answer: `{"code":"deploy_key_refused","message":"This is a deploy key.","key":{"id":"` + keyID + `","name":"github-actions"},"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}]}`,
+			route:  "GET /v1/keys",
+			stderr: "this is a deploy key (\"github-actions\"): it can deploy to example.com and nothing else. Use a login key for this command\n",
+			code:   1,
+		},
+		{
+			name:   "key rename of no key of the account",
+			args:   []string{"key", "rename", keyID, "ci-box"},
+			status: http.StatusNotFound,
+			answer: `{"code":"key_not_found","message":"Key not found."}`,
+			route:  "PATCH /v1/keys/" + keyID,
+			stderr: "no key with ID " + keyID + " in this account\n",
+			code:   1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var route, authorization string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				route = r.Method + " " + r.URL.Path
+				authorization = r.Header.Get("Authorization")
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.answer)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader(""), &stdout, &stderr)
+
+			// The handler records from the server's own goroutine, and Close
+			// returns only once that goroutine has finished, which is what
+			// orders its writes against the reads below.
+			server.Close()
+
+			if code != tc.code {
+				t.Errorf("exited %d, want %d", code, tc.code)
+			}
+			if got := stdout.String(); got != tc.stdout {
+				t.Errorf("stdout:\n%s\nwant:\n%s", got, tc.stdout)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if route != tc.route {
+				t.Errorf("request = %q, want %q", route, tc.route)
+			}
+			if got, want := authorization, "Bearer kk_live_fromenv"; got != want {
+				t.Errorf("Authorization = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// `key create` through the real switch and client: the flags reach the request
+// body (no name field at all without --name, the sites in the order typed, the
+// linked site's ID without --site), and stdout carries the key alone on
+// success and nothing on any failure, so whatever main prints is covered too.
+func TestKeyCreateRidesTheDispatch(t *testing.T) {
+	const (
+		keyID      = "3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40"
+		apiKey     = "kk_deploy_4Wq8ZtR2mN7xK1pL9sB3vC6yH0jD5fGa"
+		linkedSite = "k3j9x2m4p7q1w8e5"
+		created    = `{"key":{"id":"` + keyID + `","name":"github-actions","kind":"deploy","resource_ids":["` + linkedSite + `","a1b2c3d4e5f6g7h8"],` +
+			`"sites":[{"id":"` + linkedSite + `","label":"example.com"},{"id":"a1b2c3d4e5f6g7h8","label":"docs.kamakiri-pages.jp"}],` +
+			`"created_at":"2026-11-17T10:30:00Z","last_used_at":null,"current":false},"api_key":"` + apiKey + `"}`
+		lines = "Created deploy key \"github-actions\" (" + keyID + ").\n" +
+			"Sites: example.com, docs.kamakiri-pages.jp\n" +
+			"This key is shown once. Store it as KAMAKIRI_API_KEY in your CI secrets.\n" +
+			"A notice is being sent to the account's email address.\n"
+	)
+	cases := []struct {
+		name   string
+		args   []string
+		linked bool
+		status int
+		answer string
+		body   map[string]any
+		stdout string
+		stderr string
+		code   int
+	}{
+		{
+			name:   "--site twice, no --name",
+			args:   []string{"key", "create", "--site", "example.com", "--site=docs"},
+			status: http.StatusCreated,
+			answer: created,
+			body:   map[string]any{"sites": []any{"example.com", "docs"}},
+			stdout: apiKey + "\n",
+			stderr: lines,
+		},
+		{
+			name:   "--name, in either form",
+			args:   []string{"key", "create", "--name=first", "--site", "example.com", "--name", "github-actions"},
+			status: http.StatusCreated,
+			answer: created,
+			body:   map[string]any{"name": "github-actions", "sites": []any{"example.com"}},
+			stdout: apiKey + "\n",
+			stderr: lines,
+		},
+		{
+			name:   "the linked site without --site",
+			args:   []string{"key", "create"},
+			linked: true,
+			status: http.StatusCreated,
+			answer: created,
+			body:   map[string]any{"sites": []any{linkedSite}},
+			stdout: apiKey + "\n",
+			stderr: lines,
+		},
+		{
+			name:   "a site that matches nothing",
+			args:   []string{"key", "create", "--site", "Docs"},
+			status: http.StatusUnprocessableEntity,
+			answer: `{"code":"key_site_not_found","message":"No site of this account matches docs.kamakiri-pages.jp.","reference":"docs.kamakiri-pages.jp"}`,
+			body:   map[string]any{"sites": []any{"Docs"}},
+			stderr: "no site of this account matches docs.kamakiri-pages.jp. Name a site by its subdomain, one of its domains, or its site ID\n",
+			code:   1,
+		},
+		{
+			name:   "the linked site matching nothing",
+			args:   []string{"key", "create"},
+			linked: true,
+			status: http.StatusUnprocessableEntity,
+			answer: `{"code":"key_site_not_found","message":"No site of this account matches ` + linkedSite + `.kamakiri-pages.jp.","reference":"` + linkedSite + `.kamakiri-pages.jp"}`,
+			body:   map[string]any{"sites": []any{linkedSite}},
+			stderr: "the site linked here is not an active site of this account. Name a site with --site\n",
+			code:   1,
+		},
+		{
+			name:   "run with a deploy key",
+			args:   []string{"key", "create", "--site", "example.com"},
+			status: http.StatusForbidden,
+			answer: `{"code":"deploy_key_refused","message":"This is a deploy key.","key":{"id":"` + keyID + `","name":"github-actions"},"sites":[{"id":"` + linkedSite + `","label":"example.com"}]}`,
+			body:   map[string]any{"sites": []any{"example.com"}},
+			stderr: "this is a deploy key (\"github-actions\"): it can deploy to example.com and nothing else. Use a login key for this command\n",
+			code:   1,
+		},
+		{
+			name:   "no --site and no linked site",
+			args:   []string{"key", "create", "--name", "github-actions"},
+			stderr: "no site linked here. Run this in a linked directory, or name a site with --site\n",
+			code:   1,
+		},
+		{
+			name:   "a name the rule refuses",
+			args:   []string{"key", "create", "--name", "", "--site", "example.com"},
+			stderr: "invalid key name: it must be 1 to 64 characters with no control characters\n",
+			code:   1,
+		},
+		{
+			name:   "--name followed by --site",
+			args:   []string{"key", "create", "--name", "--site", "example.com"},
+			stderr: "Error: --name requires a value; write a value that starts with \"--\" as --name=<value>\n",
+			code:   1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+			t.Chdir(t.TempDir())
+			if tc.linked {
+				if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: linkedSite}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var requests atomic.Int32
+			var route, authorization string
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				route = r.Method + " " + r.URL.Path
+				authorization = r.Header.Get("Authorization")
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decoding the request body: %v", err)
+				}
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.answer)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader(""), &stdout, &stderr)
+
+			// Close returns only once the handler's goroutine has finished,
+			// which orders its writes against the reads below.
+			server.Close()
+
+			if code != tc.code {
+				t.Errorf("exited %d, want %d", code, tc.code)
+			}
+			if got := stdout.String(); got != tc.stdout {
+				t.Errorf("stdout = %q, want %q", got, tc.stdout)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if tc.body == nil {
+				if n := requests.Load(); n != 0 {
+					t.Errorf("sent %d requests, want none", n)
+				}
+				return
+			}
+			if n := requests.Load(); n != 1 {
+				t.Fatalf("sent %d requests, want 1", n)
+			}
+			if route != "POST /v1/keys" {
+				t.Errorf("request = %q, want %q", route, "POST /v1/keys")
+			}
+			if got, want := authorization, "Bearer kk_live_fromenv"; got != want {
+				t.Errorf("Authorization = %q, want %q", got, want)
+			}
+			if !reflect.DeepEqual(body, tc.body) {
+				t.Errorf("request body = %#v, want %#v", body, tc.body)
+			}
+		})
+	}
+}
+
+// A command line that does not name exactly one key ID is refused before
+// anything is sent, with a credential in hand so that a refusal cannot pass by
+// the run stopping for want of one. The command takes no flag, so any argument
+// starting with a hyphen is one it does not take, and the first such argument,
+// or a second ID, is named, redacted, after the usage line.
+func TestKeyRevokeRefusesABadCommandLineBeforeSending(t *testing.T) {
+	const (
+		keyID = "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c"
+		usage = "Usage: kamakiri key revoke <id>\n"
+
+		invalidID = "invalid key ID. A key ID looks like 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65; run \"kamakiri key list\" to see yours\n"
+	)
+	cases := []struct {
+		name   string
+		args   []string
+		stderr string
+	}{
+		{"no argument", []string{"key", "revoke"}, usage},
+		{"--all-others", []string{"key", "revoke", "--all-others"}, usage + "Unexpected argument: --all-others\n"},
+		{"--all-others with --yes", []string{"key", "revoke", "--all-others", "--yes"}, usage + "Unexpected argument: --all-others\n"},
+		{"--all-others with a value", []string{"key", "revoke", "--all-others=x"}, usage + "Unexpected argument: --all-others\n"},
+		{"an ID with --all-others", []string{"key", "revoke", keyID, "--all-others"}, usage + "Unexpected argument: --all-others\n"},
+		{"--yes alone", []string{"key", "revoke", "--yes"}, usage + "Unexpected argument: --yes\n"},
+		{"an ID with --yes", []string{"key", "revoke", keyID, "--yes"}, usage + "Unexpected argument: --yes\n"},
+		{"a second ID", []string{"key", "revoke", keyID, "extra"}, usage + "Unexpected argument: extra\n"},
+		{"an unknown flag with a value", []string{"key", "revoke", keyID, "--token=TOPSECRET"}, usage + "Unexpected argument: --token\n"},
+		{"a short flag", []string{"key", "revoke", "-y", keyID}, usage + "Unexpected argument: -y\n"},
+		{"an empty ID", []string{"key", "revoke", ""}, invalidID},
+		{"an empty ID and a second ID", []string{"key", "revoke", "", keyID}, usage + "Unexpected argument: " + keyID + "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader("y\n"), &stdout, &stderr)
+			server.Close()
+
+			if code != 1 {
+				t.Errorf("exited %d, want 1", code)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if got := stdout.String(); got != "" {
+				t.Errorf("stdout:\n%q\nwant nothing", got)
+			}
+			if n := requests.Load(); n != 0 {
+				t.Errorf("sent %d requests, want none", n)
+			}
+		})
+	}
+}
+
+// A rotation command line that does not name exactly one key ID is refused
+// before anything is sent, as a revoke's is: the command takes no flag, so any
+// argument starting with a hyphen is one it does not take, and the first such
+// argument, or a second ID, is named, redacted, after the usage line.
+func TestKeyRotateRefusesABadCommandLineBeforeSending(t *testing.T) {
+	const (
+		keyID = "3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40"
+		usage = "Usage: kamakiri key rotate <id>\n"
+
+		invalidID = "invalid key ID. A key ID looks like 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65; run \"kamakiri key list\" to see yours\n"
+	)
+	cases := []struct {
+		name   string
+		args   []string
+		stderr string
+	}{
+		{"no argument", []string{"key", "rotate"}, usage},
+		{"a flag alone", []string{"key", "rotate", "--name"}, usage + "Unexpected argument: --name\n"},
+		{"an ID with --site", []string{"key", "rotate", keyID, "--site", "example.com"}, usage + "Unexpected argument: --site\n"},
+		{"a second ID", []string{"key", "rotate", keyID, "extra"}, usage + "Unexpected argument: extra\n"},
+		{"an unknown flag with a value", []string{"key", "rotate", keyID, "--token=TOPSECRET"}, usage + "Unexpected argument: --token\n"},
+		{"a short flag", []string{"key", "rotate", "-y", keyID}, usage + "Unexpected argument: -y\n"},
+		{"an empty ID", []string{"key", "rotate", ""}, invalidID},
+		{"an empty ID and a second ID", []string{"key", "rotate", "", keyID}, usage + "Unexpected argument: " + keyID + "\n"},
+		{"current", []string{"key", "rotate", "current"}, invalidID},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader(""), &stdout, &stderr)
+			server.Close()
+
+			if code != 1 {
+				t.Errorf("exited %d, want 1", code)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if got := stdout.String(); got != "" {
+				t.Errorf("stdout:\n%q\nwant nothing", got)
+			}
+			if n := requests.Load(); n != 0 {
+				t.Errorf("sent %d requests, want none", n)
+			}
+		})
+	}
+}
+
+// `key rotate` through the real switch and client: the request reaches the
+// key's rotate route with no body, stdout carries the new key alone on success
+// and nothing on any failure, and a failure that leaves the outcome unknown,
+// an error answer or one that is not the API's, is followed by the line saying
+// the key may have been rotated, printed by main as part of the error.
+func TestKeyRotateRidesTheDispatch(t *testing.T) {
+	const (
+		oldID   = "3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40"
+		newID   = "7b2e4d10-9a3c-4f1e-8b20-5c6d7e8f9a01"
+		apiKey  = "kk_deploy_9Hc2Lm5Qx8Tn1Vb4Zr7Kp0Wd3Fs6Gj"
+		rotated = `{"key":{"id":"` + newID + `","name":"github-actions","kind":"deploy","resource_ids":["k3j9x2m4p7q1w8e5","a1b2c3d4e5f6g7h8"],` +
+			`"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"},{"id":"a1b2c3d4e5f6g7h8","label":"docs.kamakiri-pages.jp"}],` +
+			`"created_at":"2026-11-18T09:00:00Z","last_used_at":null,"current":false},"api_key":"` + apiKey + `",` +
+			`"replaced":{"id":"` + oldID + `","name":"github-actions"}}`
+
+		maybeRotated = "The key may have been rotated. Run \"kamakiri key list\" to see whether it was replaced.\n"
+	)
+	cases := []struct {
+		name   string
+		status int
+		answer string
+		stdout string
+		stderr string
+		code   int
+	}{
+		{
+			name:   "a deploy key",
+			status: http.StatusCreated,
+			answer: rotated,
+			stdout: apiKey + "\n",
+			stderr: "Rotated deploy key \"github-actions\": " + newID + " replaces " + oldID + ", which no longer works.\n" +
+				"Sites: example.com, docs.kamakiri-pages.jp\n" +
+				"This key is shown once. Store it as KAMAKIRI_API_KEY in your CI secrets.\n" +
+				"A notice is being sent to the account's email address.\n",
+		},
+		{
+			name:   "a login key",
+			status: http.StatusConflict,
+			answer: `{"code":"key_not_rotatable","message":"This is a login key, which cannot be rotated. Log in again on the machine that uses it, then revoke this one."}`,
+			stderr: "this is a login key, which cannot be rotated. Run \"kamakiri login\" on the machine that uses it, then revoke this one with \"kamakiri key revoke " + oldID + "\"\n",
+			code:   1,
+		},
+		{
+			name:   "no key of the account",
+			status: http.StatusNotFound,
+			answer: `{"code":"key_not_found","message":"Key not found."}`,
+			stderr: "no key with ID " + oldID + " in this account\n",
+			code:   1,
+		},
+		{
+			name:   "a server error",
+			status: http.StatusInternalServerError,
+			answer: `{"code":"server_error","message":"Failed to rotate the key."}`,
+			stderr: "Failed to rotate the key.\n" + maybeRotated,
+			code:   1,
+		},
+		{
+			name:   "an answer that is not JSON",
+			status: http.StatusBadGateway,
+			answer: "<html>Bad Gateway</html>",
+			stderr: "server returned 502\n" + maybeRotated,
+			code:   1,
+		},
+		{
+			name:   "a success that carries no key",
+			status: http.StatusCreated,
+			answer: `{}`,
+			stderr: "parse response: the response names no key\n" + maybeRotated,
+			code:   1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			var requests atomic.Int32
+			var route, authorization string
+			var body []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				route = r.Method + " " + r.URL.Path
+				authorization = r.Header.Get("Authorization")
+				body, _ = io.ReadAll(r.Body)
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.answer)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"key", "rotate", oldID}, strings.NewReader(""), &stdout, &stderr)
+
+			// Close returns only once the handler's goroutine has finished,
+			// which orders its writes against the reads below.
+			server.Close()
+
+			if code != tc.code {
+				t.Errorf("exited %d, want %d", code, tc.code)
+			}
+			if got := stdout.String(); got != tc.stdout {
+				t.Errorf("stdout = %q, want %q", got, tc.stdout)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if n := requests.Load(); n != 1 {
+				t.Fatalf("sent %d requests, want 1", n)
+			}
+			if want := "POST /v1/keys/" + oldID + "/rotate"; route != want {
+				t.Errorf("request = %q, want %q", route, want)
+			}
+			if got, want := authorization, "Bearer kk_live_fromenv"; got != want {
+				t.Errorf("Authorization = %q, want %q", got, want)
+			}
+			if len(body) != 0 {
+				t.Errorf("request body = %q, want none", body)
+			}
+		})
+	}
+}
+
+// stubAnswer is one canned response of a dispatch test's stub server.
+type stubAnswer struct {
+	status int
+	body   string
+}
+
+// `init` and `teardown` render a deploy key's refusals through the same mapping
+// as every other command, so a key name the server controls reaches the
+// terminal escaped and in the catalog's wording, with nothing on stdout but the
+// command's own prompt.
+func TestInitAndTeardownRenderDeployKeyRefusals(t *testing.T) {
+	const siteRow = `"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}]`
+	const keyRow = `"key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"ci\u202ebox"}`
+	cases := []struct {
+		name string
+		args []string
+		// stdin answers the prompt of the command, when it has one.
+		stdin string
+		// answers maps "METHOD path" to the status and body the stub returns;
+		// requests lists the requests the command is expected to make, in order.
+		answers  map[string]stubAnswer
+		requests []string
+		stdout   string
+		stderr   string
+	}{
+		{
+			name:   "init refused as a deploy key",
+			args:   []string{"init"},
+			stdin:  "blog\n",
+			stdout: "Subdomain: ",
+			answers: map[string]stubAnswer{
+				"POST /v1/pages/sites": {http.StatusForbidden, `{"code":"deploy_key_refused","message":"This is a deploy key.",` + keyRow + `,` + siteRow + `}`},
+			},
+			requests: []string{"POST /v1/pages/sites"},
+			stderr:   "this is a deploy key (\"ci\\u{202e}box\"): it can deploy to example.com and nothing else. Use a login key for this command\n",
+		},
+		{
+			// A deploy key may read its own site, so the refusal comes from the
+			// DELETE, after the confirmation.
+			name:  "teardown refused as a deploy key",
+			args:  []string{"teardown"},
+			stdin: "y\n",
+			answers: map[string]stubAnswer{
+				"GET /v1/pages/sites/site123":    {http.StatusOK, `{"id":"site123","subdomain":"example"}`},
+				"DELETE /v1/pages/sites/site123": {http.StatusForbidden, `{"code":"deploy_key_refused","message":"This is a deploy key.",` + keyRow + `,` + siteRow + `}`},
+			},
+			requests: []string{"GET /v1/pages/sites/site123", "DELETE /v1/pages/sites/site123"},
+			stdout:   "This will permanently delete \"example\" and remove it from kamakiri-pages.jp.\nAre you sure? (y/N) ",
+			stderr:   "this is a deploy key (\"ci\\u{202e}box\"): it can deploy to example.com and nothing else. Use a login key for this command\n",
+		},
+		{
+			name:  "teardown of a site off the key's list",
+			args:  []string{"teardown"},
+			stdin: "y\n",
+			answers: map[string]stubAnswer{
+				"GET /v1/pages/sites/site123": {http.StatusForbidden, `{"code":"site_not_in_key","message":"Not in key.",` + keyRow + `,` + siteRow + `,"site":{"id":"z9y8x7w6v5u4t3s2","label":"blog.example.org"}}`},
+			},
+			requests: []string{"GET /v1/pages/sites/site123"},
+			stderr:   "this deploy key (\"ci\\u{202e}box\") cannot act on blog.example.org: it can deploy to example.com and nothing else\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+			t.Chdir(t.TempDir())
+			// init asks for a subdomain only when no site is linked.
+			if tc.args[0] != "init" {
+				if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+					t.Fatalf("SaveProject: %v", err)
+				}
+			}
+
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				route := r.Method + " " + r.URL.Path
+				requests = append(requests, route)
+				answer, ok := tc.answers[route]
+				if !ok {
+					answer = stubAnswer{http.StatusNotFound, `{}`}
+				}
+				w.WriteHeader(answer.status)
+				io.WriteString(w, answer.body)
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader(tc.stdin), &stdout, &stderr)
+			server.Close()
+
+			if code != 1 {
+				t.Errorf("exited %d, want 1", code)
+			}
+			if got := stdout.String(); got != tc.stdout {
+				t.Errorf("stdout:\n%q\nwant:\n%q", got, tc.stdout)
+			}
+			if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if !slices.Equal(requests, tc.requests) {
+				t.Errorf("requests = %q, want %q", requests, tc.requests)
+			}
+			if tc.args[0] == "teardown" {
+				if _, err := os.Stat(core.ProjectPath()); err != nil {
+					t.Errorf("project config not kept: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// The logout arm loads the credential itself and hands it to the logout
+// package, which decides from it whether anything is sent. Each run is driven
+// against a local server that counts what reaches it, so a run that must send
+// nothing is held to that, and the bearer of the one that sends is the key the
+// file held.
+func TestLogoutRidesTheDispatch(t *testing.T) {
+	const (
+		notLoggedIn = "Not logged in.\n"
+		environment = `KAMAKIRI_API_KEY holds the key in use, so logout changes nothing. Unset it to stop using that key, or revoke it with "kamakiri key revoke" from another key` + "\n"
+	)
+	cases := []struct {
+		name string
+		args []string
+		// file is what the credentials file holds before the run, or nothing
+		// when it is empty.
+		file        string
+		environment bool
+		status      int
+		answer      string
+		requests    int32
+		stdout      string
+		stderr      string
+		// stderrPrefix stands in for stderr where the line carries a path or
+		// an error from the operating system: one line starting with it.
+		stderrPrefix string
+		code         int
+		fileKept     bool
+	}{
+		{
+			name:     "a revoke",
+			args:     []string{"logout"},
+			file:     `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			status:   http.StatusOK,
+			answer:   `{"key":{"id":"5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65","name":"alexis-laptop"}}`,
+			requests: 1,
+			stdout:   "Logged out. The key alexis-laptop was revoked; any copy of it, in a CI secret for instance, no longer works.\n",
+		},
+		{
+			name:     "a key the server already refuses",
+			args:     []string{"logout"},
+			file:     `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			status:   http.StatusUnauthorized,
+			answer:   `{"code":"unauthorized","message":"invalid API key"}`,
+			requests: 1,
+			stdout:   "Logged out. The saved key was already invalid.\n",
+		},
+		{
+			name:     "a server failure",
+			args:     []string{"logout"},
+			file:     `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			status:   http.StatusInternalServerError,
+			answer:   "<html>500 Internal Server Error</html>",
+			requests: 1,
+			stderr:   "server returned 500\nthe key may still be valid and is still saved; run \"kamakiri logout\" again\n",
+			code:     1,
+			fileKept: true,
+		},
+		{
+			// A deploy key cannot revoke itself: the credentials file stays,
+			// nothing prints on stdout, and the one line on stderr names the
+			// key with every slot escaped.
+			name:     "a deploy key",
+			args:     []string{"logout"},
+			file:     `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			status:   http.StatusForbidden,
+			answer:   `{"code":"deploy_key_refused","message":"This is a deploy key.","key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"ci\u202ebox"},"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}]}`,
+			requests: 1,
+			stderr:   "this is a deploy key (\"ci\\u{202e}box\", 3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40), which cannot revoke itself. The credentials file was kept. Revoke the key with \"kamakiri key revoke <id>\" using a login key\n",
+			code:     1,
+			fileKept: true,
+		},
+		{
+			name:   "no credential",
+			args:   []string{"logout"},
+			stdout: notLoggedIn,
+		},
+		{
+			// A file with no key in it is no credential, as for every command,
+			// and logout leaves it where it is.
+			name:     "a credentials file with no key",
+			args:     []string{"logout"},
+			file:     `{"version":1,"api_key":"   "}`,
+			stdout:   notLoggedIn,
+			fileKept: true,
+		},
+		{
+			name:        "a key from the environment",
+			args:        []string{"logout"},
+			file:        `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			environment: true,
+			stderr:      environment,
+			code:        1,
+			fileKept:    true,
+		},
+		{
+			name:         "a credentials file that cannot be read",
+			args:         []string{"logout"},
+			file:         "not json",
+			stderrPrefix: "parse credentials:",
+			code:         1,
+			fileKept:     true,
+		},
+		{
+			name:     "an extra argument",
+			args:     []string{"logout", "extra"},
+			file:     `{"version":1,"api_key":"kk_live_fromfile","email":"a@example.com"}`,
+			stderr:   "Usage: kamakiri logout\nUnexpected argument: extra\n",
+			code:     1,
+			fileKept: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinDispatchEnvironment(t)
+			t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+			path := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri", "credentials.json")
+			if tc.file != "" {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				if err := os.WriteFile(path, []byte(tc.file), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+
+			var requests atomic.Int32
+			var route, authorization string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				route = r.Method + " " + r.URL.Path
+				authorization = r.Header.Get("Authorization")
+				if tc.requests == 0 {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.answer)
+			}))
+			t.Cleanup(server.Close)
+
+			t.Setenv("KAMAKIRI_API_URL", server.URL)
+			if tc.environment {
+				t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, strings.NewReader(""), &stdout, &stderr)
+			// Close returns only once the handler's goroutine has finished,
+			// which orders its writes against the reads below.
+			server.Close()
+
+			if code != tc.code {
+				t.Errorf("exited %d, want %d", code, tc.code)
+			}
+			if got := stdout.String(); got != tc.stdout {
+				t.Errorf("stdout:\n%q\nwant:\n%q", got, tc.stdout)
+			}
+			if tc.stderrPrefix != "" {
+				if line := stderr.String(); !strings.HasPrefix(line, tc.stderrPrefix) ||
+					strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+					t.Errorf("stderr:\n%q\nwant one line starting with %q", line, tc.stderrPrefix)
+				}
+			} else if got := stderr.String(); got != tc.stderr {
+				t.Errorf("stderr:\n%q\nwant:\n%q", got, tc.stderr)
+			}
+			if n := requests.Load(); n != tc.requests {
+				t.Errorf("sent %d requests, want %d", n, tc.requests)
+			}
+			if tc.requests > 0 {
+				if route != "DELETE /v1/keys/current" {
+					t.Errorf("request = %q, want %q", route, "DELETE /v1/keys/current")
+				}
+				if got, want := authorization, "Bearer kk_live_fromfile"; got != want {
+					t.Errorf("Authorization = %q, want %q", got, want)
+				}
+			}
+			_, err := os.Stat(path)
+			switch {
+			case tc.file == "":
+			case tc.fileKept && err != nil:
+				t.Errorf("credentials.json: Stat() error = %v, want the file kept", err)
+			case !tc.fileKept && !errors.Is(err, os.ErrNotExist):
+				t.Errorf("credentials.json: Stat() error = %v, want the file removed", err)
+			}
+		})
+	}
+}
+
+// A revoke that went through while the file could not be removed exits 1: the
+// file now holds a dead key, and the line says so. The config directory is made
+// read-only, which root ignores.
+func TestLogoutExitsWhenItCannotRemoveTheRevokedKey(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes from a directory whatever its mode says, so no removal here would fail")
+	}
+	pinDispatchEnvironment(t)
+	t.Cleanup(func() { api.SetKeyFromEnvironment(false) })
+
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "kamakiri")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(dir, "credentials.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"api_key":"kk_live_fromfile"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatalf("sealing the config directory: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0700) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"key":{"id":"5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65","name":"alexis-laptop"}}`)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("KAMAKIRI_API_URL", server.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"logout"}, strings.NewReader(""), &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("exited %d, want 1", code)
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("stdout:\n%q\nwant nothing", got)
+	}
+	const want = "the key alexis-laptop was revoked, but the saved copy could not be removed: delete credentials: "
+	if line := stderr.String(); !strings.HasPrefix(line, want) ||
+		strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+		t.Errorf("stderr:\n%q\nwant one line starting with %q", line, want)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("credentials.json: Stat() error = %v, want the file still there", err)
+	}
 }

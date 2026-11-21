@@ -45,6 +45,14 @@ func Redact(arg string) string {
 // on from: the same index for the equals form, i+1 once the space form has
 // consumed the next argument. A non-empty hint is appended to a missing-value
 // error to show the format expected.
+//
+// In the space form a next argument that starts with "--" is refused rather
+// than taken, so a flag whose value was forgotten cannot swallow the flag after
+// it: `login --name --revoke-others` would otherwise mint a key named
+// "--revoke-others" and revoke nothing. The refusal points at the equals form,
+// which takes any value, and never echoes the refused argument, since under
+// --secret it could be the secret. A value starting with a single "-", or
+// exactly "-", is still taken.
 func Value(args []string, i int, hasValue bool, embedded, name, hint string) (string, int, error) {
 	if hasValue {
 		if embedded == "" {
@@ -54,6 +62,9 @@ func Value(args []string, i int, hasValue bool, embedded, name, hint string) (st
 	}
 	if i+1 >= len(args) {
 		return "", i, errors.New(i18n.Tf("cliflags.err_requires_value", name, FormatHint(hint)))
+	}
+	if strings.HasPrefix(args[i+1], "--") {
+		return "", i, errors.New(i18n.Tf("cliflags.err_value_starts_with_dashes", name, FormatHint(hint), name))
 	}
 	return args[i+1], i + 1, nil
 }

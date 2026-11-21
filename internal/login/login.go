@@ -18,6 +18,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/keyname"
 	"github.com/kamakiri-labs/kamakiri/internal/streamui"
 )
 
@@ -49,14 +50,39 @@ var discardTypeahead = func(in io.Reader) {
 	flushInput(f)
 }
 
+// hostname reads the machine's name, which names the key when --name is not
+// given. It is a variable so the tests can name the machine themselves; only
+// tests reassign it.
+var hostname = os.Hostname
+
 // APIClient is the API surface the login flow needs.
 type APIClient interface {
 	Register(email string, tosAccepted bool, secretHash string, resend bool) (*api.RegisterResponse, error)
-	Verify(email, code, secret string) (*api.VerifyResponse, error)
+	Verify(email, code, secret, name string, revokeOthers bool) (*api.VerifyResponse, error)
 }
 
-// Run executes the login flow, reading from in and writing to out.
-func Run(client APIClient, in io.Reader, out io.Writer) error {
+// Options is what the command line says about the run. NameGiven records that
+// --name appeared, whatever its value, so an empty value is refused as a name
+// rather than taken for the flag's absence and replaced with the hostname.
+// RevokeOthers asks the server to revoke every other key of the account in the
+// same step that issues the new one.
+type Options struct {
+	Name         string
+	NameGiven    bool
+	RevokeOthers bool
+}
+
+// Run executes the login flow, reading from in and writing to out, and names
+// the key it mints as opts says.
+func Run(client APIClient, in io.Reader, out io.Writer, opts Options) error {
+	// Ahead of the first prompt, so a refused name costs the user nothing
+	// typed and nothing is sent.
+	keyName, ok := resolveKeyName(opts)
+	if !ok {
+		fmt.Fprintln(out, i18n.T("login.err_invalid_name"))
+		return errors.New(i18n.T("login.err_aborted_invalid_name"))
+	}
+
 	reader := bufio.NewReader(in)
 
 	fmt.Fprint(out, i18n.T("login.prompt_email"))
@@ -118,13 +144,20 @@ func Run(client APIClient, in io.Reader, out io.Writer) error {
 			continue
 		}
 
-		resp, err := client.Verify(email, code, secret)
+		resp, err := client.Verify(email, code, secret, keyName, opts.RevokeOthers)
 		if err != nil {
 			if line, ok := rejectedCodeLine(err); ok {
 				fmt.Fprintln(out, line)
 				continue
 			}
-			return handleAPIError(out, err)
+			line, unknown := apiErrorLine(err)
+			fmt.Fprintln(out, line)
+			// Only this request can have revoked anything, and only a refusal the
+			// server makes before it changes anything says the keys are untouched.
+			if opts.RevokeOthers && unknown {
+				fmt.Fprintln(out, i18n.T("login.revoke_others_maybe_done"))
+			}
+			return err
 		}
 
 		// Delete the local secret before saving credentials: the server has
@@ -132,11 +165,24 @@ func Run(client APIClient, in io.Reader, out io.Writer) error {
 		_ = core.DeleteLoginSecret()
 
 		if err := core.SaveCredentials(resp.APIKey, email); err != nil {
+			// The other keys are gone whether or not this one is saved, and the
+			// user must learn that before the error ends the run.
+			if opts.RevokeOthers {
+				printRevoked(out, resp.Revoked)
+			}
 			return fmt.Errorf("%s: %w", i18n.T("login.err_save_credentials"), err)
 		}
 
 		credPath, _ := core.CredentialsPath()
 		fmt.Fprintln(out, i18n.Tf("login.api_key_saved", credPath))
+		// The name the server reports, not the one sent, so the line confirms
+		// what the account now holds.
+		if resp.Key != nil && resp.Key.Name != "" {
+			fmt.Fprintln(out, i18n.Tf("login.key_name", keyname.Escape(resp.Key.Name)))
+		}
+		if opts.RevokeOthers {
+			printRevoked(out, resp.Revoked)
+		}
 		// The key was minted and saved, and yet nothing about the next command
 		// changes while the environment holds a key of its own, so say so rather
 		// than leave the user to work out why the account did not switch.
@@ -144,6 +190,24 @@ func Run(client APIClient, in io.Reader, out io.Writer) error {
 			fmt.Fprintln(out, i18n.T("login.env_override_note"))
 		}
 		return nil
+	}
+}
+
+// printRevoked lists the keys a verify with RevokeOthers revoked, or says there
+// were none. The names come from the server, so each is escaped before it
+// reaches the terminal.
+func printRevoked(out io.Writer, revoked []api.KeyInfo) {
+	switch len(revoked) {
+	case 0:
+		fmt.Fprintln(out, i18n.T("login.revoked_others_none"))
+		return
+	case 1:
+		fmt.Fprintln(out, i18n.T("login.revoked_others_one"))
+	default:
+		fmt.Fprintln(out, i18n.Tf("login.revoked_others_many", len(revoked)))
+	}
+	for _, key := range revoked {
+		fmt.Fprintln(out, i18n.Tf("login.revoked_key", keyname.Escape(key.Name), key.ID))
 	}
 }
 
@@ -323,40 +387,91 @@ func hashSecret(secret string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// handleAPIError prints the line apiErrorLine renders for a failed request
+// that ends the run, and returns the error for the run to end with.
 func handleAPIError(out io.Writer, err error) error {
+	line, _ := apiErrorLine(err)
+	fmt.Fprintln(out, line)
+	return err
+}
+
+// apiErrorLine renders a failed request that ends the run, and reports whether
+// the failure leaves it unknown what the server did. Only the refusals named
+// here are known: the server makes each of them before it changes anything.
+// Every other failure is unknown: the server may have carried out the request,
+// and its answer was then lost, came back unreadable, or was replaced by one
+// that is not the API's.
+func apiErrorLine(err error) (line string, unknown bool) {
 	// Ahead of the type assertion below: a version refusal is a sentinel rather
 	// than a coded error response, so it would otherwise fall through to the
 	// network copy and tell the user something false.
 	if errors.Is(err, api.ErrUpgradeRequired) {
-		fmt.Fprintln(out, api.ErrUpgradeRequired)
-		return err
+		return api.ErrUpgradeRequired.Error(), false
 	}
 
 	apiErr, ok := err.(*api.ErrorResponse)
 	if !ok {
-		fmt.Fprintln(out, i18n.T("login.err_network"))
-		return err
+		return i18n.T("login.err_network"), true
 	}
 
 	switch apiErr.Code {
 	case "invalid_email":
-		fmt.Fprintln(out, i18n.T("login.err_invalid_email"))
+		return i18n.T("login.err_invalid_email"), false
 	case "tos_required":
-		fmt.Fprintln(out, i18n.T("login.err_tos_required"))
+		return i18n.T("login.err_tos_required"), false
 	case "invite_required":
 		// The flow aborts here without ever prompting for a code, so the copy
 		// must not send the user looking for a mail that was never sent.
-		fmt.Fprintln(out, i18n.T("login.err_invite_required"))
+		return i18n.T("login.err_invite_required"), false
 	case "auth_rate_limited":
 		// A flood refusal, kept apart from the per-email cooldown the code
 		// request counts down: rendering a throttled request as that cooldown
 		// would tell the user a code is out when none was sent.
-		fmt.Fprintln(out, i18n.T("login.err_auth_rate_limited"))
-	default:
-		fmt.Fprintln(out, i18n.T("login.err_server"))
+		return i18n.T("login.err_auth_rate_limited"), false
+	case "invalid_request":
+		// The server refused the request itself, a bad name or a malformed
+		// field, and its message says which; the server-error line would
+		// claim a fault that is not there.
+		return i18n.Tf("login.err_invalid_request", apiErr.Message), false
 	}
+	return i18n.T("login.err_server"), true
+}
 
-	return err
+// resolveKeyName returns the name to send with the verify request, and false
+// when --name was given a name the rule refuses. A given name is trimmed and
+// then checked, never repaired: the user chose it, so a name other than theirs
+// must not be issued silently. Without the flag the name is the hostname, made
+// to fit the rule rather than checked against it, since the user did not choose
+// it and a login must not fail over it. An empty result sends no name, and the
+// server then names the key itself.
+func resolveKeyName(opts Options) (string, bool) {
+	if opts.NameGiven {
+		name := strings.TrimSpace(opts.Name)
+		return name, keyname.Valid(name)
+	}
+	host, err := hostname()
+	if err != nil {
+		return "", true
+	}
+	host = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if keyname.Refused(r) {
+			return -1
+		}
+		return r
+	}, host))
+	return truncateRunes(host, keyname.MaxRunes), true
+}
+
+// truncateRunes cuts s to its first n code points, never inside one.
+func truncateRunes(s string, n int) string {
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }
 
 // foldEmailCase lowercases the ASCII letters A to Z and copies every other byte

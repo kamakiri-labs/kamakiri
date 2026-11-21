@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,19 +18,24 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/core"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/keyname"
 )
 
 type mockClient struct {
 	registerFn func(email string, tosAccepted bool, secretHash string, resend bool) (*api.RegisterResponse, error)
-	verifyFn   func(email, code, secret string) (*api.VerifyResponse, error)
+	verifyFn   func(email, code, secret, name string) (*api.VerifyResponse, error)
+
+	// names holds the key name each Verify call carried, in order.
+	names []string
 }
 
 func (m *mockClient) Register(email string, tosAccepted bool, secretHash string, resend bool) (*api.RegisterResponse, error) {
 	return m.registerFn(email, tosAccepted, secretHash, resend)
 }
 
-func (m *mockClient) Verify(email, code, secret string) (*api.VerifyResponse, error) {
-	return m.verifyFn(email, code, secret)
+func (m *mockClient) Verify(email, code, secret, name string, _ bool) (*api.VerifyResponse, error) {
+	m.names = append(m.names, name)
+	return m.verifyFn(email, code, secret, name)
 }
 
 // mintingClient answers the two calls of a successful login, checking nothing:
@@ -40,7 +46,7 @@ func mintingClient(apiKey string) *mockClient {
 		registerFn: func(string, bool, string, bool) (*api.RegisterResponse, error) {
 			return &api.RegisterResponse{Message: "Confirmation code sent."}, nil
 		},
-		verifyFn: func(string, string, string) (*api.VerifyResponse, error) {
+		verifyFn: func(string, string, string, string) (*api.VerifyResponse, error) {
 			return &api.VerifyResponse{APIKey: apiKey}, nil
 		},
 	}
@@ -65,14 +71,20 @@ const testLang = "en"
 // The sleep seam is replaced with one that panics, so a test that reaches a
 // countdown without stubbing the wait through stubWaits fails at once rather
 // than sleeping for real.
+//
+// The hostname seam answers testHost, so no test sends the real machine's name
+// and every expectation about the default name holds on any machine.
 func TestMain(m *testing.M) {
 	i18n.Load(testLang)
 	os.Unsetenv(core.EnvAPIKey)
 	sleep = func(d time.Duration) {
 		panic(fmt.Sprintf("login test slept for real (%s); stub the wait with stubWaits", d))
 	}
+	hostname = func() (string, error) { return testHost, nil }
 	os.Exit(m.Run())
 }
+
+const testHost = "test-host"
 
 func TestLoginSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -88,7 +100,7 @@ func TestLoginSuccess(t *testing.T) {
 			}
 			return &api.RegisterResponse{Message: "Confirmation code sent.", Status: "sent", ExpiresIn: 600}, nil
 		},
-		verifyFn: func(email, code, secret string) (*api.VerifyResponse, error) {
+		verifyFn: func(email, code, secret, _ string) (*api.VerifyResponse, error) {
 			if email != "user@example.com" {
 				t.Errorf("email = %q", email)
 			}
@@ -105,7 +117,7 @@ func TestLoginSuccess(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
 	var stdout bytes.Buffer
 
-	err := Run(client, stdin, &stdout)
+	err := Run(client, stdin, &stdout, Options{})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -155,7 +167,7 @@ func TestLoginUnderTheEnvironmentVariableSavesAndSaysSo(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
 	var stdout bytes.Buffer
 
-	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout); err != nil {
+	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout, Options{}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
@@ -202,7 +214,7 @@ func TestLoginWithoutTheEnvironmentVariablePrintsNoNote(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
 	var stdout bytes.Buffer
 
-	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout); err != nil {
+	if err := Run(mintingClient("kk_live_minted"), stdin, &stdout, Options{}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
@@ -217,7 +229,7 @@ func TestLoginTosRejected(t *testing.T) {
 			t.Error("Register should not be called")
 			return nil, nil
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			t.Error("Verify should not be called")
 			return nil, nil
 		},
@@ -226,7 +238,7 @@ func TestLoginTosRejected(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\nn\n")
 	var stdout bytes.Buffer
 
-	err := Run(client, stdin, &stdout)
+	err := Run(client, stdin, &stdout, Options{})
 	if err == nil {
 		t.Fatal("Run() expected error, got nil")
 	}
@@ -247,7 +259,7 @@ func TestLoginInvalidEmail(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return nil, &api.ErrorResponse{Code: "invalid_email", Message: "Invalid email address."}
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			t.Error("Verify should not be called")
 			return nil, nil
 		},
@@ -256,7 +268,7 @@ func TestLoginInvalidEmail(t *testing.T) {
 	stdin := strings.NewReader("bad\nY\n")
 	var stdout bytes.Buffer
 
-	err := Run(client, stdin, &stdout)
+	err := Run(client, stdin, &stdout, Options{})
 	if err == nil {
 		t.Fatal("Run() expected error, got nil")
 	}
@@ -283,7 +295,7 @@ func TestLoginFoldsTheTypedEmailToLowercase(t *testing.T) {
 			}
 			return &api.RegisterResponse{Message: "Confirmation code sent."}, nil
 		},
-		verifyFn: func(email, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(email, _, _, _ string) (*api.VerifyResponse, error) {
 			if email != folded {
 				t.Errorf("Verify email = %q, want %q", email, folded)
 			}
@@ -292,7 +304,7 @@ func TestLoginFoldsTheTypedEmailToLowercase(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := Run(client, strings.NewReader("  Alice@Example.COM \nY\nABC123\n"), &stdout); err != nil {
+	if err := Run(client, strings.NewReader("  Alice@Example.COM \nY\nABC123\n"), &stdout, Options{}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 
@@ -334,14 +346,14 @@ func TestLoginAuthRateLimitedAborts(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return nil, &api.ErrorResponse{Code: "auth_rate_limited", Message: "Too many requests."}
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			t.Fatal("verify must not be reached after a register flood")
 			return nil, nil
 		},
 	}
 
 	var out bytes.Buffer
-	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &out); err == nil {
+	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &out, Options{}); err == nil {
 		t.Fatal("Run() expected the flood error, got nil")
 	}
 
@@ -360,7 +372,7 @@ func TestLoginAuthRateLimitedAborts(t *testing.T) {
 	t.Cleanup(func() { i18n.Load(testLang) })
 
 	var outJA bytes.Buffer
-	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &outJA); err == nil {
+	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &outJA, Options{}); err == nil {
 		t.Fatal("Run() (ja) expected the flood error, got nil")
 	}
 	if !strings.Contains(outJA.String(), "リクエストが多すぎます") {
@@ -376,14 +388,14 @@ func TestLoginInviteRequiredAborts(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return nil, &api.ErrorResponse{Code: "invite_required", Message: "private beta"}
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			t.Fatal("verify must not be reached when the email is not invited")
 			return nil, nil
 		},
 	}
 
 	var out bytes.Buffer
-	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &out); err == nil {
+	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &out, Options{}); err == nil {
 		t.Fatal("Run() expected the invite-required error, got nil")
 	}
 
@@ -410,7 +422,7 @@ func TestLoginInviteRequiredAborts(t *testing.T) {
 	t.Cleanup(func() { i18n.Load(testLang) })
 
 	var outJA bytes.Buffer
-	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &outJA); err == nil {
+	if err := Run(client, strings.NewReader("user@example.com\nY\n"), &outJA, Options{}); err == nil {
 		t.Fatal("Run() (ja) expected the invite-required error, got nil")
 	}
 	// The assertion needs a substring unique to Japanese: the address is
@@ -433,13 +445,13 @@ func TestLoginVerifyAuthRateLimitedAborts(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return &api.RegisterResponse{Message: "Confirmation code sent."}, nil
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			return nil, &api.ErrorResponse{Code: "auth_rate_limited", Message: "Too many requests."}
 		},
 	}
 
 	var out bytes.Buffer
-	if err := Run(client, strings.NewReader("user@example.com\nY\nABC123\n"), &out); err == nil {
+	if err := Run(client, strings.NewReader("user@example.com\nY\nABC123\n"), &out, Options{}); err == nil {
 		t.Fatal("Run() expected the verify flood error, got nil")
 	}
 	if !strings.Contains(out.String(), "Too many requests. Please wait a moment and try again.") {
@@ -455,7 +467,7 @@ func TestLoginEmptyTosAccepted(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return &api.RegisterResponse{Message: "Confirmation code sent."}, nil
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			return &api.VerifyResponse{APIKey: "kk_live_abc"}, nil
 		},
 	}
@@ -464,7 +476,7 @@ func TestLoginEmptyTosAccepted(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\n\nABC123\n")
 	var stdout bytes.Buffer
 
-	err := Run(client, stdin, &stdout)
+	err := Run(client, stdin, &stdout, Options{})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -480,7 +492,7 @@ func TestLoginSecretReusedOnRateLimit(t *testing.T) {
 			capturedHash = secretHash
 			return nil, &api.ErrorResponse{Code: "rate_limited", Message: "Please wait."}
 		},
-		verifyFn: func(_, _, secret string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, secret, _ string) (*api.VerifyResponse, error) {
 			// The secret sent to verify must hash to what register was given,
 			// or the channel binding proves nothing.
 			got := hashSecret(secret)
@@ -494,7 +506,7 @@ func TestLoginSecretReusedOnRateLimit(t *testing.T) {
 	stdin := strings.NewReader("user@example.com\nY\nABC123\n")
 	var stdout bytes.Buffer
 
-	err := Run(client, stdin, &stdout)
+	err := Run(client, stdin, &stdout, Options{})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -508,14 +520,14 @@ func TestLoginUpgradeRequiredAborts(t *testing.T) {
 		registerFn: func(_ string, _ bool, _ string, _ bool) (*api.RegisterResponse, error) {
 			return nil, api.ErrUpgradeRequired
 		},
-		verifyFn: func(_, _, _ string) (*api.VerifyResponse, error) {
+		verifyFn: func(_, _, _, _ string) (*api.VerifyResponse, error) {
 			t.Fatal("verify must not be reached after a refused version")
 			return nil, nil
 		},
 	}
 
 	var out bytes.Buffer
-	err := Run(client, strings.NewReader("user@example.com\nY\n"), &out)
+	err := Run(client, strings.NewReader("user@example.com\nY\n"), &out, Options{})
 	if !errors.Is(err, api.ErrUpgradeRequired) {
 		t.Fatalf("Run() error = %v, want the upgrade sentinel", err)
 	}
@@ -557,8 +569,10 @@ type scriptedClient struct {
 	onRegister func()
 	onVerify   func()
 
-	calls  []string
-	hashes []string
+	calls        []string
+	hashes       []string
+	names        []string
+	revokeOthers []bool
 }
 
 type registerAnswer struct {
@@ -588,8 +602,10 @@ func (c *scriptedClient) Register(email string, tosAccepted bool, secretHash str
 	return next.resp, next.err
 }
 
-func (c *scriptedClient) Verify(email, code, secret string) (*api.VerifyResponse, error) {
+func (c *scriptedClient) Verify(email, code, secret, name string, revokeOthers bool) (*api.VerifyResponse, error) {
 	c.calls = append(c.calls, "verify "+code)
+	c.names = append(c.names, name)
+	c.revokeOthers = append(c.revokeOthers, revokeOthers)
 	if email != "user@example.com" {
 		c.t.Errorf("Verify(email=%q), want user@example.com", email)
 	}
@@ -665,13 +681,19 @@ func traceWaits(t *testing.T, client *scriptedClient) *[]io.Reader {
 // Code: prompt. It returns what the run printed and the error it ended with.
 func runScripted(t *testing.T, client *scriptedClient, codeLines ...string) (string, error) {
 	t.Helper()
+	return runScriptedWith(t, client, Options{}, codeLines...)
+}
+
+// runScriptedWith is runScripted with the command-line options given.
+func runScriptedWith(t *testing.T, client *scriptedClient, opts Options, codeLines ...string) (string, error) {
+	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	input := "user@example.com\nY\n"
 	for _, line := range codeLines {
 		input += line + "\n"
 	}
 	var out bytes.Buffer
-	err := Run(client, strings.NewReader(input), &out)
+	err := Run(client, strings.NewReader(input), &out, opts)
 	return out.String(), err
 }
 
@@ -993,8 +1015,9 @@ func TestLoginNewCodeRequestFailuresKeepTheRunAlive(t *testing.T) {
 	}
 }
 
-// On an Enter request, a version refusal and any refusal the loop has no copy
-// for still end the run, as they do on the first request.
+// On an Enter request, a version refusal and a refusal of the request itself
+// still end the run, as they do on the first request. The refused request is
+// reported with the server's own message, which says what was wrong with it.
 func TestLoginNewCodeRequestRefusalsEndTheRun(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1002,7 +1025,7 @@ func TestLoginNewCodeRequestRefusalsEndTheRun(t *testing.T) {
 		line string
 	}{
 		{"upgrade required", api.ErrUpgradeRequired, api.ErrUpgradeRequired.Error() + "\n"},
-		{"invalid_request", &api.ErrorResponse{Code: "invalid_request", Message: "resend must be true or false."}, "Error: Server error. Try again. If the problem persists, email support@kamakiri-labs.jp.\n"},
+		{"invalid_request", &api.ErrorResponse{Code: "invalid_request", Message: "resend must be true or false."}, "Error: resend must be true or false.\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1150,7 +1173,7 @@ func TestLoginDiscardsTypeaheadOnceAfterEachCountdown(t *testing.T) {
 			input := "user@example.com\nY\n" + strings.Join(tc.lines, "\n") + "\n"
 			in := strings.NewReader(input)
 
-			if err := Run(client, in, &out); err != nil {
+			if err := Run(client, in, &out, Options{}); err != nil {
 				t.Fatalf("Run() error = %v", err)
 			}
 			assertCalls(t, client, tc.want...)
@@ -1324,4 +1347,507 @@ func TestGenerateSecretIs32RandomBytesAsLowercaseHex(t *testing.T) {
 	if a == b {
 		t.Fatal("two calls returned the same secret")
 	}
+}
+
+// The copy of the --name refusal, kept literal for the same reason as the
+// block of lines above.
+const invalidNameLine = "Error: --name must be 1 to 64 characters with no control characters.\n"
+
+// keyed is a successful verify whose answer names the key it issued.
+func keyed(name string) verifyAnswer {
+	return verifyAnswer{resp: &api.VerifyResponse{
+		APIKey: "kk_live_minted",
+		Key:    &api.KeyInfo{ID: "0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59", Name: name},
+	}}
+}
+
+// stubHostname makes the hostname read answer as given for one test.
+func stubHostname(t *testing.T, name string, err error) {
+	t.Helper()
+	prev := hostname
+	t.Cleanup(func() { hostname = prev })
+	hostname = func() (string, error) { return name, err }
+}
+
+// forbidHostname fails the test if the run reads the hostname at all.
+func forbidHostname(t *testing.T) {
+	t.Helper()
+	prev := hostname
+	t.Cleanup(func() { hostname = prev })
+	hostname = func() (string, error) {
+		t.Error("the run read the hostname, want it left alone")
+		return "read-anyway", nil
+	}
+}
+
+func assertNames(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Errorf("names sent to verify = %q, want %q", got, want)
+	}
+}
+
+// A valid --name is what verify carries, with its surrounding whitespace
+// trimmed, and the hostname is never consulted. The rule refuses control
+// characters only, so the tilde (just below DEL), the no-break space (just
+// above the C1 range), format characters and the line separator all pass, as
+// they do on the server.
+func TestLoginSendsTheNameGiven(t *testing.T) {
+	cases := []struct {
+		name  string
+		given string
+		sent  string
+	}{
+		{"plain", "ci-box", "ci-box"},
+		{"an inner space", "ci box", "ci box"},
+		{"NEL at the edges trimmed", "\u0085ci-box\u0085", "ci-box"},
+		{"surrounding whitespace trimmed", " \t ci-box \n", "ci-box"},
+		{"64 non-ASCII code points", strings.Repeat("名", 64), strings.Repeat("名", 64)},
+		{"a tilde", "ci~box", "ci~box"},
+		{"a no-break space", "ci\u00a0box", "ci\u00a0box"},
+		{"a zero-width joiner", "ci\u200dbox", "ci\u200dbox"},
+		{"a bidi override", "ci\u202ebox", "ci\u202ebox"},
+		{"a line separator", "ci\u2028box", "ci\u2028box"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forbidHostname(t)
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{minted()}}
+
+			if _, err := runScriptedWith(t, client, Options{Name: tc.given, NameGiven: true}, "ABC123"); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			assertNames(t, client.names, tc.sent)
+		})
+	}
+}
+
+// A --name that breaks the rule ends the run before the email prompt: nothing is
+// sent, the hostname is not read, and the refusal is reported the way an
+// invalid address is. An empty value is a refusal rather than a request for the
+// default, since the flag was given.
+func TestLoginRefusesABadNameBeforeAnythingIsSent(t *testing.T) {
+	cases := []struct {
+		name  string
+		given string
+	}{
+		{"empty", ""},
+		{"whitespace only", " \t\n "},
+		{"65 code points", strings.Repeat("名", 65)},
+		{"an escape character", "ci\x1bbox"},
+		{"DEL", "ci\x7fbox"},
+		{"a newline inside", "ci\nbox"},
+		{"the first C1 control", "ci\u0080box"},
+		{"NEL inside", "ci\u0085box"},
+		{"the 8-bit CSI", "ci\u009bbox"},
+		{"the last C1 control", "ci\u009fbox"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			forbidHostname(t)
+			client := &scriptedClient{t: t}
+
+			var out bytes.Buffer
+			err := Run(client, strings.NewReader("user@example.com\nY\nABC123\n"), &out, Options{Name: tc.given, NameGiven: true})
+			if err == nil || err.Error() != "invalid key name" {
+				t.Fatalf("Run() error = %v, want invalid key name", err)
+			}
+			assertOutput(t, out.String(), invalidNameLine)
+			assertCalls(t, client)
+		})
+	}
+}
+
+// Without --name the key is named after the machine: control characters are
+// dropped, surrounding whitespace is trimmed and the result is cut to 64 code
+// points, never inside one. A hostname that cannot be read, or that leaves
+// nothing, sends no name, and the server names the key itself. Whatever is sent
+// is a name the --name check would accept.
+func TestLoginNamesTheKeyAfterTheHostnameByDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		err  error
+		sent string
+	}{
+		{"plain", "build-box", nil, "build-box"},
+		{"80 code points cut to 64", strings.Repeat("ホ", 80), nil, strings.Repeat("ホ", 64)},
+		{"64 code points kept", strings.Repeat("ホ", 64), nil, strings.Repeat("ホ", 64)},
+		{"65 code points cut to 64", strings.Repeat("ホ", 65), nil, strings.Repeat("ホ", 64)},
+		{"control characters dropped", "build\x1b[31m-box\x7f", nil, "build[31m-box"},
+		{"C1 controls dropped", "build\u0080-\u009bbox\u009f", nil, "build-box"},
+		{"a format character kept", "build\u200d-box", nil, "build\u200d-box"},
+		{"surrounding whitespace trimmed", "  build-box \n", nil, "build-box"},
+		{"whitespace left by dropped controls trimmed", "\x01 build-box \x02", nil, "build-box"},
+		{"only control characters", "\x01\x02\x7f", nil, ""},
+		{"only C1 controls", "\u0080\u009b\u009f", nil, ""},
+		{"an inner space kept", "build box", nil, "build box"},
+		{"read fails", "", errors.New("hostname unavailable"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubHostname(t, tc.host, tc.err)
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{minted()}}
+
+			if _, err := runScripted(t, client, "ABC123"); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			assertNames(t, client.names, tc.sent)
+			if tc.sent != "" && !keyname.Valid(tc.sent) {
+				t.Errorf("the default name %q would be refused as a --name", tc.sent)
+			}
+		})
+	}
+}
+
+// The stub hostname from TestMain is what a run with no flag sends.
+func TestLoginWithoutTheFlagSendsTheHostname(t *testing.T) {
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{minted()}}
+
+	if _, err := runScripted(t, client, "ABC123"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertNames(t, client.names, testHost)
+}
+
+// The line names the key as the server stored it, which is not always what was
+// sent, and sits right after the saved line.
+func TestLoginPrintsTheNameTheServerReturned(t *testing.T) {
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{keyed("ci-box (stored)")}}
+
+	out, err := runScriptedWith(t, client, Options{Name: "ci-box", NameGiven: true}, "ABC123")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+"Key name: ci-box (stored)\n")
+}
+
+// Under the variable the name line still follows the saved line, and the note
+// about the variable comes last.
+func TestLoginPrintsTheNameBeforeTheEnvironmentNote(t *testing.T) {
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{keyed("ci-box")}}
+
+	out, err := runScripted(t, client, "ABC123")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+
+		"Key name: ci-box\n"+
+		"KAMAKIRI_API_KEY is set, so it is the key every command uses for now; the saved key applies once it is unset.\n")
+}
+
+// A server that reports no key, or a key without a name, gets no name line.
+func TestLoginPrintsNoNameLineWithoutOne(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer verifyAnswer
+	}{
+		{"no key object", minted()},
+		{"an empty name", keyed("")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{tc.answer}}
+
+			out, err := runScripted(t, client, "ABC123")
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t))
+		})
+	}
+}
+
+// A refused verify request is reported with the server's own message, which
+// says what was wrong, rather than as a server error.
+func TestLoginVerifyInvalidRequestPrintsTheServersMessage(t *testing.T) {
+	refusal := &api.ErrorResponse{Code: "invalid_request", Message: "name must be 1 to 64 characters with no control characters."}
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{{err: refusal}}}
+
+	out, err := runScripted(t, client, "ABC123")
+	if err != refusal {
+		t.Fatalf("Run() error = %v, want %v", err, refusal)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+
+		"Error: name must be 1 to 64 characters with no control characters.\n")
+}
+
+// The name comes from the server, so the line must not hand the terminal an
+// 8-bit CSI or a bidi override, whatever the server sent.
+func TestLoginEscapesTheNameLine(t *testing.T) {
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{keyed("ci\u009b2Jbox\u202ex")}}
+
+	out, err := runScripted(t, client, "ABC123")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+`Key name: ci\u{009b}2Jbox\u{202e}x`+"\n")
+	if strings.ContainsAny(out, "\u009b\u202e") {
+		t.Errorf("output carries a raw control or bidi rune: %q", out)
+	}
+}
+
+// revoking is a successful verify made with --revoke-others: the key it issued,
+// named laptop, and the other keys the server reports it revoked.
+func revoking(revoked ...api.KeyInfo) verifyAnswer {
+	return verifyAnswer{resp: &api.VerifyResponse{
+		APIKey:  "kk_live_minted",
+		Key:     &api.KeyInfo{ID: "0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59", Name: "laptop"},
+		Revoked: revoked,
+	}}
+}
+
+var (
+	oldLaptop = api.KeyInfo{ID: "5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65", Name: "old-laptop"}
+	// A name only a hostile or broken server would send, which the block must
+	// escape as the name line does.
+	hostileKey = api.KeyInfo{ID: "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c", Name: "ci\u009b2Jbox"}
+)
+
+// The flag reaches the verify request, and without it the request asks for no
+// revoke.
+func TestLoginSendsRevokeOthersToVerify(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		t.Run(fmt.Sprintf("RevokeOthers=%t", want), func(t *testing.T) {
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking()}}
+
+			if _, err := runScriptedWith(t, client, Options{RevokeOthers: want}, "ABC123"); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if !slices.Equal(client.revokeOthers, []bool{want}) {
+				t.Errorf("revoke_others sent to verify = %v, want [%t]", client.revokeOthers, want)
+			}
+		})
+	}
+}
+
+// The revoked keys are listed after the name line, each name escaped, in the
+// order the server gave them; an empty list says so in a line of its own.
+func TestLoginPrintsTheKeysItRevoked(t *testing.T) {
+	cases := []struct {
+		name    string
+		revoked []api.KeyInfo
+		en      string
+		ja      string
+	}{
+		{
+			"none", nil,
+			"No other keys were revoked.\n",
+			"他に失効させたキーはありません。\n",
+		},
+		{
+			"one", []api.KeyInfo{oldLaptop},
+			"Revoked 1 other key:\n  old-laptop (5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n",
+			"他のキー1件を失効させました:\n  「old-laptop」(5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n",
+		},
+		{
+			"two, one escaped", []api.KeyInfo{oldLaptop, hostileKey},
+			"Revoked 2 other keys:\n  old-laptop (5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n" +
+				`  ci\u{009b}2Jbox (c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c)` + "\n",
+			"他のキー2件を失効させました:\n  「old-laptop」(5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n" +
+				`  「ci\u{009b}2Jbox」(c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c)` + "\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking(tc.revoked...)}}
+
+			out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+"Key name: laptop\n"+tc.en)
+			if strings.ContainsRune(out, '\u009b') {
+				t.Errorf("output carries a raw control rune: %q", out)
+			}
+		})
+		t.Run(tc.name+" (ja)", func(t *testing.T) {
+			i18n.Load("ja")
+			t.Cleanup(func() { i18n.Load(testLang) })
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking(tc.revoked...)}}
+
+			out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if want := "キー名: laptop\n" + tc.ja; !strings.HasSuffix(out, want) {
+				t.Errorf("output:\n got %q\nwant it to end with %q", out, want)
+			}
+		})
+	}
+}
+
+// Under the variable the block still follows the name line, and the note about
+// the variable comes last: the key the variable holds may be among those
+// revoked, and the note says nothing either way.
+func TestLoginPrintsTheRevokedKeysBeforeTheEnvironmentNote(t *testing.T) {
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking(oldLaptop)}}
+
+	out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+
+		"Key name: laptop\n"+
+		"Revoked 1 other key:\n  old-laptop (5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n"+
+		"KAMAKIRI_API_KEY is set, so it is the key every command uses for now; the saved key applies once it is unset.\n")
+}
+
+// The other keys are gone once verify answers, whether or not the new key can
+// be saved, so the block is printed ahead of the save error.
+func TestLoginPrintsTheRevokedKeysWhenSavingFails(t *testing.T) {
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking(oldLaptop)}}
+	client.onVerify = func() {
+		path, err := core.CredentialsPath()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Dir(path)
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dir, []byte("in the way"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+	if err == nil || !strings.HasPrefix(err.Error(), "save credentials: ") {
+		t.Fatalf("Run() error = %v, want the save error", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+
+		"Revoked 1 other key:\n  old-laptop (5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)\n")
+}
+
+// Without the flag nothing was asked to be revoked, so no block is printed,
+// not even the line saying none was.
+func TestLoginWithoutRevokeOthersPrintsNoRevokedBlock(t *testing.T) {
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{revoking()}}
+
+	out, err := runScripted(t, client, "ABC123")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+savedLine(t)+"Key name: laptop\n")
+}
+
+// maybeRevoked is the line a --revoke-others run prints when its verify ended
+// without an answer that says whether the other keys were revoked.
+const maybeRevoked = "Your other keys may already have been revoked. Run \"kamakiri login --revoke-others\" again to finish.\n"
+
+// A verify that fails in any way other than a refusal the CLI recognises may
+// have been carried out by the server, the other keys revoked with it, so with
+// --revoke-others the error line is followed by one that says so and how to
+// finish. The unreadable success is the case where the server certainly did.
+func TestLoginRevokeOthersVerifyWithAnUnknownOutcomeSaysTheKeysMayBeGone(t *testing.T) {
+	const (
+		networkLine = "Error: Could not connect to the server. Check your network and try again.\n"
+		serverLine  = "Error: Server error. Try again. If the problem persists, email support@kamakiri-labs.jp.\n"
+	)
+	cases := []struct {
+		name string
+		err  error
+		line string
+	}{
+		{"no answer", errors.New("request failed: dial tcp 127.0.0.1:4000: connect: connection refused"), networkLine},
+		{"unreadable success", errors.New("parse response: unexpected end of JSON input"), networkLine},
+		{"an answer that is not the API's", errors.New("server returned 413"), networkLine},
+		{"server_error", &api.ErrorResponse{Code: "server_error", Message: "Verification failed. Try again."}, serverLine},
+		{"a code this CLI does not know", &api.ErrorResponse{Code: "key_quota_exceeded", Message: "Too many keys."}, serverLine},
+		{"an error with no code", &api.ErrorResponse{Message: "Something went wrong."}, serverLine},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{{err: tc.err}}}
+
+			out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+			if err != tc.err {
+				t.Fatalf("Run() error = %v, want %v", err, tc.err)
+			}
+			assertOutput(t, out, header+sentLine+hintLine+prompt+tc.line+maybeRevoked)
+		})
+	}
+}
+
+// The server refuses each of these before it changes anything, so the keys are
+// known to be untouched and the run prints only the refusal's own line. Every
+// recognised refusal that reaches the end of the run is here, so exempting
+// only some of them from the line fails.
+func TestLoginRevokeOthersVerifyRefusalPrintsOnlyItsOwnLine(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		line string
+	}{
+		{"invalid_request", &api.ErrorResponse{Code: "invalid_request", Message: "name must be 1 to 64 characters with no control characters."}, "Error: name must be 1 to 64 characters with no control characters.\n"},
+		{"auth_rate_limited", &api.ErrorResponse{Code: "auth_rate_limited", Message: "Too many requests."}, "Error: Too many requests. Please wait a moment and try again.\n"},
+		{"invalid_email", &api.ErrorResponse{Code: "invalid_email", Message: "Invalid email."}, "Error: Invalid email address.\n"},
+		{"tos_required", &api.ErrorResponse{Code: "tos_required", Message: "Terms not accepted."}, "Error: You must accept the Terms of Service to continue.\n"},
+		{"invite_required", &api.ErrorResponse{Code: "invite_required", Message: "Invitation required."}, "Kamakiri Pages is in private beta. To request an invitation, email beta@kamakiri-labs.jp.\n"},
+		{"upgrade required", api.ErrUpgradeRequired, api.ErrUpgradeRequired.Error() + "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{{err: tc.err}}}
+
+			out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+			if err != tc.err {
+				t.Fatalf("Run() error = %v, want %v", err, tc.err)
+			}
+			assertOutput(t, out, header+sentLine+hintLine+prompt+tc.line)
+		})
+	}
+}
+
+// Without the flag nothing was asked to be revoked, so a verify that ends
+// without an answer says nothing about other keys.
+func TestLoginVerifyWithAnUnknownOutcomeWithoutRevokeOthersSaysNothingOfOtherKeys(t *testing.T) {
+	transport := errors.New("request failed: dial tcp 127.0.0.1:4000: connect: connection refused")
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{{err: transport}}}
+
+	out, err := runScripted(t, client, "ABC123")
+	if err != transport {
+		t.Fatalf("Run() error = %v, want %v", err, transport)
+	}
+	assertOutput(t, out, header+sentLine+hintLine+prompt+
+		"Error: Could not connect to the server. Check your network and try again.\n")
+}
+
+// Nothing is revoked before a code is accepted, so a failed code request says
+// nothing about other keys, even with the flag.
+func TestLoginRevokeOthersCodeRequestFailureSaysNothingOfOtherKeys(t *testing.T) {
+	transport := errors.New("request failed: dial tcp 127.0.0.1:4000: connect: connection refused")
+	client := &scriptedClient{t: t, registers: []registerAnswer{registerFails(transport)}}
+
+	out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+	if err != transport {
+		t.Fatalf("Run() error = %v, want %v", err, transport)
+	}
+	assertOutput(t, out, header+"Error: Could not connect to the server. Check your network and try again.\n")
+	assertCalls(t, client, "register resend=false")
+}
+
+// The Japanese line says revoke with 失効, as the revoked-keys block does.
+func TestLoginRevokeOthersVerifyWithAnUnknownOutcomeInJapanese(t *testing.T) {
+	i18n.Load("ja")
+	t.Cleanup(func() { i18n.Load(testLang) })
+	transport := errors.New("request failed: dial tcp 127.0.0.1:4000: connect: connection refused")
+	client := &scriptedClient{t: t, registers: []registerAnswer{sent(600)}, verifies: []verifyAnswer{{err: transport}}}
+
+	out, err := runScriptedWith(t, client, Options{RevokeOthers: true}, "ABC123")
+	if err != transport {
+		t.Fatalf("Run() error = %v, want %v", err, transport)
+	}
+	assertOutput(t, out, "メールアドレス: "+
+		"利用規約:             https://kamakiri-labs.jp/ja/terms/\n"+
+		"プライバシーポリシー: https://kamakiri-labs.jp/ja/privacy/\n"+
+		"利用規約に同意しますか？ (Y/n) "+
+		"user@example.com に確認コードを送信しました。\n"+
+		"新しいコードを受け取るには、何も入力せずに Enter キーを押してください。\n"+
+		"確認コード: "+
+		"エラー: サーバーに接続できません。ネットワークを確認してもう一度お試しください。\n"+
+		"他のキーはすでに失効している可能性があります。処理を完了するには \"kamakiri login --revoke-others\" を再実行してください。\n")
 }

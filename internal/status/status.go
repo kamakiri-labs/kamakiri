@@ -14,6 +14,7 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/domain"
 	"github.com/kamakiri-labs/kamakiri/internal/freshness"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
+	"github.com/kamakiri-labs/kamakiri/internal/keyname"
 	"github.com/kamakiri-labs/kamakiri/internal/sizelimit"
 	"github.com/kamakiri-labs/kamakiri/internal/timeago"
 )
@@ -34,6 +35,11 @@ const (
 // so it stays a literal here and joins the set below like any other.
 const labelCDN = "CDN:"
 
+// deployKind is the kind of a key bound to a list of the account's sites. Such
+// a key may not ask for a recheck, so the page lists its sites and leaves the
+// recheck out.
+const deployKind = "deploy"
+
 // labelTexts is every label the left column can carry, rendered in the language
 // in force. The column is as wide as the widest of them, so a label added here
 // widens the column instead of colliding with the value beside it; the English
@@ -43,13 +49,14 @@ func labelTexts() []string {
 		i18n.T("status.label_version"),
 		i18n.T("status.label_credentials"),
 		i18n.T("status.label_logged_in"),
+		i18n.T("status.label_key"),
+		i18n.T("status.label_key_sites"),
 		i18n.T("status.label_api_server"),
-		i18n.T("status.label_site"),
 		i18n.T("status.label_subdomain"),
 		i18n.T("status.label_domain"),
 		i18n.T("status.label_domains"),
 		i18n.T("status.label_reconcile"),
-		i18n.T("status.label_sites"),
+		i18n.T("status.label_site_quota"),
 		i18n.T("status.label_snapshots"),
 		i18n.T("status.label_max_deploy"),
 		i18n.T("status.label_status"),
@@ -80,22 +87,27 @@ type SiteClient interface {
 	ListDomains(siteID string) (*api.DomainList, error)
 	CDNStatus(siteID string) (*api.CDNStatusResponse, error)
 
+	// CurrentKey backs the Key row: the server's description of the key the
+	// client sends, and its verdict on whether that key still works.
+	CurrentKey() (*api.Key, error)
+
 	// RecheckDomain backs `status --recheck`. Plain `status` never calls it:
 	// reads stay pure.
 	RecheckDomain(siteID, domain string) (*api.Domain, error)
 }
 
-// Run prints version, credentials, login state, API server, and site info.
-// verbose renders the per-domain DNS records table for every domain rather than
-// only the rows that need user action (see shouldRenderRecordsTable).
+// Run prints version, credentials, login state, the key in use, API server, and
+// site info. verbose renders the per-domain DNS records table for every domain
+// rather than only the rows that need user action (see shouldRenderRecordsTable).
 //
 // The bool is true when at least one drift was surfaced: an apex on direct A
 // records left stale by a CDN mode flip. The CLI wrapper exits non-zero on true,
 // so `kamakiri status` slots into polling and CI checks. The error is separate
 // from it because the two mean different things: drift is a finding about the
 // site, the error is status being unable to vouch for it, whether because nobody
-// is logged in, the credentials file cannot be read, or a read failed. The page
-// is rendered as far as it got, and the caller owns printing the error after it.
+// is logged in, the credentials file cannot be read, the server rejected the key
+// or could not be asked about it, or a read failed. The page is rendered as far
+// as it got, and the caller owns printing the error after it.
 func Run(out io.Writer, version, baseURL string, client SiteClient, verbose bool) (bool, error) {
 	return run(out, io.Discard, version, baseURL, client, verbose, false)
 }
@@ -103,8 +115,9 @@ func Run(out io.Writer, version, baseURL string, client SiteClient, verbose bool
 // RunWithRecheck is `status --recheck`: it POSTs the recheck endpoint for each
 // non-serving custom domain, opening the server-side verify-priority window,
 // before rendering. It returns the same drift signal and error as Run. A recheck
-// the server did not perform changes nothing the page reports, so its failure is
-// written to errOut as the page renders and never returned.
+// the server did not perform does not fail the command: that domain's row stays
+// as listed, its nudge takes the backoff framing, and the failure is written to
+// errOut as the page renders, never returned.
 func RunWithRecheck(out, errOut io.Writer, version, baseURL string, client SiteClient, verbose bool) (bool, error) {
 	return run(out, errOut, version, baseURL, client, verbose, true)
 }
@@ -112,76 +125,166 @@ func RunWithRecheck(out, errOut io.Writer, version, baseURL string, client SiteC
 func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verbose, recheck bool) (bool, error) {
 	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_version")), version)
 
-	// What stops this run from vouching for the site: the page reports it on its
-	// lines and the caller prints it after the page. It stays nil only while a
-	// key is in hand.
-	var credErr error
+	cred := readCredentials()
 
-	// The variable outranks the file and the file is then left unread, so this
-	// branch names the variable rather than a path the run never opened, and the
-	// logged-in line can only say yes: the variable carries a key and no email.
+	// The key is described before the credential rows are printed, since the
+	// answer decides what the logged-in line says. A key the API refuses is no
+	// login, so it takes the place of a missing key: the logged-in line says no
+	// and no site is read over it. Any other failure to ask leaves the logged-in
+	// line as it was read and the page renders on, but the run cannot vouch for
+	// the key, so that failure is held and returned however the page ends, ahead
+	// of any later one.
+	//
+	// keyKind stays empty when the key could not be described. The run then
+	// cannot tell a deploy key from a login key, so it asks for every recheck
+	// and lets the server's answers speak for the key.
+	var keyRow, keySites, keyKind string
+	var keyErr error
+	if cred.err == nil && client != nil {
+		key, err := client.CurrentKey()
+		switch {
+		case err == nil:
+			keyRow = i18n.Tf("status.value_key", keyname.Escape(key.Name), key.KindText(), key.ID)
+			keyKind = key.Kind
+			if key.Kind == deployKind {
+				keySites = key.SitesText()
+			}
+		case isErrorCode(err, "unauthorized"):
+			cred.err = api.MapError(err)
+			cred.loggedIn = i18n.T("status.value_no")
+			keyRow = i18n.T("status.value_key_rejected")
+		default:
+			keyErr = api.MapError(err)
+			keyRow = i18n.Tf("status.value_error", keyErr)
+		}
+	}
+
+	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), cred.location)
+	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), cred.loggedIn)
+	if keyRow != "" {
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_key")), keyRow)
+	}
+	if keySites != "" {
+		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_key_sites")), keySites)
+	}
+	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_api_server")), baseURL)
+
+	drift, err := runSite(out, errOut, client, cred.err, keyKind, verbose, recheck)
+	if keyErr != nil {
+		return drift, keyErr
+	}
+	return drift, err
+}
+
+// credentials is what the page can say about the key this run would send: the
+// Credentials and Logged in values, and what stops the run from vouching for
+// this machine. readCredentials fills it without sending anything, and leaves
+// err nil exactly when a key is in hand; run then sets err, and turns the
+// logged-in value to no, when the server rejects that key, since a rejected key
+// vouches for nothing more than a missing one.
+type credentials struct {
+	location string
+	loggedIn string
+	err      error
+}
+
+// readCredentials reads the key this run would send and says where it came
+// from. It sends nothing and prints nothing, and the err of what it returns is
+// nil exactly when a key is in hand.
+func readCredentials() credentials {
+	// The variable outranks the file and the file is then left unread, so the
+	// location names the variable rather than a path the run never opened. The
+	// variable carries a key and no email, so the logged-in value is yes until
+	// the server says otherwise.
 	if _, fromEnvironment := core.APIKeyFromEnvironment(); fromEnvironment {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), i18n.T("status.value_credentials_env"))
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_yes"))
-	} else if credPath, pathErr := core.CredentialsPath(); pathErr != nil {
-		credErr = pathErr
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), i18n.Tf("status.value_error", pathErr))
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_no"))
-	} else if creds, err := core.LoadCredentials(); err != nil {
+		return credentials{
+			location: i18n.T("status.value_credentials_env"),
+			loggedIn: i18n.T("status.value_yes"),
+		}
+	}
+
+	credPath, pathErr := core.CredentialsPath()
+	if pathErr != nil {
+		return credentials{
+			location: i18n.Tf("status.value_error", pathErr),
+			loggedIn: i18n.T("status.value_no"),
+			err:      pathErr,
+		}
+	}
+
+	creds, err := core.LoadCredentials()
+	if err != nil {
 		// The page reads whether the file is usable off LoadCredentials and
 		// never off a stat, which would let it say not found over a file that
 		// is there but unreadable: such a file is reported here, as the load's
 		// own error, ahead of the branch below that does stat. The same failure
 		// is what the caller prints after the page.
-		credErr = err
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credPath)
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.Tf("status.value_error", err))
-	} else if creds == nil {
+		return credentials{
+			location: credPath,
+			loggedIn: i18n.Tf("status.value_error", err),
+			err:      err,
+		}
+	}
+
+	if creds == nil {
 		// Two states land here, no file at all and a file holding no key, and
 		// the stat only asks which of the two the reader is looking at. Every
 		// failure it can return reads as not found, the ordinary not-exist over
 		// a missing file included, which is safe because the load above has
 		// already ruled out a file that is there but cannot be read.
-		credErr = errors.New(i18n.T("common.err_not_logged_in"))
-		credValue := i18n.T("status.value_not_found")
+		location := i18n.T("status.value_not_found")
 		if _, statErr := os.Stat(credPath); statErr == nil {
-			credValue = credPath
+			location = credPath
 		}
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credValue)
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_no"))
-	} else {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_credentials")), credPath)
-		if creds.Email != "" {
-			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), creds.Email)
-		} else {
-			fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_logged_in")), i18n.T("status.value_yes"))
+		return credentials{
+			location: location,
+			loggedIn: i18n.T("status.value_no"),
+			err:      errors.New(i18n.T("common.err_not_logged_in")),
 		}
 	}
 
-	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_api_server")), baseURL)
+	loggedIn := creds.Email
+	if loggedIn == "" {
+		loggedIn = i18n.T("status.value_yes")
+	}
+	return credentials{location: credPath, loggedIn: loggedIn}
+}
 
-	config, _ := core.LoadProject()
-	if config == nil {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), i18n.T("status.value_none"))
+// runSite renders the linked site's part of the page and returns its drift
+// signal and the failure that stopped it. credErr is what stops this run from
+// vouching for this machine, nil only while a key the server has not refused is
+// in hand. keyKind is that key's kind as the server described it, or "" when it
+// could not be described.
+func runSite(out, errOut io.Writer, client SiteClient, credErr error, keyKind string, verbose, recheck bool) (bool, error) {
+	config, err := core.LoadProject()
+	if config == nil && err == nil {
+		fmt.Fprintln(out, i18n.T("status.no_site_linked"))
 		return false, credErr
 	}
 
-	if client == nil {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
-		return false, credErr
+	// A project file that is there but cannot be loaded is returned as the load
+	// error itself, the line every command that needs the project prints, and
+	// never as an unlinked directory: init reads the same file, so advice to run
+	// it would fail too. A credential failure ranks ahead of it: it is the more
+	// basic of the two, the one a command needing both reports first when no key
+	// is in hand, and the credential rows above already show it.
+	if err != nil {
+		if credErr != nil {
+			return false, credErr
+		}
+		return false, err
 	}
 
 	// With no key to send, a lookup can only come back unauthorized, and its
-	// copy would blame a key that was never sent; the site line carries the ID
-	// it can name and the credential lines already say why.
-	if credErr != nil {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
+	// copy would blame a key that was never sent; with a key the server has just
+	// refused, it can only be refused again. Either way the credential rows
+	// already say why, and the page ends there.
+	if client == nil || credErr != nil {
 		return false, credErr
 	}
 
 	site, err := client.GetSite(config.ID)
 	if err != nil {
-		fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_site")), config.ID)
 		return false, api.MapError(err)
 	}
 
@@ -199,14 +302,29 @@ func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verb
 		return false, api.MapError(err)
 	}
 
-	// The recheck asks the server to probe sooner than its own cadence; it does
-	// not decide anything the page reports. A recheck the server did not perform
-	// therefore leaves the row as it was and the exit code alone: the server
-	// keeps probing regardless. A rate limit says nothing the page's in-burst
-	// nudge does not already say, so it stays quiet. A torn-down site's refusal is
-	// quiet too: the status page prints its own teardown line, and the server
+	// The recheck asks the server to probe sooner than its own cadence, and it
+	// decides one thing the page reports: a recheck the server performed opened
+	// that domain's probe window, so only a domain in rechecked gets the nudge
+	// with a small ETA. A recheck the server did not perform leaves the row as
+	// it was, the exit code alone and the nudge in its backoff framing: the
+	// server keeps probing regardless. A rate limit counts as not performed,
+	// since the limit is per account and its refusal says nothing about this
+	// domain's probe window. It stays quiet on stderr, because the backoff
+	// nudge already tells the user how to ask again. A torn-down site's refusal
+	// is quiet too: the status page prints its own teardown line, and the server
 	// does not keep checking a site that is going away. Any other failure is
 	// worth one line.
+	//
+	// The server refuses every recheck a deploy key asks for, so with one none is
+	// sent, and a single line says why in place of one refusal per domain. It is
+	// printed even when no domain needed a recheck, since the flag cannot work
+	// with this key at all. No domain is rechecked, so every nudge below takes
+	// the backoff framing.
+	rechecked := map[string]bool{}
+	if recheck && keyKind == deployKind {
+		fmt.Fprintln(errOut, i18n.T("status.recheck_deploy_key"))
+		recheck = false
+	}
 	if recheck {
 		for i := range result.Domains {
 			if result.Domains[i].State == domain.StateServing {
@@ -219,6 +337,7 @@ func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verb
 				}
 				continue
 			}
+			rechecked[result.Domains[i].Domain] = true
 			if fresh != nil {
 				result.Domains[i] = *fresh
 			}
@@ -273,7 +392,7 @@ func run(out, errOut io.Writer, version, baseURL string, client SiteClient, verb
 	// a different remediation.
 	blockedHosts := blockedHostSet(site)
 
-	return renderPerDomainStatus(out, result.Domains, cdnResult, verbose, recheck, blockedHosts), nil
+	return renderPerDomainStatus(out, result.Domains, cdnResult, verbose, rechecked, blockedHosts), nil
 }
 
 // renderFreshnessBlock prints the site-level freshness lines: whether the
@@ -367,7 +486,7 @@ func renderQuota(out io.Writer, site *api.Site) {
 		return
 	}
 
-	fmt.Fprintf(out, "%s%d / %d\n", label(i18n.T("status.label_sites")), q.SitesUsed, q.SitesMax)
+	fmt.Fprintf(out, "%s%d / %d\n", label(i18n.T("status.label_site_quota")), q.SitesUsed, q.SitesMax)
 	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_snapshots")),
 		i18n.Tf("status.value_snapshots", q.SnapshotsUsed, q.SnapshotsMax))
 	fmt.Fprintf(out, "%s%s\n", label(i18n.T("status.label_max_deploy")), sizelimit.MB(q.MaxSnapshotBytes))
@@ -382,7 +501,7 @@ func renderQuota(out io.Writer, site *api.Site) {
 //
 // An empty domain list prints nothing here (the "(none)" line is handled
 // upstream), as does a site whose state columns are all blank.
-func renderPerDomainStatus(out io.Writer, domains []api.Domain, cdnResult *api.CDNStatusResponse, verbose, inBurst bool, blockedHosts map[string]struct{}) bool {
+func renderPerDomainStatus(out io.Writer, domains []api.Domain, cdnResult *api.CDNStatusResponse, verbose bool, rechecked map[string]bool, blockedHosts map[string]struct{}) bool {
 	if len(domains) == 0 {
 		return false
 	}
@@ -430,14 +549,15 @@ func renderPerDomainStatus(out io.Writer, domains []api.Domain, cdnResult *api.C
 		// Nudge for an awaiting-DNS domain that has never been live; a degraded
 		// row carries its own "DNS broken" context instead.
 		if r.full.State == domain.StateAwaitingDNS && domain.IsNeverLive(r.full) {
-			// inBurst is true only on the --recheck path, where the CLI just
-			// opened the verify-priority window and a small ETA is therefore
-			// truthful. A plain read cannot know the window's state, so it takes
-			// the deliberate-backoff framing rather than guess an ETA.
-			fmt.Fprintf(out, "    %s\n", domain.VerifyNudge(r.full.Domain, inBurst))
+			// A domain whose recheck the server just performed has its
+			// verify-priority window open, so a small ETA is truthful for it.
+			// For any other domain, including every one on a plain read, the
+			// window's state is unknown, so it takes the deliberate-backoff
+			// framing rather than guess an ETA.
+			fmt.Fprintf(out, "    %s\n", domain.VerifyNudge(r.full.Domain, rechecked[r.full.Domain]))
 		}
-		// Drift is drift whether the user just rechecked or not, so inBurst does
-		// not gate this.
+		// Drift is drift whether the user just rechecked or not, so rechecked
+		// does not gate this.
 		if line := apexARecordsDriftLine(r.full, cdnMode); line != "" {
 			fmt.Fprint(out, line)
 			drift = true

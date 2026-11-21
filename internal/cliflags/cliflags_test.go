@@ -70,6 +70,81 @@ func TestValueEqualsForm(t *testing.T) {
 	}
 }
 
+// A separated value that starts with "--" is refused rather than taken, so a
+// flag whose value was forgotten cannot swallow the flag after it. The line
+// names the flag and the equals form, never the refused argument.
+func TestValueSpaceFormRefusesADoubleDashValue(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		flag string
+		hint string
+		want string
+	}{
+		{
+			name: "the next flag",
+			args: []string{"--name", "--revoke-others"},
+			flag: "--name",
+			want: `--name requires a value; write a value that starts with "--" as --name=<value>`,
+		},
+		{
+			name: "a bare double dash",
+			args: []string{"--secret", "--"},
+			flag: "--secret",
+			want: `--secret requires a value; write a value that starts with "--" as --secret=<value>`,
+		},
+		{
+			name: "with a hint",
+			args: []string{"--status", "--no-wait"},
+			flag: "--status",
+			hint: "301, 302, 307, or 308",
+			want: `--status requires a value (301, 302, 307, or 308); write a value that starts with "--" as --status=<value>`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, next, err := Value(tc.args, 0, false, "", tc.flag, tc.hint)
+			if err == nil {
+				t.Fatalf("Value(%q) = (%q, %d, nil), want an error", tc.args, v, next)
+			}
+			if got := err.Error(); got != tc.want {
+				t.Errorf("error:\n%q\nwant:\n%q", got, tc.want)
+			}
+			if v != "" || next != 0 {
+				t.Errorf("Value(%q) = (%q, %d), want (\"\", 0) with the error", tc.args, v, next)
+			}
+		})
+	}
+}
+
+// Only a leading "--" is refused: a value that starts with a single "-", or is
+// exactly "-", is still taken in the space form.
+func TestValueSpaceFormTakesASingleDashValue(t *testing.T) {
+	for _, value := range []string{"-x", "-"} {
+		args := []string{"--name", value}
+		v, next, err := Value(args, 0, false, "", "--name", "")
+		if err != nil {
+			t.Fatalf("Value(%q): %v", args, err)
+		}
+		if v != value || next != 1 {
+			t.Errorf("Value(%q) = (%q, %d), want (%q, 1)", args, v, next, value)
+		}
+	}
+}
+
+// The equals form passes a value that starts with "--", which is how the
+// refusal above tells the user to write one.
+func TestValueEqualsFormTakesADoubleDashValue(t *testing.T) {
+	name, val, has := SplitArg("--name=--x")
+	v, next, err := Value([]string{"--name=--x"}, 0, has, val, name, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "--x" || next != 0 {
+		t.Errorf("Value = (%q, %d), want (\"--x\", 0)", v, next)
+	}
+}
+
 func TestValueEqualsFormEmptyRejected(t *testing.T) {
 	args := []string{"--token="}
 	_, _, err := Value(args, 0, true, "", "--token", "")

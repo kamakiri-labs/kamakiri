@@ -184,8 +184,8 @@ Each removes the binary (from `KAMAKIRI_INSTALL_DIR` when set, the default
 install directory otherwise) and the config directory, which holds the saved
 API key; on Windows it also takes the install directory out of your user
 `PATH`. Nothing else is touched. The key itself stays valid on your account,
-since only the local copy is removed. Running it on a machine with nothing to
-remove is not an error.
+since only the local copy is removed; run `kamakiri logout` first to revoke it
+as well. Running it on a machine with nothing to remove is not an error.
 
 A copy installed through a package manager is removed through that package
 manager instead: `npm uninstall -g kamakiri` or `brew uninstall kamakiri`.
@@ -221,13 +221,25 @@ repository secret rather than a literal written into the workflow file. While
 the variable holds a key, the credentials file is not read at all, and
 `kamakiri status` reports the variable as the credential source.
 
-The key is the `api_key` value in `~/.config/kamakiri/credentials.json`, the
-file `kamakiri login` writes on your own machine; on Windows,
-`%USERPROFILE%\.config\kamakiri\credentials.json`. Copy that value in as the
-whole secret, with nothing around it. `login` prints only the path of the file
-it wrote, never the key. Running `login` again mints a new key and leaves the
-one already in CI valid, so rotating on your own machine does not break the
-runner.
+The key to put in it is a deploy key. Run `kamakiri key create` from the
+directory linked to the site, or with `--site` once for each site the job
+deploys, and pipe the result straight into the secret store. The key goes to
+stdout alone, so nothing else lands in the secret:
+
+    kamakiri key create --name github-actions | gh secret set KAMAKIRI_API_KEY
+
+A deploy key is bound to those sites. It can deploy them and roll them back,
+and make the reads that `deploy`, `rollback` and `status` need. Any other
+command is refused, so a leak from one repository's CI reaches only the sites
+the key is bound to. The key is shown once, so keep it only in the secret.
+
+If the secret leaks, `kamakiri key rotate <id>` replaces the key with a new one
+for the same sites and ends the old one, and its output pipes into the secret
+store the same way. When the job is retired, `kamakiri key revoke <id>` ends
+the key. `kamakiri key list` shows the IDs.
+
+A login key also works in the variable, but it reaches the whole account, so
+prefer a deploy key.
 
 A command that needs a credential and finds neither the variable nor a
 credentials file exits 1 with one line pointing at both remedies:

@@ -8,8 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
@@ -112,7 +116,7 @@ func TestVerifySuccess(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	resp, err := client.Verify("user@example.com", "ABC123", "my_secret")
+	resp, err := client.Verify("user@example.com", "ABC123", "my_secret", "", false)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -132,7 +136,7 @@ func TestVerifyInvalidCode(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	_, err := client.Verify("user@example.com", "WRONG1", "some_secret")
+	_, err := client.Verify("user@example.com", "WRONG1", "some_secret", "", false)
 	if err == nil {
 		t.Fatal("Verify() expected error, got nil")
 	}
@@ -157,7 +161,7 @@ func TestVerifyTooManyAttempts(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL)
-	_, err := client.Verify("user@example.com", "ABC123", "some_secret")
+	_, err := client.Verify("user@example.com", "ABC123", "some_secret", "", false)
 
 	apiErr, ok := err.(*ErrorResponse)
 	if !ok {
@@ -260,7 +264,7 @@ func TestVerifyDecodesAttemptsLeft(t *testing.T) {
 			}))
 			defer server.Close()
 
-			_, err := NewClient(server.URL).Verify("user@example.com", "WRONG1", "some_secret")
+			_, err := NewClient(server.URL).Verify("user@example.com", "WRONG1", "some_secret", "", false)
 			apiErr, ok := err.(*ErrorResponse)
 			if !ok {
 				t.Fatalf("Verify() error = %v (%T), want *ErrorResponse", err, err)
@@ -278,6 +282,110 @@ func TestVerifyDecodesAttemptsLeft(t *testing.T) {
 }
 
 func intPtr(n int) *int { return &n }
+
+// An empty name is left out of the body, so the server names the key itself
+// rather than refusing an empty one; any other name is sent as given. The key
+// object of the answer is decoded under the server's field names.
+func TestVerifySendsTheNameAndDecodesTheKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		present bool
+	}{
+		{"", false},
+		{"ci-box", true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("name=%q", tc.name), func(t *testing.T) {
+			var body map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decoding the request body: %v", err)
+				}
+				io.WriteString(w, `{"api_key":"kk_live_testkey123","key":{"id":"0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59","name":"ci-box"}}`)
+			}))
+			defer server.Close()
+
+			resp, err := NewClient(server.URL).Verify("user@example.com", "ABC123", "my_secret", tc.name, false)
+			if err != nil {
+				t.Fatalf("Verify() error = %v", err)
+			}
+			server.Close()
+
+			value, present := body["name"]
+			if present != tc.present {
+				t.Fatalf("request body %v: name present = %t, want %t", body, present, tc.present)
+			}
+			if present && value != tc.name {
+				t.Errorf("name = %#v, want %q", value, tc.name)
+			}
+			want := KeyInfo{ID: "0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59", Name: "ci-box"}
+			if resp.Key == nil || *resp.Key != want {
+				t.Errorf("Key = %+v, want %+v", resp.Key, want)
+			}
+		})
+	}
+}
+
+// revoke_others goes out as a JSON true only when asked for, so a plain login
+// sends exactly the request it always did; the revoked keys the answer lists
+// are decoded in the order the server gave them.
+func TestVerifySendsRevokeOthersOnlyWhenAskedAndDecodesTheRevokedKeys(t *testing.T) {
+	answer := `{"api_key":"kk_live_testkey123","key":{"id":"0b8f3a52-6a3e-4c55-9d0e-2f1d8c7b6a59","name":"laptop"},` +
+		`"revoked":[{"id":"5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65","name":"old-laptop"},{"id":"c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c","name":"github-ci"}]}`
+	for _, revokeOthers := range []bool{true, false} {
+		t.Run(fmt.Sprintf("revokeOthers=%t", revokeOthers), func(t *testing.T) {
+			var raw []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ = io.ReadAll(r.Body)
+				io.WriteString(w, answer)
+			}))
+			defer server.Close()
+
+			resp, err := NewClient(server.URL).Verify("user@example.com", "ABC123", "my_secret", "laptop", revokeOthers)
+			if err != nil {
+				t.Fatalf("Verify() error = %v", err)
+			}
+			server.Close()
+
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("decoding the request body %q: %v", raw, err)
+			}
+			value, present := body["revoke_others"]
+			if revokeOthers && value != true {
+				t.Errorf("request body %s: revoke_others = %#v, want true", raw, value)
+			}
+			if !revokeOthers && present {
+				t.Errorf("request body %s: revoke_others present, want it left out", raw)
+			}
+
+			want := []KeyInfo{
+				{ID: "5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65", Name: "old-laptop"},
+				{ID: "c3e94b70-1a2d-4e5f-b6c7-8d9e0f1a2b3c", Name: "github-ci"},
+			}
+			if !reflect.DeepEqual(resp.Revoked, want) {
+				t.Errorf("Revoked = %+v, want %+v", resp.Revoked, want)
+			}
+		})
+	}
+}
+
+// An older server answers with the key alone, and the response says so with a
+// nil Key rather than an empty one.
+func TestVerifyWithoutAKeyObjectLeavesKeyNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"api_key":"kk_live_testkey123"}`)
+	}))
+	defer server.Close()
+
+	resp, err := NewClient(server.URL).Verify("user@example.com", "ABC123", "my_secret", "ci-box", false)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if resp.Key != nil {
+		t.Errorf("Key = %+v, want nil", resp.Key)
+	}
+}
 
 func TestCreateSiteSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1188,6 +1296,339 @@ func TestMapErrorRollbackRateLimited(t *testing.T) {
 	}
 	if strings.Contains(got, "registering domains very frequently") {
 		t.Errorf("MapError(rollback_rate_limited) leaked the register copy: %q", got)
+	}
+}
+
+// renderIn switches the catalog to lang for one test and puts English back. It
+// must not be called from a parallel test: the catalog is an unsynchronized map,
+// and the parallel tests of this package run only once the serial ones are done.
+func renderIn(t *testing.T, lang string) {
+	t.Helper()
+	i18n.Load(lang)
+	t.Cleanup(func() { i18n.Load("en") })
+}
+
+// The fields of a deploy key's refusals, as the server sends them for a key
+// named github-actions bound to two sites.
+var (
+	deployKey   = &KeyInfo{ID: "3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40", Name: "github-actions"}
+	deploySites = []LabeledSite{
+		{ID: "k3j9x2m4p7q1w8e5", Label: "example.com"},
+		{ID: "a1b2c3d4e5f6g7h8", Label: "docs.kamakiri-pages.jp"},
+	}
+	refusedSite = &LabeledSite{ID: "z9y8x7w6v5u4t3s2", Label: "blog.example.org"}
+)
+
+// Each deploy-key refusal is worded from its body's fields, in both languages,
+// and the whole line is compared. The server's message is never what prints.
+func TestMapErrorRendersTheDeployKeyRefusals(t *testing.T) {
+	cases := []struct {
+		name string
+		lang string
+		err  *ErrorResponse
+		want string
+	}{
+		{
+			"a route closed to deploy keys",
+			"en",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: deploySites},
+			`this is a deploy key ("github-actions"): it can deploy to example.com, docs.kamakiri-pages.jp and nothing else. Use a login key for this command`,
+		},
+		{
+			"a route closed to deploy keys, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: deploySites},
+			`このAPIキーはデプロイキー「github-actions」です。デプロイできるのは example.com、docs.kamakiri-pages.jp だけです。このコマンドにはログインキーを使ってください`,
+		},
+		{
+			"a key bound to one site",
+			"en",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: deploySites[:1]},
+			`this is a deploy key ("github-actions"): it can deploy to example.com and nothing else. Use a login key for this command`,
+		},
+		{
+			"a site not on the key's list",
+			"en",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites, Site: refusedSite},
+			`this deploy key ("github-actions") cannot act on blog.example.org: it can deploy to example.com, docs.kamakiri-pages.jp and nothing else`,
+		},
+		{
+			"a site not on the key's list, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites, Site: refusedSite},
+			`デプロイキー「github-actions」は blog.example.org を操作できません。デプロイできるのは example.com、docs.kamakiri-pages.jp だけです`,
+		},
+		{
+			// The server labels a site that is no longer active with its ID.
+			"a torn-down site, labelled with its ID",
+			"en",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites, Site: &LabeledSite{ID: "z9y8x7w6v5u4t3s2", Label: "z9y8x7w6v5u4t3s2"}},
+			`this deploy key ("github-actions") cannot act on z9y8x7w6v5u4t3s2: it can deploy to example.com, docs.kamakiri-pages.jp and nothing else`,
+		},
+		{
+			"a reference that matches no site",
+			"en",
+			&ErrorResponse{Code: "key_site_not_found", Message: "raw", Reference: "docs.kamakiri-pages.jp"},
+			`no site of this account matches docs.kamakiri-pages.jp. Name a site by its subdomain, one of its domains, or its site ID`,
+		},
+		{
+			"a reference that matches no site, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "key_site_not_found", Message: "raw", Reference: "docs.kamakiri-pages.jp"},
+			`このアカウントに docs.kamakiri-pages.jp に該当するサイトはありません。サイトはサブドメイン、ドメイン、またはサイトIDで指定してください`,
+		},
+		{
+			"the deploy-key limit",
+			"en",
+			&ErrorResponse{Code: "deploy_key_limit", Message: "raw", Limit: 10},
+			`this account already holds 10 deploy keys, the most it can have. Revoke one with "kamakiri key revoke <id>" first`,
+		},
+		{
+			"the deploy-key limit, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "deploy_key_limit", Message: "raw", Limit: 10},
+			`このアカウントのデプロイキーは上限の10件に達しています。先に "kamakiri key revoke <id>" で1件失効させてください`,
+		},
+		{
+			"the creation rate limit",
+			"en",
+			&ErrorResponse{Code: "key_create_rate_limited", Message: "raw"},
+			`too many keys created recently. Try again later`,
+		},
+		{
+			"the creation rate limit, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "key_create_rate_limited", Message: "raw"},
+			`短時間にキーが繰り返し作成されています。しばらく時間をおいてからもう一度お試しください`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			renderIn(t, tc.lang)
+			if got := MapError(tc.err).Error(); got != tc.want {
+				t.Errorf("MapError(%s) = %q, want %q", tc.err.Code, got, tc.want)
+			}
+		})
+	}
+}
+
+// A key's name and a site's label come from the server, and the echoed
+// reference from what the user typed, so each is escaped before it reaches the
+// terminal: a bidi override, a zero-width character, a line separator, ESC and
+// BEL are shown as the escapes of their code points, in either language.
+func TestMapErrorEscapesWhatTheDeployKeyRefusalsCarry(t *testing.T) {
+	hostileKey := &KeyInfo{ID: deployKey.ID, Name: "ci‮box\x1b[2J"}
+	hostileSites := []LabeledSite{
+		{ID: "k3j9x2m4p7q1w8e5", Label: "ex​ample.com"},
+		{ID: "a1b2c3d4e5f6g7h8", Label: "docs .kamakiri-pages.jp"},
+	}
+	hostileSite := &LabeledSite{ID: "z9y8x7w6v5u4t3s2", Label: "blog\x1b]0;x\x07.example.org"}
+
+	cases := []struct {
+		name string
+		lang string
+		err  *ErrorResponse
+		want string
+	}{
+		{
+			"a route closed to deploy keys",
+			"en",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: hostileKey, Sites: hostileSites},
+			`this is a deploy key ("ci\u{202e}box\u{001b}[2J"): it can deploy to ex\u{200b}ample.com, docs\u{2028}.kamakiri-pages.jp and nothing else. Use a login key for this command`,
+		},
+		{
+			"a site not on the key's list",
+			"en",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: hostileKey, Sites: hostileSites, Site: hostileSite},
+			`this deploy key ("ci\u{202e}box\u{001b}[2J") cannot act on blog\u{001b}]0;x\u{0007}.example.org: it can deploy to ex\u{200b}ample.com, docs\u{2028}.kamakiri-pages.jp and nothing else`,
+		},
+		{
+			"a site not on the key's list, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: hostileKey, Sites: hostileSites, Site: hostileSite},
+			`デプロイキー「ci\u{202e}box\u{001b}[2J」は blog\u{001b}]0;x\u{0007}.example.org を操作できません。デプロイできるのは ex\u{200b}ample.com、docs\u{2028}.kamakiri-pages.jp だけです`,
+		},
+		{
+			"a reference that matches no site",
+			"en",
+			&ErrorResponse{Code: "key_site_not_found", Message: "raw", Reference: "‮docs ‍.kamakiri-pages.jp"},
+			`no site of this account matches \u{202e}docs\u{2028}\u{200d}.kamakiri-pages.jp. Name a site by its subdomain, one of its domains, or its site ID`,
+		},
+		{
+			"a route closed to deploy keys, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: hostileKey, Sites: hostileSites},
+			`このAPIキーはデプロイキー「ci\u{202e}box\u{001b}[2J」です。デプロイできるのは ex\u{200b}ample.com、docs\u{2028}.kamakiri-pages.jp だけです。このコマンドにはログインキーを使ってください`,
+		},
+		{
+			"a reference that matches no site, in Japanese",
+			"ja",
+			&ErrorResponse{Code: "key_site_not_found", Message: "raw", Reference: "\u202edocs\u2028\u200d.kamakiri-pages.jp"},
+			`このアカウントに \u{202e}docs\u{2028}\u{200d}.kamakiri-pages.jp に該当するサイトはありません。サイトはサブドメイン、ドメイン、またはサイトIDで指定してください`,
+		},
+		{
+			// A site with no label is shown by its ID, which is as much the
+			// server's text as a label is.
+			"sites shown by IDs that hold format characters",
+			"en",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey,
+				Sites: []LabeledSite{{ID: "k3j9\u202ex2m4"}, {ID: "a1b2\x1b[2Jc3d4"}},
+				Site:  &LabeledSite{ID: "z9y8\u202ex7w6\x1b[2J"}},
+			`this deploy key ("github-actions") cannot act on z9y8\u{202e}x7w6\u{001b}[2J: it can deploy to k3j9\u{202e}x2m4, a1b2\u{001b}[2Jc3d4 and nothing else`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			renderIn(t, tc.lang)
+			if got := MapError(tc.err).Error(); got != tc.want {
+				t.Errorf("MapError(%s) = %q, want %q", tc.err.Code, got, tc.want)
+			}
+		})
+	}
+}
+
+// The server always fills the fields these refusals are worded from. A body
+// that lacks one still renders a whole sentence: a site with no label is shown
+// by its ID, as the server shows a site that is no longer active, and a body
+// that leaves a slot with nothing to show gets the line that names no
+// particulars, rather than a sentence with a hole in it.
+func TestMapErrorWordsADeployKeyRefusalWithFieldsMissing(t *testing.T) {
+	const (
+		refusedEN  = `this is a deploy key: it can deploy to its own sites and nothing else. Use a login key for this command`
+		refusedJA  = `このAPIキーはデプロイキーです。デプロイできるのは、このキーのサイトだけです。このコマンドにはログインキーを使ってください`
+		notInKeyEN = `this deploy key cannot act on this site: it can deploy to its own sites and nothing else`
+		notInKeyJA = `このデプロイキーはこのサイトを操作できません。デプロイできるのは、このキーのサイトだけです`
+		notFoundEN = `no site of this account matches one of the sites named. Name a site by its subdomain, one of its domains, or its site ID`
+		notFoundJA = `指定したサイトのうち、このアカウントのどのサイトにも該当しないものがあります。サイトはサブドメイン、ドメイン、またはサイトIDで指定してください`
+		limitEN    = `this account already holds the most deploy keys it can have. Revoke one with "kamakiri key revoke <id>" first`
+		limitJA    = `このアカウントのデプロイキーは上限に達しています。先に "kamakiri key revoke <id>" で1件失効させてください`
+	)
+	unlabelled := []LabeledSite{{ID: "k3j9x2m4p7q1w8e5"}, {ID: "a1b2c3d4e5f6g7h8", Label: "docs.kamakiri-pages.jp"}}
+	empty := []LabeledSite{{}, {}}
+
+	cases := []struct {
+		name string
+		lang string
+		err  *ErrorResponse
+		want string
+	}{
+		{"deploy_key_refused with no key", "en", &ErrorResponse{Code: "deploy_key_refused", Message: "raw", Sites: deploySites}, refusedEN},
+		{"deploy_key_refused with no key, in Japanese", "ja", &ErrorResponse{Code: "deploy_key_refused", Message: "raw", Sites: deploySites}, refusedJA},
+		{"deploy_key_refused with an unnamed key", "en", &ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: &KeyInfo{ID: deployKey.ID}, Sites: deploySites}, refusedEN},
+		{"deploy_key_refused with no sites", "en", &ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey}, refusedEN},
+		{"deploy_key_refused with sites that name nothing", "en", &ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: empty}, refusedEN},
+		{
+			"deploy_key_refused with an unlabelled site",
+			"en",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: unlabelled},
+			`this is a deploy key ("github-actions"): it can deploy to k3j9x2m4p7q1w8e5, docs.kamakiri-pages.jp and nothing else. Use a login key for this command`,
+		},
+		{
+			"deploy_key_refused with one empty site among labelled ones",
+			"en",
+			&ErrorResponse{Code: "deploy_key_refused", Message: "raw", Key: deployKey, Sites: append([]LabeledSite{{}}, deploySites...)},
+			`this is a deploy key ("github-actions"): it can deploy to example.com, docs.kamakiri-pages.jp and nothing else. Use a login key for this command`,
+		},
+		{"site_not_in_key with no refused site", "en", &ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites}, notInKeyEN},
+		{"site_not_in_key with no refused site, in Japanese", "ja", &ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites}, notInKeyJA},
+		{"site_not_in_key with an empty refused site", "en", &ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites, Site: &LabeledSite{}}, notInKeyEN},
+		{"site_not_in_key with no key", "en", &ErrorResponse{Code: "site_not_in_key", Message: "raw", Sites: deploySites, Site: refusedSite}, notInKeyEN},
+		{"site_not_in_key with no sites", "en", &ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Site: refusedSite}, notInKeyEN},
+		{
+			"site_not_in_key with an unlabelled refused site",
+			"en",
+			&ErrorResponse{Code: "site_not_in_key", Message: "raw", Key: deployKey, Sites: deploySites, Site: &LabeledSite{ID: "z9y8x7w6v5u4t3s2"}},
+			`this deploy key ("github-actions") cannot act on z9y8x7w6v5u4t3s2: it can deploy to example.com, docs.kamakiri-pages.jp and nothing else`,
+		},
+		{"key_site_not_found with no reference", "en", &ErrorResponse{Code: "key_site_not_found", Message: "raw"}, notFoundEN},
+		{"key_site_not_found with no reference, in Japanese", "ja", &ErrorResponse{Code: "key_site_not_found", Message: "raw"}, notFoundJA},
+		{"deploy_key_limit with no limit", "en", &ErrorResponse{Code: "deploy_key_limit", Message: "raw"}, limitEN},
+		{"deploy_key_limit with no limit, in Japanese", "ja", &ErrorResponse{Code: "deploy_key_limit", Message: "raw"}, limitJA},
+		{"deploy_key_limit with a negative limit", "en", &ErrorResponse{Code: "deploy_key_limit", Message: "raw", Limit: -1}, limitEN},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			renderIn(t, tc.lang)
+			if got := MapError(tc.err).Error(); got != tc.want {
+				t.Errorf("MapError(%s) = %q, want %q", tc.err.Code, got, tc.want)
+			}
+		})
+	}
+}
+
+// The tests above build the refusals as structs. These send each as the server
+// does, so what is held is that the client reads every field it words the line
+// from off the wire. The 429 carries Retry-After, which no rate-limit line
+// reads.
+func TestDeployKeyRefusalsAreReadOffTheWire(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{
+			"deploy_key_refused",
+			http.StatusForbidden,
+			`{"code":"deploy_key_refused","message":"This is a deploy key.","key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"github-actions"},"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"},{"id":"a1b2c3d4e5f6g7h8","label":"docs.kamakiri-pages.jp"}]}`,
+			`this is a deploy key ("github-actions"): it can deploy to example.com, docs.kamakiri-pages.jp and nothing else. Use a login key for this command`,
+		},
+		{
+			"site_not_in_key",
+			http.StatusForbidden,
+			`{"code":"site_not_in_key","message":"This deploy key cannot act on it.","site":{"id":"z9y8x7w6v5u4t3s2","label":"blog.example.org"},"key":{"id":"3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40","name":"github-actions"},"sites":[{"id":"k3j9x2m4p7q1w8e5","label":"example.com"}]}`,
+			`this deploy key ("github-actions") cannot act on blog.example.org: it can deploy to example.com and nothing else`,
+		},
+		{
+			"key_site_not_found",
+			http.StatusUnprocessableEntity,
+			`{"code":"key_site_not_found","message":"No site of this account matches docs.kamakiri-pages.jp.","reference":"docs.kamakiri-pages.jp"}`,
+			`no site of this account matches docs.kamakiri-pages.jp. Name a site by its subdomain, one of its domains, or its site ID`,
+		},
+		{
+			"deploy_key_limit",
+			http.StatusForbidden,
+			`{"code":"deploy_key_limit","message":"This account already holds 10 deploy keys, the most it can have.","limit":10}`,
+			`this account already holds 10 deploy keys, the most it can have. Revoke one with "kamakiri key revoke <id>" first`,
+		},
+		{
+			"key_create_rate_limited",
+			http.StatusTooManyRequests,
+			`{"code":"key_create_rate_limited","message":"Too many keys created recently. Try again later."}`,
+			`too many keys created recently. Try again later`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.status == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "1800")
+				}
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+
+			_, err := NewClient(server.URL).ListKeys()
+			var apiErr *ErrorResponse
+			if !errors.As(err, &apiErr) || apiErr.Code != tc.name {
+				t.Fatalf("ListKeys() error = %v, want an ErrorResponse with code %s", err, tc.name)
+			}
+			if got := MapError(err).Error(); got != tc.want {
+				t.Errorf("MapError(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// The creation rate limit is its own code, so a creation flood inherits none of
+// the other limiters' copy, and they inherit none of its.
+func TestMapErrorKeyCreateRateLimitedIsDistinct(t *testing.T) {
+	keyCreate := MapError(&ErrorResponse{Code: "key_create_rate_limited", Message: "raw"}).Error()
+	for _, code := range []string{"rate_limited", "deploy_rate_limited", "register_rate_limited", "rollback_rate_limited"} {
+		if other := MapError(&ErrorResponse{Code: code, Message: "raw"}).Error(); other == keyCreate {
+			t.Errorf("MapError(%s) = %q, the same line as key_create_rate_limited", code, other)
+		}
 	}
 }
 
@@ -2145,5 +2586,1100 @@ func TestLatestAdvertisedHoldsTheHeaderToItsLengthBound(t *testing.T) {
 				t.Errorf("LatestAdvertised() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// keyRoute is the method, path and decoded body of the request a key test's
+// server received.
+type keyRoute struct {
+	method string
+	path   string
+	body   map[string]any
+}
+
+// keyServer answers every request with the given status and body. The returned
+// function closes the server and then reports what it received: the handler
+// records from the server's own goroutine, and Close returns only once that
+// goroutine has finished, which is what orders the write against the read.
+func keyServer(t *testing.T, status int, answer string) (string, func() *keyRoute) {
+	t.Helper()
+	var got keyRoute
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.method = r.Method
+		got.path = r.URL.Path
+		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
+			if err := json.Unmarshal(raw, &got.body); err != nil {
+				t.Errorf("decoding the request body %q: %v", raw, err)
+			}
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, answer)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL, func() *keyRoute {
+		server.Close()
+		return &got
+	}
+}
+
+func assertKeyRoute(t *testing.T, got *keyRoute, method, path string, body map[string]any) {
+	t.Helper()
+	if got.method != method || got.path != path {
+		t.Errorf("request = %s %s, want %s %s", got.method, got.path, method, path)
+	}
+	if !reflect.DeepEqual(got.body, body) {
+		t.Errorf("request body = %#v, want %#v", got.body, body)
+	}
+}
+
+const (
+	keyID        = "5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65"
+	otherKeyID   = "0f8c2a1e-6b4d-4f0a-9c3e-2d7b5a8e1f40"
+	keyJSON      = `{"id":"` + keyID + `","name":"alexis-laptop","kind":"login","resource_ids":[],"sites":null,"created_at":"2026-11-12T10:30:00Z","last_used_at":"2026-11-16T09:00:00Z","current":true}`
+	otherKeyJSON = `{"id":"` + otherKeyID + `","name":"unnamed","kind":"deploy","resource_ids":["site-a","site-b"],"sites":[{"id":"site-a","label":"example.com"},{"id":"site-b","label":"docs.kamakiri-pages.jp"}],"created_at":"2026-09-02T08:14:00Z","last_used_at":null,"current":false}`
+)
+
+func wantKey() Key {
+	lastUsed := "2026-11-16T09:00:00Z"
+	return Key{
+		ID:          keyID,
+		Name:        "alexis-laptop",
+		Kind:        "login",
+		ResourceIDs: []string{},
+		CreatedAt:   "2026-11-12T10:30:00Z",
+		LastUsedAt:  &lastUsed,
+		Current:     true,
+	}
+}
+
+func wantOtherKey() Key {
+	return Key{
+		ID:          otherKeyID,
+		Name:        "unnamed",
+		Kind:        "deploy",
+		ResourceIDs: []string{"site-a", "site-b"},
+		Sites: []LabeledSite{
+			{ID: "site-a", Label: "example.com"},
+			{ID: "site-b", Label: "docs.kamakiri-pages.jp"},
+		},
+		CreatedAt: "2026-09-02T08:14:00Z",
+		Current:   false,
+	}
+}
+
+// A deploy key's sites decode in the server's order, and a login key's null
+// leaves Sites nil, as an older server's answer with no sites at all does.
+func TestCurrentKeyDecodesADeployKeysSites(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want Key
+	}{
+		{"deploy key", `{"key":` + otherKeyJSON + `}`, wantOtherKey()},
+		{"login key", `{"key":` + keyJSON + `}`, wantKey()},
+		{"older server", `{"key":{"id":"` + otherKeyID + `","name":"unnamed","kind":"deploy","resource_ids":["site-a"],"created_at":"2026-09-02T08:14:00Z"}}`, Key{
+			ID: otherKeyID, Name: "unnamed", Kind: "deploy", ResourceIDs: []string{"site-a"}, CreatedAt: "2026-09-02T08:14:00Z",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, _ := keyServer(t, 200, tc.body)
+			key, err := NewClient(base).CurrentKey()
+			if err != nil {
+				t.Fatalf("CurrentKey() error = %v", err)
+			}
+			if !reflect.DeepEqual(*key, tc.want) {
+				t.Errorf("CurrentKey() = %+v, want %+v", *key, tc.want)
+			}
+		})
+	}
+}
+
+// siteLabels is the one rendering of a list of sites that every command shares:
+// each label escaped, the ID standing in for a missing label, a site with
+// neither left out, and the separator taken from the language in force.
+func TestSiteLabelsJoinsAndEscapes(t *testing.T) {
+	sites := []LabeledSite{
+		{ID: "k3j9x2m4p7q1w8e5", Label: "example.com"},
+		{ID: "a1b2c3d4e5f6g7h8", Label: ""},
+		{ID: "", Label: ""},
+		{ID: "z9y8x7w6v5u4t3s2", Label: "evil\u202e.example"},
+	}
+
+	if got, want := siteLabels(sites), `example.com, a1b2c3d4e5f6g7h8, evil\u{202e}.example`; got != want {
+		t.Errorf("siteLabels() = %q, want %q", got, want)
+	}
+	if got := siteLabels(nil); got != "" {
+		t.Errorf("siteLabels(nil) = %q, want empty", got)
+	}
+
+	renderIn(t, "ja")
+	if got, want := siteLabels(sites), `example.com、a1b2c3d4e5f6g7h8、evil\u{202e}.example`; got != want {
+		t.Errorf("siteLabels() in Japanese = %q, want %q", got, want)
+	}
+}
+
+func TestListKeysDecodesEveryKeyInOrder(t *testing.T) {
+	base, got := keyServer(t, 200, `{"keys":[`+otherKeyJSON+`,`+keyJSON+`]}`)
+
+	keys, err := NewClient(base).ListKeys()
+	if err != nil {
+		t.Fatalf("ListKeys() error = %v", err)
+	}
+	assertKeyRoute(t, got(), "GET", "/v1/keys", nil)
+	if want := []Key{wantOtherKey(), wantKey()}; !reflect.DeepEqual(keys, want) {
+		t.Errorf("ListKeys() = %+v, want %+v", keys, want)
+	}
+}
+
+// SitesText is the labels when there are any, and otherwise the key's resource
+// IDs rendered the same way, so a key that names sites is never shown with none.
+func TestKeySitesText(t *testing.T) {
+	ids := []string{"k3j9x2m4p7q1w8e5", "a1b2c3d4e5f6g7h8"}
+	labeled := []LabeledSite{{ID: ids[0], Label: "example.com"}}
+
+	for _, tc := range []struct {
+		name string
+		key  Key
+		want string
+	}{
+		{"labels win over the IDs", Key{ResourceIDs: ids, Sites: labeled}, "example.com"},
+		{"nil sites", Key{ResourceIDs: ids}, "k3j9x2m4p7q1w8e5, a1b2c3d4e5f6g7h8"},
+		{"empty sites", Key{ResourceIDs: ids, Sites: []LabeledSite{}}, "k3j9x2m4p7q1w8e5, a1b2c3d4e5f6g7h8"},
+		{"unusable sites", Key{ResourceIDs: ids, Sites: []LabeledSite{{}}}, "k3j9x2m4p7q1w8e5, a1b2c3d4e5f6g7h8"},
+		{"an ID to escape", Key{ResourceIDs: []string{"a\u202eb"}}, `a\u{202e}b`},
+		{"nothing at all", Key{}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.key.SitesText(); got != tc.want {
+				t.Errorf("SitesText() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// KindText words the two kinds the CLI knows in the language in force, and
+// shows any other kind as the server sent it.
+func TestKeyKindText(t *testing.T) {
+	for _, tc := range []struct {
+		lang string
+		kind string
+		want string
+	}{
+		{"en", "login", "login"},
+		{"en", "deploy", "deploy"},
+		{"en", "ci", "ci"},
+		{"ja", "login", "ログイン"},
+		{"ja", "deploy", "デプロイ"},
+		{"ja", "ci", "ci"},
+	} {
+		t.Run(tc.lang+" "+tc.kind, func(t *testing.T) {
+			renderIn(t, tc.lang)
+			if got := (Key{Kind: tc.kind}).KindText(); got != tc.want {
+				t.Errorf("KindText() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCurrentKeyDecodesTheKey(t *testing.T) {
+	base, got := keyServer(t, 200, `{"key":`+keyJSON+`}`)
+
+	key, err := NewClient(base).CurrentKey()
+	if err != nil {
+		t.Fatalf("CurrentKey() error = %v", err)
+	}
+	assertKeyRoute(t, got(), "GET", "/v1/keys/current", nil)
+	if want := wantKey(); !reflect.DeepEqual(*key, want) {
+		t.Errorf("CurrentKey() = %+v, want %+v", *key, want)
+	}
+}
+
+// A 200 that names no key describes nothing: status would render an empty key
+// row from it.
+func TestCurrentKeyRefusesAnAnswerThatNamesNoKey(t *testing.T) {
+	for _, body := range []string{`{"key":{}}`, `{}`} {
+		t.Run(body, func(t *testing.T) {
+			base, _ := keyServer(t, 200, body)
+
+			key, err := NewClient(base).CurrentKey()
+			if err == nil {
+				t.Fatalf("CurrentKey() = %+v, want an error", key)
+			}
+			if got, want := err.Error(), "parse response: the response names no key"; got != want {
+				t.Errorf("CurrentKey() error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRenameKeySendsTheNameAndDecodesTheStoredKey(t *testing.T) {
+	base, got := keyServer(t, 200, `{"key":`+keyJSON+`}`)
+
+	key, err := NewClient(base).RenameKey(keyID, "alexis-laptop")
+	if err != nil {
+		t.Fatalf("RenameKey() error = %v", err)
+	}
+	assertKeyRoute(t, got(), "PATCH", "/v1/keys/"+keyID, map[string]any{"name": "alexis-laptop"})
+	if want := wantKey(); !reflect.DeepEqual(*key, want) {
+		t.Errorf("RenameKey() = %+v, want %+v", *key, want)
+	}
+}
+
+// A refusal comes back as the coded error response, which is what the key
+// commands word for themselves.
+func TestRenameKeyReturnsKeyNotFoundAsTheErrorResponse(t *testing.T) {
+	base, _ := keyServer(t, 404, `{"code":"key_not_found","message":"Key not found."}`)
+
+	_, err := NewClient(base).RenameKey(keyID, "x")
+	apiErr, ok := err.(*ErrorResponse)
+	if !ok || apiErr.Code != "key_not_found" {
+		t.Fatalf("RenameKey() error = %#v, want a key_not_found *ErrorResponse", err)
+	}
+}
+
+// The sites go out in the order given, and the name only when there is one:
+// with none the field is absent, not empty or null, since the server refuses
+// both and applies its default only to an absent name. The 201 decodes into the
+// key as the list describes it and the key itself.
+func TestCreateKeySendsTheSitesAndTheNameOnlyWhenGiven(t *testing.T) {
+	answer := `{"key":` + otherKeyJSON + `,"api_key":"kk_deploy_minted"}`
+	cases := []struct {
+		label string
+		name  string
+		body  map[string]any
+	}{
+		{"no name", "", map[string]any{"sites": []any{"example.com", "docs"}}},
+		{"a name", "github-actions", map[string]any{"name": "github-actions", "sites": []any{"example.com", "docs"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			base, got := keyServer(t, 201, answer)
+
+			created, err := NewClient(base).CreateKey(tc.name, []string{"example.com", "docs"})
+			if err != nil {
+				t.Fatalf("CreateKey() error = %v", err)
+			}
+			assertKeyRoute(t, got(), "POST", "/v1/keys", tc.body)
+			want := CreatedKey{Key: wantOtherKey(), APIKey: "kk_deploy_minted"}
+			if !reflect.DeepEqual(*created, want) {
+				t.Errorf("CreateKey() = %+v, want %+v", *created, want)
+			}
+		})
+	}
+}
+
+// A success that carries no key has nothing to hand the user, so it is an
+// error rather than an empty key printed where the key belongs.
+func TestCreateKeyRefusesAnAnswerThatCarriesNoKey(t *testing.T) {
+	for _, body := range []string{`{"key":` + otherKeyJSON + `}`, `{"key":` + otherKeyJSON + `,"api_key":""}`, `{}`} {
+		t.Run(body, func(t *testing.T) {
+			base, _ := keyServer(t, 201, body)
+
+			created, err := NewClient(base).CreateKey("", []string{"example.com"})
+			if err == nil {
+				t.Fatalf("CreateKey() = %+v, want an error", created)
+			}
+			if got, want := err.Error(), "parse response: the response names no key"; got != want {
+				t.Errorf("CreateKey() error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A refusal comes back as the coded error response with the fields the
+// deploy-key copy is worded from.
+func TestCreateKeyReturnsTheRefusalAsTheErrorResponse(t *testing.T) {
+	base, _ := keyServer(t, 422, `{"code":"key_site_not_found","message":"No site of this account matches docs.kamakiri-pages.jp.","reference":"docs.kamakiri-pages.jp"}`)
+
+	_, err := NewClient(base).CreateKey("", []string{"docs"})
+	apiErr, ok := err.(*ErrorResponse)
+	if !ok || apiErr.Code != "key_site_not_found" || apiErr.Reference != "docs.kamakiri-pages.jp" {
+		t.Fatalf("CreateKey() error = %#v, want a key_site_not_found *ErrorResponse carrying the reference", err)
+	}
+}
+
+// The rotation goes out as a POST to the key's own rotate route, the ID
+// path-escaped, with no body at all, and the 201 decodes into the new key as the
+// list describes it, the key itself, and the key it replaced.
+func TestRotateKeyPostsToTheKeysRouteAndDecodesTheAnswer(t *testing.T) {
+	answer := `{"key":` + otherKeyJSON + `,"api_key":"kk_deploy_minted","replaced":{"id":"` + keyID + `","name":"unnamed"}}`
+	base, got := keyServer(t, 201, answer)
+
+	rotated, err := NewClient(base).RotateKey(keyID)
+	if err != nil {
+		t.Fatalf("RotateKey() error = %v", err)
+	}
+	route := got()
+	assertKeyRoute(t, route, "POST", "/v1/keys/"+keyID+"/rotate", nil)
+	want := RotatedKey{Key: wantOtherKey(), APIKey: "kk_deploy_minted", Replaced: KeyInfo{ID: keyID, Name: "unnamed"}}
+	if !reflect.DeepEqual(*rotated, want) {
+		t.Errorf("RotateKey() = %+v, want %+v", *rotated, want)
+	}
+}
+
+// The ID is escaped into the path, so an argument holding a slash cannot reach
+// another route. The key commands check the ID first; this holds for any other
+// caller.
+func TestRotateKeyEscapesTheID(t *testing.T) {
+	var rawPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawPath = r.URL.EscapedPath()
+		w.WriteHeader(404)
+		io.WriteString(w, `{"code":"key_not_found","message":"Key not found."}`)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := NewClient(server.URL).RotateKey("a/b")
+	server.Close()
+	if err == nil {
+		t.Fatal("RotateKey() error = nil, want the refusal")
+	}
+	if want := "/v1/keys/a%2Fb/rotate"; rawPath != want {
+		t.Errorf("request path = %q, want %q", rawPath, want)
+	}
+}
+
+// A success that carries no key has nothing to hand the user, and the old key
+// may already be gone, so it is an error rather than an empty key printed where
+// the key belongs.
+func TestRotateKeyRefusesAnAnswerThatCarriesNoKey(t *testing.T) {
+	for _, body := range []string{
+		`{"key":` + otherKeyJSON + `,"replaced":{"id":"` + keyID + `","name":"unnamed"}}`,
+		`{"key":` + otherKeyJSON + `,"api_key":""}`,
+		`{}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			base, _ := keyServer(t, 201, body)
+
+			rotated, err := NewClient(base).RotateKey(keyID)
+			if err == nil {
+				t.Fatalf("RotateKey() = %+v, want an error", rotated)
+			}
+			if got, want := err.Error(), "parse response: the response names no key"; got != want {
+				t.Errorf("RotateKey() error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A refusal comes back as the coded error response, which the key commands word
+// for themselves.
+func TestRotateKeyReturnsTheRefusalAsTheErrorResponse(t *testing.T) {
+	base, _ := keyServer(t, 409, `{"code":"key_not_rotatable","message":"This is a login key, which cannot be rotated."}`)
+
+	_, err := NewClient(base).RotateKey(keyID)
+	apiErr, ok := err.(*ErrorResponse)
+	if !ok || apiErr.Code != "key_not_rotatable" {
+		t.Fatalf("RotateKey() error = %#v, want a key_not_rotatable *ErrorResponse", err)
+	}
+}
+
+func TestRevokeKeyDecodesTheRevokedKey(t *testing.T) {
+	base, got := keyServer(t, 200, `{"key":{"id":"`+otherKeyID+`","name":"unnamed"}}`)
+
+	key, err := NewClient(base).RevokeKey(otherKeyID)
+	if err != nil {
+		t.Fatalf("RevokeKey() error = %v", err)
+	}
+	assertKeyRoute(t, got(), "DELETE", "/v1/keys/"+otherKeyID, nil)
+	if want := (KeyInfo{ID: otherKeyID, Name: "unnamed"}); *key != want {
+		t.Errorf("RevokeKey() = %+v, want %+v", *key, want)
+	}
+}
+
+func TestRevokeCurrentKeyDecodesTheRevokedKey(t *testing.T) {
+	base, got := keyServer(t, 200, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+
+	key, err := NewClient(base).RevokeCurrentKey()
+	if err != nil {
+		t.Fatalf("RevokeCurrentKey() error = %v", err)
+	}
+	assertKeyRoute(t, got(), "DELETE", "/v1/keys/current", nil)
+	if want := (KeyInfo{ID: keyID, Name: "alexis-laptop"}); *key != want {
+		t.Errorf("RevokeCurrentKey() = %+v, want %+v", *key, want)
+	}
+}
+
+// A 301, 302 or 303 makes Go's client re-send a DELETE as a GET, and a GET on
+// this path answers 200 with a key, which would read as a revoke.
+func TestRevokeCurrentKeyRefusesARedirectThatChangesTheMethod(t *testing.T) {
+	for _, status := range []int{301, 302, 303} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var methods []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				methods = append(methods, r.Method)
+				mu.Unlock()
+				if r.Method == "DELETE" {
+					w.Header().Set("Location", "/v1/keys/current")
+					w.WriteHeader(status)
+					return
+				}
+				io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+			}))
+			t.Cleanup(server.Close)
+
+			key, err := NewClient(server.URL).RevokeCurrentKey()
+			server.Close()
+			if err == nil {
+				t.Fatalf("RevokeCurrentKey() = %+v, want an error", key)
+			}
+			if len(methods) != 1 || methods[0] != "DELETE" {
+				t.Errorf("methods seen = %v, want only the DELETE", methods)
+			}
+		})
+	}
+}
+
+func TestRevokeCurrentKeyFollowsARedirectThatKeepsTheMethod(t *testing.T) {
+	for _, status := range []int{307, 308} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var routes, authorizations []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				routes = append(routes, r.Method+" "+r.URL.Path)
+				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				mu.Unlock()
+				if r.URL.Path == "/v1/keys/current" {
+					w.Header().Set("Location", "/moved/keys/current")
+					w.WriteHeader(status)
+					return
+				}
+				io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+			}))
+			t.Cleanup(server.Close)
+
+			client := NewClient(server.URL)
+			client.APIKey = "kk_live_test"
+			key, err := client.RevokeCurrentKey()
+			server.Close()
+			if err != nil {
+				t.Fatalf("RevokeCurrentKey() error = %v", err)
+			}
+			if want := (KeyInfo{ID: keyID, Name: "alexis-laptop"}); *key != want {
+				t.Errorf("RevokeCurrentKey() = %+v, want %+v", *key, want)
+			}
+			want := []string{"DELETE /v1/keys/current", "DELETE /moved/keys/current"}
+			if !slices.Equal(routes, want) {
+				t.Errorf("routes = %v, want %v", routes, want)
+			}
+			bearer := []string{"Bearer kk_live_test", "Bearer kk_live_test"}
+			if !slices.Equal(authorizations, bearer) {
+				t.Errorf("Authorization headers = %v, want %v", authorizations, bearer)
+			}
+		})
+	}
+}
+
+// Moving from http to https on the same host keeps the key, so the redirected
+// DELETE is followed and revokes.
+func TestRevokeCurrentKeyFollowsARedirectFromHTTPToHTTPS(t *testing.T) {
+	for _, status := range []int{307, 308} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var seenByB, authorizations []string
+			b := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				seenByB = append(seenByB, r.Method+" "+r.URL.Path)
+				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				mu.Unlock()
+				io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+			}))
+			t.Cleanup(b.Close)
+
+			a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", b.URL+r.URL.Path)
+				w.WriteHeader(status)
+			}))
+			t.Cleanup(a.Close)
+
+			client := NewClient(a.URL)
+			client.APIKey = "kk_live_test"
+			client.HTTPClient = b.Client()
+			key, err := client.RevokeCurrentKey()
+			a.Close()
+			b.Close()
+			if err != nil {
+				t.Fatalf("RevokeCurrentKey() error = %v", err)
+			}
+			if want := (KeyInfo{ID: keyID, Name: "alexis-laptop"}); *key != want {
+				t.Errorf("RevokeCurrentKey() = %+v, want %+v", *key, want)
+			}
+			if want := []string{"DELETE /v1/keys/current"}; !slices.Equal(seenByB, want) {
+				t.Errorf("the https host saw %v, want %v", seenByB, want)
+			}
+			if want := []string{"Bearer kk_live_test"}; !slices.Equal(authorizations, want) {
+				t.Errorf("Authorization headers = %v, want %v", authorizations, want)
+			}
+		})
+	}
+}
+
+// A 200 may carry no key at all, which does not say which key was revoked, so
+// it may not read as a revoke. A 3xx never reaches this check, since every
+// request refuses one first; TestAnUnfollowedRedirectIsAnError holds that.
+func TestRevokeCurrentKeyRefusesAnAnswerThatNamesNoKey(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"a 200 with an empty object", 200, `{}`},
+		{"a 200 with an empty key", 200, `{"key":{}}`},
+		{"a 200 with a name but no ID", 200, `{"key":{"name":"alexis-laptop"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, _ := keyServer(t, tc.status, tc.body)
+
+			key, err := NewClient(base).RevokeCurrentKey()
+			if err == nil {
+				t.Fatalf("RevokeCurrentKey() = %+v, want an error", key)
+			}
+			if got, want := err.Error(), "parse response: the response names no key"; got != want {
+				t.Errorf("RevokeCurrentKey() error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Go strips Authorization from a redirect to another host and keeps the
+// DELETE; the API's own 401 to that keyless request would read as the key
+// being invalid.
+func TestRevokeCurrentKeyRefusesARedirectToAnotherHost(t *testing.T) {
+	for _, status := range []int{307, 308} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var mu sync.Mutex
+			var seenByB []string
+			b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				seenByB = append(seenByB, r.Method+" "+r.URL.Path)
+				mu.Unlock()
+				w.WriteHeader(401)
+				io.WriteString(w, `{"code":"unauthorized","message":"invalid API key"}`)
+			}))
+			t.Cleanup(b.Close)
+			portB := b.URL[strings.LastIndex(b.URL, ":")+1:]
+
+			a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "http://localhost:"+portB+"/v1/keys/current")
+				w.WriteHeader(status)
+			}))
+			t.Cleanup(a.Close)
+
+			client := NewClient(a.URL)
+			client.APIKey = "kk_live_test"
+			key, err := client.RevokeCurrentKey()
+			a.Close()
+			b.Close()
+			if err == nil {
+				t.Fatalf("RevokeCurrentKey() = %+v, want an error", key)
+			}
+			var apiErr *ErrorResponse
+			if errors.As(err, &apiErr) {
+				t.Errorf("RevokeCurrentKey() error = %v, want one that is not the API's answer", err)
+			}
+			if len(seenByB) != 0 {
+				t.Errorf("the other host saw %v, want no request", seenByB)
+			}
+		})
+	}
+}
+
+func TestRevokeCurrentKeyStopsAfterTenRedirects(t *testing.T) {
+	var mu sync.Mutex
+	count := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		mu.Unlock()
+		w.Header().Set("Location", r.URL.Path)
+		w.WriteHeader(307)
+	}))
+	t.Cleanup(server.Close)
+
+	if _, err := NewClient(server.URL).RevokeCurrentKey(); err == nil {
+		t.Fatal("RevokeCurrentKey() error = nil, want one")
+	}
+	server.Close()
+	if count < 2 || count > 11 {
+		t.Errorf("requests = %d, want a bounded number between 2 and 11", count)
+	}
+}
+
+// The guard runs ahead of an existing CheckRedirect, so a permissive one
+// cannot let a method change or a dropped key through.
+func TestRevokeCurrentKeyGuardsAheadOfAPermissiveCheckRedirect(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		other  bool
+	}{
+		{"a method change", 302, false},
+		{"another host", 307, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var seen []string
+			record := func(r *http.Request) {
+				mu.Lock()
+				seen = append(seen, r.Method+" "+r.Host+r.URL.Path)
+				mu.Unlock()
+			}
+			b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				record(r)
+				io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+			}))
+			t.Cleanup(b.Close)
+			portB := b.URL[strings.LastIndex(b.URL, ":")+1:]
+
+			a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "DELETE" {
+					record(r)
+					io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+					return
+				}
+				loc := "/v1/keys/current"
+				if tc.other {
+					loc = "http://localhost:" + portB + "/v1/keys/current"
+				}
+				w.Header().Set("Location", loc)
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(a.Close)
+
+			client := NewClient(a.URL)
+			client.APIKey = "kk_live_test"
+			client.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error { return nil }
+			key, err := client.RevokeCurrentKey()
+			a.Close()
+			b.Close()
+			if err == nil {
+				t.Fatalf("RevokeCurrentKey() = %+v, want the guard's error", key)
+			}
+			if len(seen) != 0 {
+				t.Errorf("requests after the redirect = %v, want none", seen)
+			}
+		})
+	}
+}
+
+// NewClient always sets an HTTPClient; a literal may not.
+func TestRevokeCurrentKeyGuardsAClientWithoutAnHTTPClient(t *testing.T) {
+	var mu sync.Mutex
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		methods = append(methods, r.Method)
+		mu.Unlock()
+		if r.Method == "DELETE" {
+			w.Header().Set("Location", "/v1/keys/current")
+			w.WriteHeader(302)
+			return
+		}
+		io.WriteString(w, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := &Client{BaseURL: server.URL, APIKey: "kk_live_test"}
+	if _, err := client.RevokeCurrentKey(); err == nil {
+		t.Fatal("RevokeCurrentKey() error = nil, want one")
+	}
+	server.Close()
+	if !slices.Equal(methods, []string{"DELETE"}) {
+		t.Errorf("methods seen = %v, want only the DELETE", methods)
+	}
+}
+
+func TestRevokeCurrentKeyDoesNotMutateTheClientsHTTPClient(t *testing.T) {
+	base, _ := keyServer(t, 200, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+	client := NewClient(base)
+	original := client.HTTPClient
+
+	if _, err := client.RevokeCurrentKey(); err != nil {
+		t.Fatalf("RevokeCurrentKey() error = %v", err)
+	}
+	if client.HTTPClient != original || original.CheckRedirect != nil {
+		t.Errorf("the client's HTTPClient was changed: same=%v CheckRedirect set=%v",
+			client.HTTPClient == original, original.CheckRedirect != nil)
+	}
+}
+
+func TestRevokeCurrentKeyKeepsAnExistingCheckRedirect(t *testing.T) {
+	base, _ := keyServer(t, 200, `{"key":{"id":"`+keyID+`","name":"alexis-laptop"}}`)
+	client := NewClient(base)
+	errStop := errors.New("stop")
+	client.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error { return errStop }
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/elsewhere")
+		w.WriteHeader(307)
+	}))
+	t.Cleanup(server.Close)
+	client.BaseURL = server.URL
+
+	if _, err := client.RevokeCurrentKey(); !errors.Is(err, errStop) {
+		t.Errorf("RevokeCurrentKey() error = %v, want the original CheckRedirect's", err)
+	}
+}
+
+// unsafeRedirect is the English copy of a refused redirect. Go reports the
+// refusal as a *url.Error naming the original method in its own capitalised
+// spelling and the Location as the server sent it, so refusedRedirect builds
+// the whole line from those two.
+const unsafeRedirect = "the server answered with a redirect that would have changed the request's method, dropped its API key, or moved it from https to http, so it was not followed"
+
+func refusedRedirect(op, location string) string {
+	return "request failed: " + op + ` "` + location + `": ` + unsafeRedirect
+}
+
+const siteJSON = `{"id":"site123","subdomain":"my-site","subdomain_enabled":true}`
+
+// methodRecorder records the method and path of every request a test server
+// sees. Reading what it recorded after the server's Close is what orders the
+// handler's writes against the test's reads.
+type methodRecorder struct {
+	mu     sync.Mutex
+	routes []string
+}
+
+func (m *methodRecorder) record(r *http.Request) {
+	m.mu.Lock()
+	m.routes = append(m.routes, r.Method+" "+r.URL.Path)
+	m.mu.Unlock()
+}
+
+// teardown is the concrete case: Go re-sends the DELETE redirected by a 302 as
+// a GET, and the GET's 200 would read as a teardown the server accepted.
+func TestDeleteSiteRefusesARedirectThatChangesTheMethod(t *testing.T) {
+	const location = "/v1/pages/sites/site123"
+	var seen methodRecorder
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.record(r)
+		if r.Method == "DELETE" {
+			w.Header().Set("Location", location)
+			w.WriteHeader(302)
+			return
+		}
+		io.WriteString(w, siteJSON)
+	}))
+	t.Cleanup(server.Close)
+
+	site, err := NewClient(server.URL).DeleteSite("site123")
+	server.Close()
+	if err == nil {
+		t.Fatalf("DeleteSite() = %+v, want the unsafe-redirect error", site)
+	}
+	if got, want := err.Error(), refusedRedirect("Delete", location); got != want {
+		t.Errorf("DeleteSite() error = %q, want %q", got, want)
+	}
+	if want := []string{"DELETE /v1/pages/sites/site123"}; !slices.Equal(seen.routes, want) {
+		t.Errorf("requests = %q, want %q", seen.routes, want)
+	}
+}
+
+func TestAPostRefusesARedirectThatChangesTheMethod(t *testing.T) {
+	const location = "/v1/pages/sites/site123"
+	var seen methodRecorder
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.record(r)
+		if r.Method == "POST" {
+			w.Header().Set("Location", location)
+			w.WriteHeader(303)
+			return
+		}
+		io.WriteString(w, siteJSON)
+	}))
+	t.Cleanup(server.Close)
+
+	site, err := NewClient(server.URL).CreateSite("my-site")
+	server.Close()
+	if err == nil {
+		t.Fatalf("CreateSite() = %+v, want the unsafe-redirect error", site)
+	}
+	if got, want := err.Error(), refusedRedirect("Post", location); got != want {
+		t.Errorf("CreateSite() error = %q, want %q", got, want)
+	}
+	if want := []string{"POST /v1/pages/sites"}; !slices.Equal(seen.routes, want) {
+		t.Errorf("requests = %q, want %q", seen.routes, want)
+	}
+}
+
+// Deploy builds its own request rather than going through doJSON, so this pins
+// that the guard covers it too.
+func TestDeployRefusesARedirectThatChangesTheMethod(t *testing.T) {
+	const location = "/v1/pages/deploys/latest"
+	var seen methodRecorder
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.record(r)
+		if r.Method == "POST" {
+			w.Header().Set("Location", location)
+			w.WriteHeader(302)
+			return
+		}
+		io.WriteString(w, `{"url":"https://my-site.kamakiri-pages.jp"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(server.URL)
+	client.APIKey = "kk_live_test"
+	result, err := client.Deploy([]byte(`{}`), strings.NewReader("tarball"))
+	server.Close()
+	if err == nil {
+		t.Fatalf("Deploy() = %+v, want the unsafe-redirect error", result)
+	}
+	if got, want := err.Error(), refusedRedirect("Post", location); got != want {
+		t.Errorf("Deploy() error = %q, want %q", got, want)
+	}
+	if want := []string{"POST /v1/pages/deploy"}; !slices.Equal(seen.routes, want) {
+		t.Errorf("requests = %q, want %q", seen.routes, want)
+	}
+}
+
+// Deploy streams its body through a pipe, which Go cannot replay, so it does
+// not follow a 307 at all and never asks the guard: the answer reaches the
+// status check as it came, and only the rule against a 3xx stops it reading as
+// a deploy.
+func TestDeployReportsA307ItCannotFollow(t *testing.T) {
+	var seen methodRecorder
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.record(r)
+		w.Header().Set("Location", "/v1/pages/deploy-elsewhere")
+		w.WriteHeader(307)
+		io.WriteString(w, `{"url":"https://my-site.kamakiri-pages.jp"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	result, err := NewClient(server.URL).Deploy([]byte(`{}`), strings.NewReader("tarball"))
+	server.Close()
+	if err == nil {
+		t.Fatalf("Deploy() = %+v, want an error", result)
+	}
+	if got, want := err.Error(), "server returned 307"; got != want {
+		t.Errorf("Deploy() error = %q, want %q", got, want)
+	}
+	if want := []string{"POST /v1/pages/deploy"}; !slices.Equal(seen.routes, want) {
+		t.Errorf("requests = %q, want %q", seen.routes, want)
+	}
+}
+
+// The Location names the TLS server's own host, 127.0.0.1, so Go keeps the
+// Authorization header across the hop and the scheme is the only thing that
+// refuses it. With another host name Go would strip the key, and the header
+// check would refuse first.
+func TestARedirectFromHTTPSToHTTPIsRefused(t *testing.T) {
+	var seenByPlain methodRecorder
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenByPlain.record(r)
+		io.WriteString(w, siteJSON)
+	}))
+	t.Cleanup(plain.Close)
+	portPlain := plain.URL[strings.LastIndex(plain.URL, ":")+1:]
+	location := "http://127.0.0.1:" + portPlain + "/v1/pages/sites/site123"
+
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", location)
+		w.WriteHeader(307)
+	}))
+	t.Cleanup(secure.Close)
+
+	client := NewClient(secure.URL)
+	client.APIKey = "kk_live_test"
+	client.HTTPClient = secure.Client()
+	site, err := client.GetSite("site123")
+	secure.Close()
+	plain.Close()
+	if err == nil {
+		t.Fatalf("GetSite() = %+v, want the unsafe-redirect error", site)
+	}
+	if got, want := err.Error(), refusedRedirect("Get", location); got != want {
+		t.Errorf("GetSite() error = %q, want %q", got, want)
+	}
+	if len(seenByPlain.routes) != 0 {
+		t.Errorf("the http server saw %q, want no request", seenByPlain.routes)
+	}
+}
+
+// Moving from http to https on the same host keeps the key, so the redirected
+// request is followed.
+func TestAGetFollowsARedirectFromHTTPToHTTPS(t *testing.T) {
+	var mu sync.Mutex
+	var seenBySecure, authorizations []string
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenBySecure = append(seenBySecure, r.Method+" "+r.URL.Path)
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		mu.Unlock()
+		io.WriteString(w, siteJSON)
+	}))
+	t.Cleanup(secure.Close)
+
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", secure.URL+r.URL.Path)
+		w.WriteHeader(307)
+	}))
+	t.Cleanup(plain.Close)
+
+	client := NewClient(plain.URL)
+	client.APIKey = "kk_live_test"
+	client.HTTPClient = secure.Client()
+	site, err := client.GetSite("site123")
+	plain.Close()
+	secure.Close()
+	if err != nil {
+		t.Fatalf("GetSite() error = %v", err)
+	}
+	if want := (Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}); !reflect.DeepEqual(*site, want) {
+		t.Errorf("GetSite() = %+v, want %+v", *site, want)
+	}
+	if want := []string{"GET /v1/pages/sites/site123"}; !slices.Equal(seenBySecure, want) {
+		t.Errorf("the https server saw %q, want %q", seenBySecure, want)
+	}
+	if want := []string{"Bearer kk_live_test"}; !slices.Equal(authorizations, want) {
+		t.Errorf("Authorization headers = %q, want %q", authorizations, want)
+	}
+}
+
+// Go hands back unchanged a 3xx it does not follow, such as a 301 with no
+// Location or a 300. Such an answer is not the API's, so it never reads as
+// success, whatever its body. UnregisterDomain decodes no result, which pins
+// that the rule does not sit inside the decode of one.
+func TestAnUnfollowedRedirectIsAnError(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		call   func(c *Client) error
+		want   string
+	}{
+		{"GetSite, a 301 with no Location", 301, siteJSON, func(c *Client) error {
+			_, err := c.GetSite("site123")
+			return err
+		}, "server returned 301"},
+		{"UnregisterDomain, a 301 with no Location", 301, `{}`, func(c *Client) error {
+			return c.UnregisterDomain("example.com")
+		}, "server returned 301"},
+		{"RevokeCurrentKey, a 301 with no Location", 301, `{"moved":true}`, func(c *Client) error {
+			_, err := c.RevokeCurrentKey()
+			return err
+		}, "server returned 301"},
+		{"RevokeCurrentKey, a 300", 300, `{}`, func(c *Client) error {
+			_, err := c.RevokeCurrentKey()
+			return err
+		}, "server returned 300"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, _ := keyServer(t, tc.status, tc.body)
+
+			err := tc.call(NewClient(base))
+			if err == nil {
+				t.Fatalf("error = nil, want %q", tc.want)
+			}
+			if got := err.Error(); got != tc.want {
+				t.Errorf("error = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Go's HTTP/1 transport hands a 101 back as the final answer, with the rest of
+// the connection as its body. It is not a success, whatever follows, so a call
+// that decodes a result and one that decodes none both fail on it.
+func TestATerminal101IsAnError(t *testing.T) {
+	cases := []struct {
+		name string
+		tail string
+		call func(c *Client) error
+	}{
+		{"UnregisterDomain, a bare 101", "", func(c *Client) error {
+			return c.UnregisterDomain("example.com")
+		}},
+		{"DeleteSite, a 101 with a JSON tail", siteJSON, func(c *Client) error {
+			_, err := c.DeleteSite("site123")
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, buf, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("hijacking: %v", err)
+					return
+				}
+				defer conn.Close()
+				buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n" + tc.tail)
+				buf.Flush()
+			}))
+			t.Cleanup(server.Close)
+
+			err := tc.call(NewClient(server.URL))
+			if err == nil {
+				t.Fatal("error = nil, want server returned 101")
+			}
+			if got, want := err.Error(), "server returned 101"; got != want {
+				t.Errorf("error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// An error body with a code and no message would print as a blank line. The
+// text falls back to the status line while the code is kept, so every switch
+// on it still matches.
+func TestAnErrorWithNoMessageNamesTheStatus(t *testing.T) {
+	base, _ := keyServer(t, 404, `{"code":"site_not_found"}`)
+
+	_, err := NewClient(base).GetSite("site123")
+	if err == nil {
+		t.Fatal("GetSite() error = nil, want one")
+	}
+	if got, want := err.Error(), "server returned 404"; got != want {
+		t.Errorf("GetSite() error = %q, want %q", got, want)
+	}
+	var apiErr *ErrorResponse
+	if !errors.As(err, &apiErr) || apiErr.Code != "site_not_found" {
+		t.Errorf("GetSite() error = %#v, want a site_not_found *ErrorResponse", err)
+	}
+}
+
+// NewClient always sets an HTTPClient; a literal may not, and every request
+// must still go out. A nil HTTPClient panics inside net/http, so the call is
+// recovered to keep a regression from aborting the rest of the package.
+func TestARequestWorksWithoutAnHTTPClient(t *testing.T) {
+	base, _ := keyServer(t, 200, siteJSON)
+	client := &Client{BaseURL: base}
+
+	site, err := func() (site *Site, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panicked: %v", r)
+			}
+		}()
+		return client.GetSite("site123")
+	}()
+	if err != nil {
+		t.Fatalf("GetSite() error = %v", err)
+	}
+	if want := (Site{ID: "site123", Subdomain: "my-site", SubdomainEnabled: true}); !reflect.DeepEqual(*site, want) {
+		t.Errorf("GetSite() = %+v, want %+v", *site, want)
+	}
+}
+
+func TestARequestDoesNotMutateTheClientsHTTPClient(t *testing.T) {
+	base, _ := keyServer(t, 200, siteJSON)
+	client := NewClient(base)
+	original := client.HTTPClient
+
+	if _, err := client.GetSite("site123"); err != nil {
+		t.Fatalf("GetSite() error = %v", err)
+	}
+	if client.HTTPClient != original || original.CheckRedirect != nil {
+		t.Errorf("the client's HTTPClient was changed: same=%v CheckRedirect set=%v",
+			client.HTTPClient == original, original.CheckRedirect != nil)
 	}
 }

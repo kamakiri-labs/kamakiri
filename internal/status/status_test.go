@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,6 +46,34 @@ type mockClient struct {
 	listDomainsFn   func(siteID string) (*api.DomainList, error)
 	cdnStatusFn     func(siteID string) (*api.CDNStatusResponse, error)
 	recheckDomainFn func(siteID, domain string) (*api.Domain, error)
+	currentKeyFn    func() (*api.Key, error)
+
+	currentKeyCalls int
+}
+
+// The key CurrentKey describes when a test does not stub it, and the row the
+// English page prints for it.
+const (
+	testKeyID   = "5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65"
+	testKeyName = "laptop"
+	testKeyRow  = "Key:          laptop (login, " + testKeyID + ")"
+)
+
+// noSiteLinkedLine is the sentence the English page ends its site part with in
+// a directory that links no site, and apiServerRow the row a page ends at when
+// it has nothing to say about the site, under the address most tests here run
+// against.
+const (
+	noSiteLinkedLine = `No site is linked to this directory. Run "kamakiri init" to create one.`
+	apiServerRow     = "API server:   https://api.kamakiri-labs.jp/cloud\n"
+)
+
+func (m *mockClient) CurrentKey() (*api.Key, error) {
+	m.currentKeyCalls++
+	if m.currentKeyFn != nil {
+		return m.currentKeyFn()
+	}
+	return &api.Key{ID: testKeyID, Name: testKeyName, Kind: "login", Current: true}, nil
 }
 
 func (m *mockClient) RecheckDomain(siteID, domain string) (*api.Domain, error) {
@@ -89,7 +118,7 @@ func TestStatusNoCredentials(t *testing.T) {
 	assertContains(t, out, "(not found)")
 	assertContains(t, out, "Logged in:    no")
 	assertContains(t, out, "https://api.kamakiri-labs.jp/cloud")
-	assertContains(t, out, "Site:         (none)")
+	assertContains(t, out, noSiteLinkedLine+"\n")
 }
 
 // A credentials file holding no key is not a login. The page golden below
@@ -148,7 +177,9 @@ func TestStatusWithCredentials(t *testing.T) {
 	assertContains(t, out, "credentials.json")
 	assertContains(t, out, "user@example.com")
 	assertContains(t, out, "http://localhost:4000")
-	assertContains(t, out, "Site:         (none)")
+	assertContains(t, out, noSiteLinkedLine+"\n")
+	// No client, so nothing could be asked about the key.
+	assertNotContains(t, out, "Key:")
 }
 
 func TestStatusWithLegacyCredentials(t *testing.T) {
@@ -163,6 +194,7 @@ func TestStatusWithLegacyCredentials(t *testing.T) {
 	out := buf.String()
 
 	assertContains(t, out, "Logged in:    yes")
+	assertNotContains(t, out, "Key:")
 }
 
 // The variable outranks the file, and the page says so rather than naming a
@@ -184,6 +216,7 @@ func TestStatusWithAPIKeyFromEnvironment(t *testing.T) {
 	assertNotContains(t, out, "credentials.json")
 	assertNotContains(t, out, "(not found)")
 	assertNotContains(t, out, "kk_live_fromenv")
+	assertNotContains(t, out, "Key:")
 }
 
 // A file present under the variable is still not read, which is what the absent
@@ -241,6 +274,29 @@ func TestStatusCorruptedCredentials(t *testing.T) {
 	assertContains(t, out, "error")
 }
 
+// A credentials file that cannot be parsed ranks ahead of a project file that
+// cannot be loaded, the same branch as a missing credential.
+func TestStatusCorruptedCredentialsRankAheadOfACorruptedProjectFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+
+	credDir := filepath.Join(tmpDir, "kamakiri")
+	os.MkdirAll(credDir, 0700)
+	os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte("{bad json"), 0600)
+	writeProjectFile(t, false)
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", nil, false)
+
+	if err == nil || !strings.Contains(err.Error(), "parse credentials") {
+		t.Fatalf("Run() error = %v, want it to carry %q", err, "parse credentials")
+	}
+	if strings.Contains(err.Error(), "project config") {
+		t.Errorf("Run() error = %v, want the credential error and not the project load error", err)
+	}
+}
+
 func TestStatusWithSite(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -290,7 +346,7 @@ func TestStatusWithQuota(t *testing.T) {
 	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
 
 	out := buf.String()
-	assertContains(t, out, "Sites:        2 / 5")
+	assertContains(t, out, "Site quota:   2 / 5")
 	assertContains(t, out, "Snapshots:    3 / 5 (this site)")
 	assertContains(t, out, "Max deploy:   100 MB")
 }
@@ -345,7 +401,7 @@ func TestStatusQuotaOmittedWhenAbsent(t *testing.T) {
 	Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
 
 	out := buf.String()
-	assertNotContains(t, out, "Sites:")
+	assertNotContains(t, out, "Site quota:")
 	assertNotContains(t, out, "Max deploy:")
 }
 
@@ -369,8 +425,9 @@ func TestStatusWithSiteAPIError(t *testing.T) {
 		t.Fatalf("Run() error = %v, want it to carry %q", err, "invalid API key")
 	}
 
-	out := buf.String()
-	assertContains(t, out, "Site:         site123")
+	if out := buf.String(); !strings.HasSuffix(out, apiServerRow) {
+		t.Errorf("the page does not end at the API server row:\n%s", out)
+	}
 }
 
 // Every read hands its failure to MapError, so a server code arrives as the copy
@@ -445,7 +502,9 @@ func TestStatusSkipsTheLookupWithoutAKey(t *testing.T) {
 
 	out := buf.String()
 	assertContains(t, out, "Logged in:    no")
-	assertContains(t, out, "Site:         site123")
+	if !strings.HasSuffix(out, apiServerRow) {
+		t.Errorf("the page does not end at the API server row:\n%s", out)
+	}
 }
 
 func TestStatusWithSiteNoClient(t *testing.T) {
@@ -463,8 +522,1040 @@ func TestStatusWithSiteNoClient(t *testing.T) {
 		t.Fatalf("Run() error = %v, want %q", err, want)
 	}
 
-	out := buf.String()
-	assertContains(t, out, "Site:         site123")
+	if out := buf.String(); !strings.HasSuffix(out, apiServerRow) {
+		t.Errorf("the page does not end at the API server row:\n%s", out)
+	}
+}
+
+// A directory with no project file ends the site part of the page with one
+// sentence naming the command that links one, in either language, and that is
+// no failure: a logged-in run with nothing else wrong returns no error.
+func TestStatusSaysNoSiteIsLinked(t *testing.T) {
+	for _, tc := range []struct {
+		lang string
+		want string
+	}{
+		{"en", noSiteLinkedLine},
+		{"ja", `このディレクトリにはサイトがリンクされていません。サイトを作成するには "kamakiri init" を実行してください。`},
+	} {
+		t.Run(tc.lang, func(t *testing.T) {
+			i18n.Load(tc.lang)
+			defer i18n.Load(testLang)
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+				t.Fatalf("SaveCredentials: %v", err)
+			}
+
+			client := &mockClient{
+				getSiteFn: func(string) (*api.Site, error) {
+					t.Fatal("GetSite must not be called with no site linked")
+					return nil, nil
+				},
+			}
+
+			var buf bytes.Buffer
+			if _, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false); err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			if got := i18n.T("status.no_site_linked"); got != tc.want {
+				t.Errorf("status.no_site_linked = %q, want %q", got, tc.want)
+			}
+			if out := buf.String(); !strings.HasSuffix(out, "https://api.kamakiri-labs.jp/cloud\n"+tc.want+"\n") {
+				t.Errorf("the page does not end with the API server row and then %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// writeProjectFile puts a project file in the current directory that cannot be
+// loaded: either JSON that does not parse, or a directory where the file
+// should be, so the read itself fails.
+func writeProjectFile(t *testing.T, unreadable bool) {
+	t.Helper()
+	path := core.ProjectPath()
+	if unreadable {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("not json"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// A project file that is there but cannot be loaded is not an unlinked
+// directory: the advice to run init would fail on the same file. The page
+// prints nothing for the site, reads nothing, and returns the load error as
+// every command that needs the project returns it, so the caller prints the
+// same line deploy would.
+func TestStatusReturnsTheProjectFileLoadError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unreadable bool
+		prefix     string
+	}{
+		{"invalid JSON", false, "parse project config: "},
+		{"unreadable", true, "read project config: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+				t.Fatalf("SaveCredentials: %v", err)
+			}
+			writeProjectFile(t, tc.unreadable)
+			_, loadErr := core.LoadProject()
+			if loadErr == nil {
+				t.Fatal("LoadProject() error = nil, want the fixture to fail to load")
+			}
+
+			client := &mockClient{
+				getSiteFn: func(string) (*api.Site, error) {
+					t.Fatal("GetSite must not be called without a loaded project")
+					return nil, nil
+				},
+			}
+
+			var buf bytes.Buffer
+			drift, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+			if err == nil || err.Error() != loadErr.Error() || !strings.HasPrefix(err.Error(), tc.prefix) {
+				t.Fatalf("Run() error = %v, want %q", err, loadErr)
+			}
+			if drift {
+				t.Error("drift = true, want false")
+			}
+			out := buf.String()
+			if !strings.HasSuffix(out, "API server:   https://api.kamakiri-labs.jp/cloud\n") {
+				t.Errorf("the page does not end at the API server row:\n%s", out)
+			}
+			assertNotContains(t, out, "kamakiri init")
+		})
+	}
+}
+
+// A run that cannot vouch for its credential returns that failure rather than
+// the project file's, as deploy does when it has no key: the credential is the
+// more basic failure, and the one the user fixes first. A held key-description
+// error comes first of all, as it does on every path.
+func TestStatusRanksTheProjectFileLoadErrorBehindTheKey(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) *mockClient
+		want  string
+	}{
+		{
+			name: "no credential",
+			setup: func(t *testing.T) *mockClient {
+				return &mockClient{}
+			},
+			want: i18n.T("common.err_not_logged_in"),
+		},
+		{
+			name: "a rejected key",
+			setup: func(t *testing.T) *mockClient {
+				if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+					t.Fatalf("SaveCredentials: %v", err)
+				}
+				return &mockClient{currentKeyFn: func() (*api.Key, error) {
+					return nil, &api.ErrorResponse{Code: "unauthorized", Message: "invalid API key"}
+				}}
+			},
+			want: i18n.T("api.err_unauthorized"),
+		},
+		{
+			name: "a key that could not be described",
+			setup: func(t *testing.T) *mockClient {
+				if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+					t.Fatalf("SaveCredentials: %v", err)
+				}
+				return &mockClient{currentKeyFn: func() (*api.Key, error) { return nil, keyFailure }}
+			},
+			want: keyFailure.Message,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			client := tc.setup(t)
+			client.getSiteFn = func(string) (*api.Site, error) {
+				t.Fatal("GetSite must not be called without a loaded project")
+				return nil, nil
+			}
+			writeProjectFile(t, false)
+
+			var buf bytes.Buffer
+			_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("Run() error = %v, want %q", err, tc.want)
+			}
+			if out := buf.String(); !strings.HasSuffix(out, "API server:   https://api.kamakiri-labs.jp/cloud\n") {
+				t.Errorf("the page does not end at the API server row:\n%s", out)
+			}
+		})
+	}
+}
+
+// keyFailure is the answer a CurrentKey that could not be served gives: an API
+// error other than a rejection, which MapError hands back as it is.
+var keyFailure = &api.ErrorResponse{Code: "internal_error", Message: "Internal server error."}
+
+// The Key row follows the logged-in line and names the key in the server's
+// words. The name is chosen by whoever minted the key, so a character that would
+// reorder the line on a terminal is escaped rather than printed.
+func TestStatusNamesTheKeyFromTheFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+		t.Fatalf("SaveCredentials: %v", err)
+	}
+
+	client := &mockClient{
+		currentKeyFn: func() (*api.Key, error) {
+			return &api.Key{ID: testKeyID, Name: "ci\u202ebox", Kind: "login", Current: true}, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	assertContains(t, buf.String(), "Logged in:    user@example.com\n"+
+		"Key:          ci\\u{202e}box (login, "+testKeyID+")\n"+
+		"API server:   https://api.kamakiri-labs.jp/cloud\n")
+	if client.currentKeyCalls != 1 {
+		t.Errorf("CurrentKey called %d times, want 1", client.currentKeyCalls)
+	}
+}
+
+// A key from the variable is described like any other, and the logged-in line
+// still says yes rather than an email: the server is not asked for one, since a
+// CI log is where this page is printed.
+func TestStatusNamesTheKeyFromTheEnvironment(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+
+	client := &mockClient{}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	assertContains(t, buf.String(), "Credentials:  KAMAKIRI_API_KEY (environment)\n"+
+		"Logged in:    yes\n"+
+		testKeyRow+"\n"+
+		"API server:   https://api.kamakiri-labs.jp/cloud\n")
+	if client.currentKeyCalls != 1 {
+		t.Errorf("CurrentKey called %d times, want 1", client.currentKeyCalls)
+	}
+}
+
+// One description per run, on the recheck path as on the plain one.
+func TestStatusAsksAboutTheKeyOncePerRun(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		recheck bool
+	}{
+		{"plain", false},
+		{"recheck", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+			core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+			client := newNudgeClient(t, tc.recheck)
+
+			var buf bytes.Buffer
+			var err error
+			if tc.recheck {
+				_, err = RunWithRecheck(&buf, io.Discard, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+			} else {
+				_, err = Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+			}
+			if err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			if client.currentKeyCalls != 1 {
+				t.Errorf("CurrentKey called %d times, want 1", client.currentKeyCalls)
+			}
+			assertContains(t, buf.String(), testKeyRow+"\n")
+		})
+	}
+}
+
+// A key the API itself refuses is not a login, whichever source it came from:
+// the logged-in line says no, the Key row says why, the credential row still
+// names where the key came from, no site is read over it, and the run returns
+// the unauthorized copy every other command prints.
+func TestStatusReportsARejectedKey(t *testing.T) {
+	rejected := &api.ErrorResponse{Code: "unauthorized", Message: "invalid API key"}
+
+	for _, tc := range []struct {
+		name        string
+		environment bool
+		linked      bool
+		credentials string
+		siteTail    string
+	}{
+		{"file, no linked site", false, false, "Credentials:  ", noSiteLinkedLine + "\n"},
+		{"file, linked site", false, true, "Credentials:  ", ""},
+		{"environment, no linked site", true, false, "Credentials:  KAMAKIRI_API_KEY (environment)", noSiteLinkedLine + "\n"},
+		{"environment, linked site", true, true, "Credentials:  KAMAKIRI_API_KEY (environment)", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			home := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", home)
+			credentials := tc.credentials
+			if tc.environment {
+				t.Setenv("KAMAKIRI_API_KEY", "kk_live_fromenv")
+			} else {
+				if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+					t.Fatalf("SaveCredentials: %v", err)
+				}
+				credentials += filepath.Join(home, "kamakiri", "credentials.json")
+			}
+			if tc.linked {
+				if err := core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"}); err != nil {
+					t.Fatalf("SaveProject: %v", err)
+				}
+			}
+
+			reads := 0
+			client := &mockClient{
+				currentKeyFn: func() (*api.Key, error) { return nil, rejected },
+				getSiteFn: func(id string) (*api.Site, error) {
+					reads++
+					return &api.Site{ID: id}, nil
+				},
+			}
+
+			var buf bytes.Buffer
+			drift, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+			// The source stamp is the dispatch's to set, and nothing here sets
+			// it, so the file's wording is the one expected for both sources.
+			if want := i18n.T("api.err_unauthorized"); err == nil || err.Error() != want {
+				t.Fatalf("Run() error = %v, want %q", err, want)
+			}
+			if drift {
+				t.Error("drift = true, want false")
+			}
+			out := buf.String()
+			if want := credentials + "\n" +
+				"Logged in:    no\n" +
+				"Key:          rejected\n" +
+				apiServerRow +
+				tc.siteTail; !strings.HasSuffix(out, want) {
+				t.Errorf("the page does not end with:\n%s\ngot:\n%s", want, out)
+			}
+			assertNotContains(t, out, "user@example.com")
+			if reads != 0 {
+				t.Errorf("GetSite called %d times, want none over a rejected key", reads)
+			}
+		})
+	}
+}
+
+// Only the API's own refusal says the key is dead. A 401 that carries no API
+// body could have come from anything between here and the server, so it is a
+// failure to ask like any other: the logged-in line stands and the site is
+// still read.
+func TestStatusTreatsABare401AsAFailureToAsk(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	bare := errors.New(i18n.Tf("api.err_server_returned", 401))
+	reads := 0
+	client := &mockClient{
+		currentKeyFn: func() (*api.Key, error) { return nil, bare },
+		getSiteFn: func(id string) (*api.Site, error) {
+			reads++
+			return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true}, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+	if err == nil || err.Error() != bare.Error() {
+		t.Fatalf("Run() error = %v, want %q", err, bare)
+	}
+	assertContains(t, buf.String(), "Logged in:    user@example.com\n"+
+		"Key:          (error: server returned 401)\n")
+	assertContains(t, buf.String(), "Subdomain:    my-site.kamakiri-pages.jp")
+	if reads != 1 {
+		t.Errorf("GetSite called %d times, want 1", reads)
+	}
+}
+
+// A key that could not be described leaves the logged-in line as it was and the
+// page renders on, but the run cannot vouch for the key, so that failure is what
+// it returns from every place the page can end, including those that otherwise
+// return no error at all. When a later read fails as well, the key's failure,
+// the first one, is still the one returned.
+func TestStatusReturnsTheKeyFailureFromEveryExitPath(t *testing.T) {
+	site := func(id string) (*api.Site, error) {
+		return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true}, nil
+	}
+	boom := errors.New("connection reset")
+	drifted := func(string) (*api.DomainList, error) {
+		return &api.DomainList{Domains: []api.Domain{{
+			Domain:                "example.com",
+			Role:                  "canonical",
+			State:                 "serving",
+			CdnState:              "active",
+			DnsMatchedAlternative: "a",
+			DNSRecordsExpected: []api.DNSRecord{
+				{Name: "example.com", Type: "a", Value: "192.0.2.1", Purpose: "primary", Required: true, AlternativeGroup: "apex_primary"},
+			},
+			DNSRecordsObserved: []api.DNSRecordObserved{
+				{Name: "example.com", Type: "a", Values: []string{"203.0.113.9"}, AlternativeGroup: "apex_primary"},
+			},
+		}}}, nil
+	}
+
+	cases := []struct {
+		name      string
+		linked    bool
+		client    *mockClient
+		lastRow   string
+		wantDrift bool
+	}{
+		{
+			name:    "no linked site",
+			client:  &mockClient{},
+			lastRow: noSiteLinkedLine,
+		},
+		{
+			name:   "every site read succeeds",
+			linked: true,
+			client: &mockClient{
+				getSiteFn: site,
+				listDomainsFn: func(string) (*api.DomainList, error) {
+					return &api.DomainList{Domains: []api.Domain{
+						{Domain: "example.com", Role: "canonical", State: "serving", CdnState: "off"},
+					}}, nil
+				},
+			},
+			lastRow: "  example.com  canonical  ✓ live  ",
+		},
+		{
+			name:      "the site has drifted",
+			linked:    true,
+			client:    &mockClient{getSiteFn: site, listDomainsFn: drifted},
+			lastRow:   "    → Update your A records at your registrar to the expected values above.",
+			wantDrift: true,
+		},
+		{
+			name:   "the site is torn down",
+			linked: true,
+			client: &mockClient{
+				getSiteFn: func(id string) (*api.Site, error) {
+					return &api.Site{ID: id, Status: "deleted", StatusObserved: "deleted"}, nil
+				},
+			},
+			lastRow: "Status:       ✗ deleted",
+		},
+		{
+			name:   "the site read fails too",
+			linked: true,
+			client: &mockClient{
+				getSiteFn: func(string) (*api.Site, error) { return nil, boom },
+			},
+			lastRow: "API server:   https://api.kamakiri-labs.jp/cloud",
+		},
+		{
+			name:   "the domain list fails too",
+			linked: true,
+			client: &mockClient{
+				getSiteFn:     site,
+				listDomainsFn: func(string) (*api.DomainList, error) { return nil, boom },
+			},
+			lastRow: "Subdomain:    my-site.kamakiri-pages.jp",
+		},
+		{
+			name:   "the cdn status fails too",
+			linked: true,
+			client: &mockClient{
+				getSiteFn:   site,
+				cdnStatusFn: func(string) (*api.CDNStatusResponse, error) { return nil, boom },
+			},
+			lastRow: "Domain:       (none)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+			if tc.linked {
+				core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+			}
+			tc.client.currentKeyFn = func() (*api.Key, error) { return nil, keyFailure }
+
+			var buf bytes.Buffer
+			drift, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", tc.client, false)
+
+			if err == nil || err.Error() != keyFailure.Message {
+				t.Fatalf("Run() error = %v, want the key's failure %q", err, keyFailure.Message)
+			}
+			if drift != tc.wantDrift {
+				t.Errorf("drift = %v, want %v", drift, tc.wantDrift)
+			}
+			out := buf.String()
+			assertContains(t, out, "Logged in:    user@example.com\n"+
+				"Key:          (error: Internal server error.)\n")
+			if !strings.HasSuffix(out, tc.lastRow+"\n") {
+				t.Errorf("the page does not end at %q:\n%s", tc.lastRow, out)
+			}
+		})
+	}
+}
+
+// The held key error goes through the same mapping every other read failure
+// does, on the Key row and as the returned error alike, so a code the mapping
+// rewrites reads as its copy and not as the server's raw message.
+func TestStatusMapsTheKeyFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+
+	client := &mockClient{
+		currentKeyFn: func() (*api.Key, error) {
+			return nil, &api.ErrorResponse{Code: "rate_limited", Message: "raw server wording"}
+		},
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+	want := i18n.T("api.err_rate_limited")
+	if err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
+	assertContains(t, buf.String(), "Key:          (error: "+want+")\n")
+}
+
+// Without a key in hand there is nothing to describe, so nothing is asked and
+// no Key row is printed, whatever stopped the key from being there.
+func TestStatusAsksNothingAboutAKeyItDoesNotHave(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T)
+	}{
+		{
+			name: "no credentials file",
+			setup: func(t *testing.T) {
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			},
+		},
+		{
+			name: "a credentials file holding no key",
+			setup: func(t *testing.T) {
+				home := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", home)
+				dir := filepath.Join(home, "kamakiri")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"version":1,"api_key":""}`), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+		},
+		{
+			name: "an unreadable credentials file",
+			setup: func(t *testing.T) {
+				home := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", home)
+				dir := filepath.Join(home, "kamakiri")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatalf("MkdirAll: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(corruptCredentials), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+		},
+		{
+			name: "no config directory to look in",
+			setup: func(t *testing.T) {
+				t.Setenv("XDG_CONFIG_HOME", "")
+				t.Setenv("HOME", "")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			tc.setup(t)
+
+			client := &mockClient{
+				currentKeyFn: func() (*api.Key, error) {
+					t.Fatal("CurrentKey must not be called without a key")
+					return nil, nil
+				},
+			}
+
+			var buf bytes.Buffer
+			_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+			if err == nil {
+				t.Fatal("Run() error = nil, want the reason there is no key")
+			}
+			out := buf.String()
+			assertContains(t, out, noSiteLinkedLine+"\n")
+			assertNotContains(t, out, "Key:")
+		})
+	}
+}
+
+// The Key row's value starts in the same column as every other value in
+// Japanese too, where the label is a mix of narrow and wide glyphs, and the
+// name sits in the brackets Japanese copy quotes a key name in.
+func TestKeyRowAlignsInJapanese(t *testing.T) {
+	i18n.Load("ja")
+	defer i18n.Load(testLang)
+
+	cases := []struct {
+		name     string
+		keyFn    func() (*api.Key, error)
+		loggedIn string
+		value    string
+	}{
+		{
+			name:     "described",
+			loggedIn: "user@example.com",
+			value:    "「" + testKeyName + "」(ログイン, " + testKeyID + ")",
+		},
+		{
+			name: "rejected",
+			keyFn: func() (*api.Key, error) {
+				return nil, &api.ErrorResponse{Code: "unauthorized", Message: "invalid API key"}
+			},
+			loggedIn: i18n.T("status.value_no"),
+			value:    i18n.T("status.value_key_rejected"),
+		},
+		{
+			name: "failed",
+			keyFn: func() (*api.Key, error) {
+				return nil, keyFailure
+			},
+			loggedIn: "user@example.com",
+			value:    i18n.Tf("status.value_error", keyFailure.Message),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+
+			var buf bytes.Buffer
+			// The rejected and failed runs return an error; only the page is read.
+			Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", &mockClient{currentKeyFn: tc.keyFn}, false)
+
+			var loggedIn, key string
+			for _, line := range strings.Split(buf.String(), "\n") {
+				switch {
+				case strings.HasPrefix(line, i18n.T("status.label_logged_in")):
+					loggedIn = line
+				case strings.HasPrefix(line, i18n.T("status.label_key")):
+					key = line
+				}
+			}
+			if loggedIn == "" || key == "" {
+				t.Fatalf("missing the logged-in or the Key row:\n%s", buf.String())
+			}
+
+			if !strings.HasSuffix(key, tc.value) {
+				t.Errorf("Key row = %q, want it to end in %q", key, tc.value)
+			}
+			if !strings.HasSuffix(loggedIn, tc.loggedIn) {
+				t.Errorf("Logged in row = %q, want it to end in %q", loggedIn, tc.loggedIn)
+			}
+			keyStart := columnStarts(t, key, []string{tc.value})[0]
+			loggedInStart := columnStarts(t, loggedIn, []string{tc.loggedIn})[0]
+			if keyStart != loggedInStart {
+				t.Errorf("the Key value starts at column %d and the logged-in value at %d:\n%q\n%q",
+					keyStart, loggedInStart, key, loggedIn)
+			}
+		})
+	}
+}
+
+// deployKey is a deploy key bound to two sites, as the server describes it.
+func deployKey() *api.Key {
+	return &api.Key{
+		ID:          "3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40",
+		Name:        "github-actions",
+		Kind:        "deploy",
+		ResourceIDs: []string{"k3j9x2m4p7q1w8e5", "a1b2c3d4e5f6g7h8"},
+		Sites: []api.LabeledSite{
+			{ID: "k3j9x2m4p7q1w8e5", Label: "example.com"},
+			{ID: "a1b2c3d4e5f6g7h8", Label: "docs.kamakiri-pages.jp"},
+		},
+		Current: true,
+	}
+}
+
+// A deploy key's page names the sites the key may act on, directly under the
+// Key row, each label escaped as the key's name is; a login key acts on the
+// whole account, so its page has no such row. Neither depends on a linked site.
+func TestStatusShowsADeployKeysSitesUnderTheKey(t *testing.T) {
+	hostile := deployKey()
+	hostile.Sites[1].Label = "docs\u202e.kamakiri-pages.jp"
+
+	for _, tc := range []struct {
+		name string
+		key  *api.Key
+		want string
+	}{
+		{
+			name: "deploy key",
+			key:  deployKey(),
+			want: "Key:          github-actions (deploy, 3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40)\n" +
+				"Sites:        example.com, docs.kamakiri-pages.jp\n" +
+				"API server:   https://api.kamakiri-labs.jp/cloud\n",
+		},
+		{
+			name: "a label to escape",
+			key:  hostile,
+			want: "Sites:        example.com, docs\\u{202e}.kamakiri-pages.jp\n",
+		},
+		{
+			name: "login key",
+			// Populated, so only the kind keeps the row off the page.
+			key: &api.Key{ID: testKeyID, Name: testKeyName, Kind: "login", Current: true,
+				ResourceIDs: []string{"k3j9x2m4p7q1w8e5"},
+				Sites:       []api.LabeledSite{{ID: "k3j9x2m4p7q1w8e5", Label: "example.com"}}},
+			want: testKeyRow + "\n" +
+				"API server:   https://api.kamakiri-labs.jp/cloud\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+
+			client := &mockClient{currentKeyFn: func() (*api.Key, error) { return tc.key, nil }}
+
+			var buf bytes.Buffer
+			if _, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false); err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			assertContains(t, buf.String(), tc.want)
+			if tc.key.Kind == "login" {
+				assertNotContains(t, buf.String(), "Sites:")
+			}
+		})
+	}
+}
+
+// In Japanese the key's sites and the site quota are two labels, サイト: and
+// サイト数:, and both values start in the column every other row uses. The
+// sites are joined with the Japanese list separator, and the Key row words the
+// kind as デプロイ.
+func TestDeployKeySitesAndSiteQuotaInJapanese(t *testing.T) {
+	i18n.Load("ja")
+	defer i18n.Load(testLang)
+
+	linkedSite(t, "user@example.com")
+	client := &mockClient{
+		currentKeyFn: func() (*api.Key, error) { return deployKey(), nil },
+		getSiteFn: func(id string) (*api.Site, error) {
+			return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true,
+				Quota: &api.Quota{SitesUsed: 2, SitesMax: 5, SnapshotsUsed: 3, SnapshotsMax: 10, MaxSnapshotBytes: 100 << 20}}, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	var key, sites, quota, loggedIn string
+	lines := strings.Split(buf.String(), "\n")
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, i18n.T("status.label_key")) && i+1 < len(lines):
+			key = line
+			// The key's sites sit directly under the Key row.
+			sites = lines[i+1]
+		case strings.HasPrefix(line, "サイト数:"):
+			quota = line
+		case strings.HasPrefix(line, i18n.T("status.label_logged_in")):
+			loggedIn = line
+		}
+	}
+	if sites == "" || quota == "" || loggedIn == "" {
+		t.Fatalf("missing the サイト:, サイト数: or logged-in row:\n%s", buf.String())
+	}
+	if !strings.Contains(key, "(デプロイ, ") {
+		t.Errorf("Key row = %q, want it to hold %q", key, "(デプロイ, ")
+	}
+	const sitesValue = "example.com、docs.kamakiri-pages.jp"
+	if want := i18n.T("status.label_key_sites"); !strings.HasPrefix(sites, want) {
+		t.Errorf("sites row = %q, want it to start with %q", sites, want)
+	}
+	if got := i18n.T("status.label_key_sites"); got != "サイト:" {
+		t.Errorf("status.label_key_sites = %q, want %q", got, "サイト:")
+	}
+	if !strings.HasSuffix(sites, sitesValue) {
+		t.Errorf("サイト: row = %q, want it to end in %q", sites, sitesValue)
+	}
+	if !strings.HasSuffix(quota, "2 / 5") {
+		t.Errorf("サイト数: row = %q, want it to end in %q", quota, "2 / 5")
+	}
+	want := columnStarts(t, loggedIn, []string{"user@example.com"})[0]
+	if got := columnStarts(t, sites, []string{sitesValue})[0]; got != want {
+		t.Errorf("the サイト: value starts at column %d, want %d:\n%s", got, want, buf.String())
+	}
+	if got := columnStarts(t, quota, []string{"2 / 5"})[0]; got != want {
+		t.Errorf("the サイト数: value starts at column %d, want %d:\n%s", got, want, buf.String())
+	}
+}
+
+// A deploy key whose server sent no usable labels is still shown by the sites
+// it names: the page falls back to the key's resource IDs, escaped and joined
+// as the labels would be, so the row is never missing for a deploy key that
+// names sites.
+func TestStatusShowsADeployKeysResourceIDsWhenNoLabelIsUsable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lang  string
+		sites []api.LabeledSite
+		ids   []string
+		want  string
+	}{
+		{"absent", "en", nil, []string{"k3j9x2m4p7q1w8e5", "a1b2c3d4e5f6g7h8"},
+			"Sites:        k3j9x2m4p7q1w8e5, a1b2c3d4e5f6g7h8\n"},
+		{"empty", "en", []api.LabeledSite{}, []string{"k3j9x2m4p7q1w8e5"},
+			"Sites:        k3j9x2m4p7q1w8e5\n"},
+		{"all unusable", "en", []api.LabeledSite{{}, {}}, []string{"k3j9x2m4p7q1w8e5"},
+			"Sites:        k3j9x2m4p7q1w8e5\n"},
+		{"escaped", "en", nil, []string{"k3j9\u202ex2m4"},
+			"Sites:        k3j9\\u{202e}x2m4\n"},
+		{"japanese separator", "ja", nil, []string{"k3j9x2m4p7q1w8e5", "a1b2c3d4e5f6g7h8"},
+			"k3j9x2m4p7q1w8e5、a1b2c3d4e5f6g7h8\n"},
+		{"nothing to show", "en", nil, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i18n.Load(tc.lang)
+			defer i18n.Load(testLang)
+			t.Chdir(t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			core.SaveCredentials("kk_live_test", "user@example.com")
+
+			key := deployKey()
+			key.Sites = tc.sites
+			key.ResourceIDs = tc.ids
+			client := &mockClient{currentKeyFn: func() (*api.Key, error) { return key, nil }}
+
+			var buf bytes.Buffer
+			if _, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false); err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			if tc.want == "" {
+				assertNotContains(t, buf.String(), i18n.T("status.label_key_sites"))
+				return
+			}
+			assertContains(t, buf.String(), tc.want)
+		})
+	}
+}
+
+// The recheck route is closed to a deploy key, so `status --recheck` run with
+// one sends no recheck at all. It says so once on stderr, whatever the domains'
+// states, and renders the page with the exit a refused recheck has: none of its
+// own. No probe window was opened, so the nudge keeps the backoff framing.
+func TestStatusRecheckWithADeployKeySendsNoRecheck(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		lang    string
+		domains []api.Domain
+	}{
+		{"a domain awaiting DNS", "en", nil},
+		{"every domain serving", "en", []api.Domain{{Domain: "example.com", Role: "canonical", State: "serving"}}},
+		{"a domain awaiting DNS in Japanese", "ja", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i18n.Load(tc.lang)
+			defer i18n.Load(testLang)
+			linkedSite(t, "user@example.com")
+
+			// newNudgeClient fails the test on any recheck call.
+			client := newNudgeClient(t, false)
+			client.currentKeyFn = func() (*api.Key, error) { return deployKey(), nil }
+			if tc.domains != nil {
+				client.listDomainsFn = func(string) (*api.DomainList, error) {
+					return &api.DomainList{Domains: tc.domains}, nil
+				}
+			}
+
+			var buf, errBuf bytes.Buffer
+			drift, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+			if err != nil || drift {
+				t.Errorf("RunWithRecheck() = %v, %v, want no drift and no error", drift, err)
+			}
+			want := "--recheck needs a login key; this run uses a deploy key, so no domain was rechecked.\n"
+			if tc.lang == "ja" {
+				want = i18n.T("status.recheck_deploy_key") + "\n"
+			}
+			if got := errBuf.String(); got != want {
+				t.Errorf("stderr = %q, want %q", got, want)
+			}
+			out := buf.String()
+			assertNotContains(t, out, "--recheck")
+			if tc.domains == nil && tc.lang == "en" {
+				assertContains(t, out, "slowed down")
+				assertNotContains(t, out, "~60s")
+			}
+		})
+	}
+}
+
+// The deploy-key recheck line belongs to the page that reads the site's
+// domains. A page that stops before that (no linked site, a site the key may
+// not read, a domain read that fails) prints no such line, and ends as it would
+// for any key. The torn-down site case pins the early return for a site whose
+// teardown page renders before the domains are read.
+func TestStatusRecheckWithADeployKeyPrintsNoLineWhereThePageStopsEarly(t *testing.T) {
+	refusal := &api.ErrorResponse{Code: "site_not_in_key", Message: "This deploy key cannot act on this site."}
+	domainReadFailure := &api.ErrorResponse{Code: "internal_error", Message: "The domain read failed."}
+	for _, tc := range []struct {
+		name    string
+		link    bool
+		getSite func(string) (*api.Site, error)
+		domains func(string) (*api.DomainList, error)
+		wantErr bool
+	}{
+		{name: "no linked site"},
+		{name: "a domain read that fails", link: true, wantErr: true,
+			domains: func(string) (*api.DomainList, error) { return nil, domainReadFailure }},
+		{name: "a site the key may not read", link: true, wantErr: true,
+			getSite: func(string) (*api.Site, error) { return nil, refusal }},
+		{name: "a site being torn down", link: true,
+			getSite: func(id string) (*api.Site, error) {
+				return &api.Site{ID: id, Subdomain: "td", Status: "deleted", StatusObserved: "active"}, nil
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.link {
+				linkedSite(t, "user@example.com")
+			} else {
+				t.Chdir(t.TempDir())
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				core.SaveCredentials("kk_live_test", "user@example.com")
+			}
+
+			client := newNudgeClient(t, false)
+			client.currentKeyFn = func() (*api.Key, error) { return deployKey(), nil }
+			if tc.getSite != nil {
+				client.getSiteFn = tc.getSite
+			}
+			if tc.domains != nil {
+				client.listDomainsFn = tc.domains
+			}
+
+			var buf, errBuf bytes.Buffer
+			drift, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+			if (err != nil) != tc.wantErr || drift {
+				t.Errorf("RunWithRecheck() = %v, %v, want drift false and error %v", drift, err, tc.wantErr)
+			}
+			if tc.domains != nil && (err == nil || err.Error() != api.MapError(domainReadFailure).Error()) {
+				t.Errorf("RunWithRecheck() error = %v, want %v", err, api.MapError(domainReadFailure))
+			}
+			if errBuf.Len() != 0 {
+				t.Errorf("stderr = %q, want nothing", errBuf.String())
+			}
+		})
+	}
+}
+
+// Without the key's description the run cannot tell a deploy key from a login
+// key, so `status --recheck` asks for each recheck as it always has, and words
+// each refusal on its own line.
+func TestStatusRecheckWithAnUnknownKindTriesEachRecheck(t *testing.T) {
+	linkedSite(t, "user@example.com")
+
+	client := newNudgeClient(t, true)
+	client.currentKeyFn = func() (*api.Key, error) { return nil, keyFailure }
+	calls := 0
+	client.recheckDomainFn = func(string, string) (*api.Domain, error) {
+		calls++
+		return nil, &api.ErrorResponse{Code: "deploy_key_refused", Message: "This is a deploy key."}
+	}
+
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	if !errors.Is(err, keyFailure) {
+		t.Errorf("RunWithRecheck() error = %v, want the key failure", err)
+	}
+	if calls != 1 {
+		t.Errorf("RecheckDomain called %d times, want 1", calls)
+	}
+	want := i18n.Tf("status.recheck_failed", "next.altstack.jp",
+		api.MapError(&api.ErrorResponse{Code: "deploy_key_refused", Message: "This is a deploy key."})) + "\n"
+	if got := errBuf.String(); got != want {
+		t.Errorf("stderr = %q, want %q", got, want)
+	}
+}
+
+// A deploy key reading a linked site that is not on its list is refused with
+// site_not_in_key: the page ends where it does for any site it cannot read,
+// after the API server row, and the run returns the refusal in the words every
+// command prints it in, which name the site and the key's list.
+func TestStatusOfASiteOutsideTheDeployKeysList(t *testing.T) {
+	linkedSite(t, "user@example.com")
+
+	key := deployKey()
+	refusal := &api.ErrorResponse{
+		Code:    "site_not_in_key",
+		Message: "This deploy key cannot act on this site.",
+		Key:     &api.KeyInfo{ID: key.ID, Name: key.Name},
+		Sites:   key.Sites,
+		Site:    &api.LabeledSite{ID: "site123", Label: "blog.example.org"},
+	}
+	client := &mockClient{
+		currentKeyFn: func() (*api.Key, error) { return key, nil },
+		getSiteFn:    func(string) (*api.Site, error) { return nil, refusal },
+		listDomainsFn: func(string) (*api.DomainList, error) {
+			t.Fatal("the domains must not be read once the site read is refused")
+			return nil, nil
+		},
+	}
+
+	var buf bytes.Buffer
+	_, err := Run(&buf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+
+	want := `this deploy key ("github-actions") cannot act on blog.example.org: it can deploy to example.com, docs.kamakiri-pages.jp and nothing else`
+	if err == nil || err.Error() != want {
+		t.Fatalf("Run() error = %v, want %q", err, want)
+	}
+	assertContains(t, buf.String(), "Sites:        example.com, docs.kamakiri-pages.jp\n")
+	if !strings.HasSuffix(buf.String(), apiServerRow) {
+		t.Errorf("the page must end at the API server row:\n%s", buf.String())
+	}
 }
 
 func TestStatusWithCanonicalDomain(t *testing.T) {
@@ -1066,6 +2157,104 @@ func TestStatusRecheckOptInCallsRecheckAndUsesInBurstFraming(t *testing.T) {
 	}
 }
 
+// Only a domain whose recheck the server performed had its probe window
+// opened, so the small ETA is true of that domain alone. A domain whose
+// recheck was refused keeps the framing a plain read gives it.
+func TestStatusRecheckNudgesEachDomainByWhetherItsRecheckWasPerformed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	awaiting := func(name, role string) api.Domain {
+		return api.Domain{
+			Domain: name, Role: role, State: "awaiting_dns",
+			DnsVerdict: "absent",
+			DNSRecordsExpected: []api.DNSRecord{
+				{Name: name, Type: "cname", Value: "t.kamakiri-pages.site.", Purpose: "primary", Required: true},
+			},
+		}
+	}
+	client := &mockClient{
+		getSiteFn: func(id string) (*api.Site, error) {
+			return &api.Site{ID: id, Subdomain: "my-site", SubdomainEnabled: true}, nil
+		},
+		listDomainsFn: func(_ string) (*api.DomainList, error) {
+			return &api.DomainList{Domains: []api.Domain{
+				awaiting("next.altstack.jp", "canonical"),
+				awaiting("www.altstack.jp", "redirect"),
+			}}, nil
+		},
+		recheckDomainFn: func(_, d string) (*api.Domain, error) {
+			if d == "www.altstack.jp" {
+				return nil, &api.ErrorResponse{Code: "internal_error", Message: "Internal server error."}
+			}
+			fresh := awaiting(d, "canonical")
+			return &fresh, nil
+		},
+	}
+
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	out := buf.String()
+	if err != nil {
+		t.Errorf("a refused recheck must not fail the command, got %v", err)
+	}
+
+	const inBurstNext = "Run `kamakiri domain verify next.altstack.jp` to check now, or `kamakiri status` to watch. Next auto-check ≤ one cron tick (~60s)."
+	const backoffWWW = "Automatic checks slowed down since no one was waiting. Run `kamakiri domain verify www.altstack.jp` to check on the next cycle and speed them back up."
+	assertContains(t, out, "    "+inBurstNext+"\n")
+	assertContains(t, out, "    "+backoffWWW+"\n")
+	assertNotContains(t, out, "Run `kamakiri domain verify www.altstack.jp` to check now")
+	if strings.Count(out, "~60s") != 1 {
+		t.Errorf("exactly one domain was rechecked, so exactly one ~60s nudge, got:\n%s", out)
+	}
+	if strings.Count(out, "slowed down") != 1 {
+		t.Errorf("exactly one domain was refused, so exactly one backoff nudge, got:\n%s", out)
+	}
+	// stderr is the same as before: one line, for the refused domain only.
+	assertContains(t, errBuf.String(), "recheck of www.altstack.jp not performed (")
+	assertNotContains(t, errBuf.String(), "next.altstack.jp")
+}
+
+// A recheck the server performed that answers with no domain still opened the
+// probe window, so the domain counts as rechecked and keeps its listed row.
+func TestStatusRecheckWithANilFreshDomainCountsAsRechecked(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	core.SaveCredentials("kk_live_test", "user@example.com")
+	core.SaveProject(&core.ProjectConfig{Version: 1, Kind: "pages", ID: "site123"})
+
+	plain := newNudgeClient(t, false)
+	var plainBuf bytes.Buffer
+	Run(&plainBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", plain, false)
+
+	client := newNudgeClient(t, true)
+	client.recheckDomainFn = func(string, string) (*api.Domain, error) {
+		return nil, nil
+	}
+	var buf, errBuf bytes.Buffer
+	_, err := RunWithRecheck(&buf, &errBuf, "v0.1.0", "https://api.kamakiri-labs.jp/cloud", client, false)
+	out := buf.String()
+	if err != nil {
+		t.Fatalf("RunWithRecheck() error = %v, want none", err)
+	}
+
+	const inBurst = "Run `kamakiri domain verify next.altstack.jp` to check now, or `kamakiri status` to watch. Next auto-check ≤ one cron tick (~60s)."
+	assertContains(t, out, "    "+inBurst+"\n")
+	assertNotContains(t, out, "slowed down")
+	if got := errBuf.String(); got != "" {
+		t.Errorf("stderr = %q, want nothing", got)
+	}
+
+	// The row is the listed one: the page differs from the plain read's only
+	// in the nudge line.
+	const backoff = "Automatic checks slowed down since no one was waiting. Run `kamakiri domain verify next.altstack.jp` to check on the next cycle and speed them back up."
+	if got, want := out, strings.Replace(plainBuf.String(), backoff, inBurst, 1); got != want {
+		t.Errorf("page differs from the plain read beyond the nudge:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestStatusRecheckRateLimitedIsNonFatal(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -1089,6 +2278,10 @@ func TestStatusRecheckRateLimitedIsNonFatal(t *testing.T) {
 	if errBuf.String() != "" {
 		t.Errorf("a rate limit says nothing the page does not, want empty stderr, got %q", errBuf.String())
 	}
+	// The limit is per account, so the refusal opened no probe window for this
+	// domain: the nudge is the one a plain read gives, with no small ETA.
+	assertContains(t, out, "    Automatic checks slowed down since no one was waiting. Run `kamakiri domain verify next.altstack.jp` to check on the next cycle and speed them back up.\n")
+	assertNotContains(t, out, "~60s")
 }
 
 // A torn-down site's recheck is refused with site_deleted. Status prints its
@@ -1822,14 +3015,17 @@ func TestStatusSurfacesAnOrdinaryAPIErrorAfterThePageItHas(t *testing.T) {
 		client  *mockClient
 		lastRow string
 		noRow   string
+		// ends pins lastRow as the final line of the page, not just a line on it.
+		ends bool
 	}{
 		{
 			name: "site read",
 			client: &mockClient{
 				getSiteFn: func(string) (*api.Site, error) { return nil, boom },
 			},
-			lastRow: "Site:         site123",
+			lastRow: "API server:   https://api.kamakiri-labs.jp/cloud",
 			noRow:   "Subdomain:",
+			ends:    true,
 		},
 		{
 			name: "domain list",
@@ -1867,6 +3063,9 @@ func TestStatusSurfacesAnOrdinaryAPIErrorAfterThePageItHas(t *testing.T) {
 				t.Error("drift = true, want false")
 			}
 			assertContains(t, buf.String(), tc.lastRow)
+			if tc.ends && !strings.HasSuffix(strings.TrimRight(buf.String(), "\n"), tc.lastRow) {
+				t.Errorf("page does not end with %q:\n%s", tc.lastRow, buf.String())
+			}
 			assertNotContains(t, buf.String(), tc.noRow)
 		})
 	}
@@ -2145,7 +3344,7 @@ func pageCases() []pageCase {
 Credentials:  (not found)
 Logged in:    no
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2159,7 +3358,7 @@ Site:         (none)
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    no
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2181,7 +3380,7 @@ Site:         (none)
 Credentials:  (error: determine config directory: <NO HOME>)
 Logged in:    no
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2196,7 +3395,7 @@ Site:         (none)
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    (error: parse credentials: <BAD JSON>)
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2218,7 +3417,7 @@ Site:         (none)
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    (error: read credentials: <NOT A DIRECTORY>)
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2239,7 +3438,7 @@ Site:         (none)
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    yes
 API server:   https://api.example.test/cloud
-Site:         (none)
+No site is linked to this directory. Run "kamakiri init" to create one.
 `,
 			setup: func(t *testing.T) SiteClient {
 				t.Chdir(t.TempDir())
@@ -2256,7 +3455,6 @@ Site:         (none)
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
 API server:   https://api.example.test/cloud
-Site:         site123
 `,
 			setup: func(t *testing.T) SiteClient {
 				linkedSite(t, "user@example.com")
@@ -2264,16 +3462,60 @@ Site:         site123
 			},
 		},
 		{
+			name: "a key the server rejected",
+			want: `Version:      v1.2.3
+Credentials:  <CONFIG>/kamakiri/credentials.json
+Logged in:    no
+Key:          rejected
+API server:   https://api.example.test/cloud
+`,
+			setup: func(t *testing.T) SiteClient {
+				linkedSite(t, "user@example.com")
+				return &mockClient{
+					currentKeyFn: func() (*api.Key, error) {
+						return nil, &api.ErrorResponse{Code: "unauthorized", Message: "invalid API key"}
+					},
+					getSiteFn: func(string) (*api.Site, error) {
+						t.Fatal("GetSite must not be called over a rejected key")
+						return nil, nil
+					},
+				}
+			},
+		},
+		{
+			name: "a key the server could not be asked about",
+			want: `Version:      v1.2.3
+Credentials:  <CONFIG>/kamakiri/credentials.json
+Logged in:    user@example.com
+Key:          (error: Internal server error.)
+API server:   https://api.example.test/cloud
+No site is linked to this directory. Run "kamakiri init" to create one.
+`,
+			setup: func(t *testing.T) SiteClient {
+				t.Chdir(t.TempDir())
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				if err := core.SaveCredentials("kk_live_test", "user@example.com"); err != nil {
+					t.Fatalf("SaveCredentials: %v", err)
+				}
+				return &mockClient{
+					currentKeyFn: func() (*api.Key, error) {
+						return nil, &api.ErrorResponse{Code: "internal_error", Message: "Internal server error."}
+					},
+				}
+			},
+		},
+		{
 			name: "the whole page",
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Subdomain:    my-site.kamakiri-pages.jp
 Domain:       example.com
 Domains:      2 additional
 CDN:          webaccel
-Sites:        2 / 5
+Site quota:   2 / 5
 Snapshots:    3 / 10 (this site)
 Max deploy:   100 MB
 
@@ -2311,10 +3553,53 @@ Per-domain status:
 			},
 		},
 		{
+			name: "a deploy key's page",
+			want: `Version:      v1.2.3
+Credentials:  <CONFIG>/kamakiri/credentials.json
+Logged in:    user@example.com
+Key:          github-actions (deploy, 3f2a9c1e-6b4d-4f0a-9c3e-2d7b5a8e1f40)
+Sites:        example.com, docs.kamakiri-pages.jp
+API server:   https://api.example.test/cloud
+Subdomain:    my-site.kamakiri-pages.jp
+Domain:       example.com
+CDN:          none
+Site quota:   2 / 5
+Snapshots:    3 / 10 (this site)
+Max deploy:   100 MB
+
+Per-domain status:
+  example.com  canonical  ✓ live  
+`,
+			setup: func(t *testing.T) SiteClient {
+				linkedSite(t, "user@example.com")
+				return &mockClient{
+					currentKeyFn: func() (*api.Key, error) { return deployKey(), nil },
+					getSiteFn: func(id string) (*api.Site, error) {
+						return &api.Site{
+							ID:               id,
+							Subdomain:        "my-site",
+							SubdomainEnabled: true,
+							Quota: &api.Quota{
+								SitesUsed: 2, SitesMax: 5,
+								SnapshotsUsed: 3, SnapshotsMax: 10,
+								MaxSnapshotBytes: 100 * 1024 * 1024,
+							},
+						}, nil
+					},
+					listDomainsFn: func(string) (*api.DomainList, error) {
+						return &api.DomainList{Domains: []api.Domain{
+							{Domain: "example.com", Role: "canonical", State: "serving"},
+						}}, nil
+					},
+				}
+			},
+		},
+		{
 			name: "a reconcile error over a flushing edge",
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Subdomain:    my-site.kamakiri-pages.jp
 Domain:       (none)
@@ -2351,6 +3636,7 @@ Edge cache: still flushing (since 5m); our flush is failing (timeout), we keep r
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Subdomain:    my-site.kamakiri-pages.jp
 Domain:       (none)
@@ -2387,6 +3673,7 @@ CDN:          none
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Subdomain:    my-site.kamakiri-pages.jp
 Domain:       example.com
@@ -2432,6 +3719,7 @@ Per-domain status:
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Status:       ⧗ pending teardown
               (the edge may still be serving until the removal lands.)
@@ -2450,6 +3738,7 @@ Status:       ⧗ pending teardown
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Status:       ⧗ tearing down (edge removed; DNS, CDN and storage in flight)
 Subdomain:    my-site.kamakiri-pages.jp (disabled)
@@ -2478,6 +3767,7 @@ Per-domain status:
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Status:       ✗ deleted
 `,
@@ -2495,6 +3785,7 @@ Status:       ✗ deleted
 			want: `Version:      v1.2.3
 Credentials:  <CONFIG>/kamakiri/credentials.json
 Logged in:    user@example.com
+Key:          laptop (login, 5a1d7c93-2e8f-4b6a-8d01-7c4e9f3b2a65)
 API server:   https://api.example.test/cloud
 Status:       ✗ stuck (status="active" status_observed="soft_deleted", please file a bug)
 `,

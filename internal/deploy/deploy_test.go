@@ -1041,9 +1041,9 @@ func TestDeployRefusesATornDownSite(t *testing.T) {
 }
 
 // An answer to the site read that the upload would get too (a rejected key, a
-// refused CLI version, a site that does not exist) ends the deploy there, with
-// the error the upload would have produced, instead of packing and uploading
-// only to be told the same thing.
+// refused CLI version, a site that does not exist, a site outside a deploy
+// key's list) ends the deploy there, with the error the upload would have
+// produced, instead of packing and uploading only to be told the same thing.
 func TestDeployStopsOnAConclusiveSiteRead(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1052,6 +1052,12 @@ func TestDeployStopsOnAConclusiveSiteRead(t *testing.T) {
 		{"unauthorized", &api.ErrorResponse{Code: "unauthorized", Message: "Unauthorized."}},
 		{"upgrade required", api.ErrUpgradeRequired},
 		{"site not found", &api.ErrorResponse{Code: "site_not_found", Message: "Site not found."}},
+		{"site not in key", &api.ErrorResponse{
+			Code: "site_not_in_key", Message: "raw",
+			Key:   &api.KeyInfo{ID: "3f2a9c1e", Name: "ci"},
+			Sites: []api.LabeledSite{{ID: "a1b2c3d4", Label: "example.com"}},
+			Site:  &api.LabeledSite{ID: "e5f6a7b8", Label: "other.example.com"},
+		}},
 	}
 
 	for _, tc := range cases {
@@ -1095,6 +1101,9 @@ func TestDeployStopsOnAConclusiveSiteRead(t *testing.T) {
 			// upload does, not an error carrying the same text.
 			if tc.answer == api.ErrUpgradeRequired && (wantErr != api.ErrUpgradeRequired || err != api.ErrUpgradeRequired) {
 				t.Errorf("Run() error = %#v through the read and %#v through the upload, want the upgrade sentinel from both", err, wantErr)
+			}
+			if tc.name == "site not in key" && (err == nil || !strings.Contains(err.Error(), "cannot act on other.example.com")) {
+				t.Errorf("Run() error = %v, want the mapped site_not_in_key line naming the refused site", err)
 			}
 			if stdout.Len() != 0 {
 				t.Errorf("stdout = %q, want nothing before the refusal", stdout.String())

@@ -126,3 +126,18 @@ func SaveCredentials(apiKey, email string) error {
 	}
 	return nil
 }
+
+// DeleteCredentials removes the credentials file and nothing else: the config
+// directory stays, and so does every other file in it, a login left
+// half-finished included. A file that is already gone is not an error, since
+// the outcome asked for already holds.
+func DeleteCredentials() error {
+	path, err := CredentialsPath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s: %w", i18n.T("core.err_delete_credentials"), err)
+	}
+	return nil
+}

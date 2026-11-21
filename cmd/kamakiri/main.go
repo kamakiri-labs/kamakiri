@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/kamakiri-labs/kamakiri/internal/api"
 	"github.com/kamakiri-labs/kamakiri/internal/cdn"
@@ -19,8 +23,10 @@ import (
 	"github.com/kamakiri-labs/kamakiri/internal/freshness"
 	"github.com/kamakiri-labs/kamakiri/internal/i18n"
 	initcmd "github.com/kamakiri-labs/kamakiri/internal/init"
+	"github.com/kamakiri-labs/kamakiri/internal/key"
 	"github.com/kamakiri-labs/kamakiri/internal/language"
 	"github.com/kamakiri-labs/kamakiri/internal/login"
+	"github.com/kamakiri-labs/kamakiri/internal/logout"
 	"github.com/kamakiri-labs/kamakiri/internal/rollback"
 	"github.com/kamakiri-labs/kamakiri/internal/status"
 	"github.com/kamakiri-labs/kamakiri/internal/streamui"
@@ -125,7 +131,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 		return 1
 	}
 
-	baseURL := os.Getenv("KAMAKIRI_API_URL")
+	// A trailing slash would double the slash in every request path, and the
+	// server's deploy address does not accept that for a large upload.
+	baseURL := strings.TrimRight(os.Getenv("KAMAKIRI_API_URL"), "/")
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
@@ -157,8 +165,42 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 			return 1
 		}
 	case "login":
+		var opts login.Options
+		for i := 1; i < len(a.args); i++ {
+			name, value, hasValue := cliflags.SplitArg(a.args[i])
+			switch name {
+			case "--name":
+				opts.Name, i = a.flagValueOrExit(a.args, i, hasValue, value, "--name", "")
+				opts.NameGiven = true
+			case "--revoke-others":
+				a.requireNoValueOrExit(name, hasValue)
+				opts.RevokeOthers = true
+			default:
+				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_login"))
+				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[i])))
+				return 1
+			}
+		}
 		client := api.NewClient(baseURL)
-		if err := login.Run(client, a.stdin, a.stdout); err != nil {
+		if err := login.Run(client, a.stdin, a.stdout, opts); err != nil {
+			fmt.Fprintln(a.stderr, err)
+			return 1
+		}
+	case "logout":
+		if len(a.args) > 1 {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.usage_logout"))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[1])))
+			return 1
+		}
+		client := api.NewClient(baseURL)
+		// loadAPIKey rather than setAPIKey, because logout needs the credential
+		// itself: what it does turns on where the key came from.
+		creds, err := a.loadAPIKey(client)
+		if err != nil {
+			fmt.Fprintln(a.stderr, err)
+			return 1
+		}
+		if err := logout.Run(client, creds, a.stdout); err != nil {
 			fmt.Fprintln(a.stderr, err)
 			return 1
 		}
@@ -192,15 +234,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 		} else {
 			drift, err = status.Run(a.stdout, version, baseURL, client, verbose)
 		}
+		// The drift block on the page has the values and the fix; the drift
+		// line here is what a script log shows for the exit, so it names the
+		// page rather than pointing above. A run can return both, since a
+		// failure to describe the key does not stop the page, so the error is
+		// printed first and the drift line is not lost behind it.
 		if err != nil {
 			fmt.Fprintln(a.stderr, err)
-			return 1
 		}
-		// The block on the page has the values and the fix; the line here is
-		// what a script log shows for the exit, so it names the page rather
-		// than pointing above.
 		if drift {
 			fmt.Fprintln(a.stderr, i18n.T("status.err_drift"))
+		}
+		if err != nil || drift {
 			return 1
 		}
 	case "init":
@@ -432,12 +477,148 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int) {
 			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_subdomain_command", cliflags.Redact(a.args[1])))
 			return 1
 		}
+	case "key":
+		if len(a.args) < 2 {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key"))
+			return 1
+		}
+		client := api.NewClient(baseURL)
+		a.setAPIKey(client)
+		switch a.args[1] {
+		case "list":
+			if len(a.args) > 2 {
+				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_list"))
+				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[2])))
+				return 1
+			}
+			if err := key.List(client, a.stdout, time.Now()); err != nil {
+				fmt.Fprintln(a.stderr, err)
+				return 1
+			}
+		case "rename":
+			if len(a.args) < 4 {
+				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_rename"))
+				return 1
+			}
+			if len(a.args) > 4 {
+				fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_rename"))
+				fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[4])))
+				return 1
+			}
+			if err := key.Rename(client, a.args[2], a.args[3], a.stdout); err != nil {
+				fmt.Fprintln(a.stderr, err)
+				return 1
+			}
+		case "create":
+			a.runKeyCreate(client)
+		case "revoke":
+			a.runKeyRevoke(client)
+		case "rotate":
+			a.runKeyRotate(client)
+		default:
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_key_command", cliflags.Redact(a.args[1])))
+			return 1
+		}
 	default:
 		fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unknown_command", cliflags.Redact(a.args[0])))
 		return 1
 	}
 
 	return 0
+}
+
+// runKeyCreate parses `kamakiri key create [--name <name>] [--site <site>]...`
+// and dispatches to the key package. Each --site is appended in the order
+// typed, so the key lists its sites in that order; --name keeps its last value,
+// as every valued flag does. The command takes no positional argument. The key
+// package writes the key to stdout and its own lines to stderr, and this arm
+// prints only to stderr, so stdout carries the key and nothing else.
+func (a *app) runKeyCreate(client *api.Client) {
+	var opts key.CreateOptions
+	for i := 2; i < len(a.args); i++ {
+		name, value, hasValue := cliflags.SplitArg(a.args[i])
+		switch name {
+		case "--name":
+			opts.Name, i = a.flagValueOrExit(a.args, i, hasValue, value, "--name", "")
+			opts.NameGiven = true
+		case "--site":
+			var site string
+			site, i = a.flagValueOrExit(a.args, i, hasValue, value, "--site", "")
+			opts.Sites = append(opts.Sites, site)
+		default:
+			fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_create"))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(a.args[i])))
+			a.exit(1)
+		}
+	}
+
+	// The key is shown once, so a reader that has gone away must surface as an
+	// error naming the key ID. By default the runtime kills the process with
+	// SIGPIPE when a write to a closed stdout or stderr fails, which would hide
+	// that line and the exit code. Ignored, the write returns EPIPE instead.
+	signal.Ignore(syscall.SIGPIPE)
+	if err := key.Create(client, opts, a.stdout, a.stderr); err != nil {
+		fmt.Fprintln(a.stderr, err)
+		a.exit(1)
+	}
+}
+
+// runKeyRevoke parses `kamakiri key revoke <id>` and dispatches to the key
+// package. A command line that does not name exactly one ID prints the usage
+// line, with nothing sent, and names the first argument it does not take. An ID
+// never starts with a hyphen, so anything that does is such an argument, even
+// alone.
+func (a *app) runKeyRevoke(client *api.Client) {
+	var id string
+	var idGiven bool
+	for _, arg := range a.args[2:] {
+		if strings.HasPrefix(arg, "-") || idGiven {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_revoke"))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(arg)))
+			a.exit(1)
+		}
+		id, idGiven = arg, true
+	}
+	if !idGiven {
+		fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_revoke"))
+		a.exit(1)
+	}
+
+	if err := key.Revoke(client, id, a.stdout); err != nil {
+		fmt.Fprintln(a.stderr, err)
+		a.exit(1)
+	}
+}
+
+// runKeyRotate parses `kamakiri key rotate <id>` and dispatches to the key
+// package. The command line is held to the rule runKeyRevoke applies: exactly
+// one ID, and no argument starting with a hyphen. As with key create, the key
+// package writes the key to stdout and its own lines to stderr, and this arm
+// prints only to stderr.
+func (a *app) runKeyRotate(client *api.Client) {
+	var id string
+	var idGiven bool
+	for _, arg := range a.args[2:] {
+		if strings.HasPrefix(arg, "-") || idGiven {
+			fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_rotate"))
+			fmt.Fprintln(a.stderr, i18n.Tf("cmd.err_unexpected_argument", cliflags.Redact(arg)))
+			a.exit(1)
+		}
+		id, idGiven = arg, true
+	}
+	if !idGiven {
+		fmt.Fprintln(a.stderr, i18n.T("cmd.usage_key_rotate"))
+		a.exit(1)
+	}
+
+	// For the reason runKeyCreate gives: the new key is shown once, so a reader
+	// that has gone away must surface as the line naming the new key's ID, not
+	// as a silent death by SIGPIPE.
+	signal.Ignore(syscall.SIGPIPE)
+	if err := key.Rotate(client, id, a.stdout, a.stderr); err != nil {
+		fmt.Fprintln(a.stderr, err)
+		a.exit(1)
+	}
 }
 
 func (a *app) runDomainAdd(client *api.Client) {
@@ -850,12 +1031,15 @@ func persistedLanguage() string {
 }
 
 // loadAPIKey arms the client and the environment stamp from the run's credential
-// and returns whatever the load failed with. setAPIKey acts on that error by
-// refusing; status calls loadAPIKey for the arming alone, since its page loads
-// and reports the credential for itself and must not exit before rendering. The
-// stamp runs on every path, the failed load included, so the value never carries
-// over from an earlier load in the same process.
-func (a *app) loadAPIKey(client *api.Client) error {
+// and returns the credential it loaded, nil when there is none, beside whatever
+// the load failed with. setAPIKey acts on that error by refusing; status calls
+// loadAPIKey for the arming alone, since its page loads and reports the
+// credential for itself and must not exit before rendering; and logout reports
+// the error itself and hands the credential on, since what it does turns on
+// where the key came from. The stamp runs on every path, the failed load
+// included, so the value never carries over from an earlier load in the same
+// process.
+func (a *app) loadAPIKey(client *api.Client) (*core.Credentials, error) {
 	creds, err := core.LoadCredentials()
 	if creds != nil {
 		client.APIKey = creds.APIKey
@@ -865,11 +1049,11 @@ func (a *app) loadAPIKey(client *api.Client) error {
 	// holds, so the answer is recorded in the api package rather than carried
 	// on the client.
 	api.SetKeyFromEnvironment(creds != nil && creds.Source == core.SourceEnvironment)
-	return err
+	return creds, err
 }
 
 func (a *app) setAPIKey(client *api.Client) {
-	if err := a.loadAPIKey(client); err != nil {
+	if _, err := a.loadAPIKey(client); err != nil {
 		fmt.Fprintln(a.stderr, err)
 		a.exit(1)
 	}
@@ -880,6 +1064,8 @@ func (a *app) printUsage() {
 	fmt.Fprintln(a.stderr, "")
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_commands_header"))
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_login"))
+	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_logout"))
+	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_key"))
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_status"))
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_init"))
 	fmt.Fprintln(a.stderr, i18n.T("cmd.usage_command_deploy"))
